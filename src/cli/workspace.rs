@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::api::schema::{
-    Method, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceReportMetadataParams,
+    Method, WorkspaceCreateParams, WorkspaceParentSpaceParams, WorkspaceRenameParams,
+    WorkspaceReportMetadataParams,
 };
 
 pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
@@ -16,6 +17,9 @@ pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
         "get" => workspace_get(&args[1..]),
         "focus" => workspace_focus(&args[1..]),
         "rename" => workspace_rename(&args[1..]),
+        "become-parent" => workspace_become_parent(&args[1..]),
+        "rescan-children" => workspace_rescan_children(&args[1..]),
+        "stop-parent" => workspace_stop_parent(&args[1..]),
         "report-metadata" => workspace_report_metadata(&args[1..]),
         "close" => workspace_close(&args[1..]),
         "help" | "--help" | "-h" => {
@@ -139,6 +143,49 @@ fn workspace_rename(args: &[String]) -> std::io::Result<i32> {
     })
 }
 
+fn workspace_become_parent(args: &[String]) -> std::io::Result<i32> {
+    let Some(params) = workspace_parent_space_params(args) else {
+        return Ok(2);
+    };
+    super::runtime::workspace_become_parent(params)
+}
+
+fn workspace_rescan_children(args: &[String]) -> std::io::Result<i32> {
+    let Some(params) = workspace_parent_space_params(args) else {
+        return Ok(2);
+    };
+    super::runtime::workspace_rescan_children(params)
+}
+
+fn workspace_stop_parent(args: &[String]) -> std::io::Result<i32> {
+    let Some(params) = workspace_parent_space_params(args) else {
+        return Ok(2);
+    };
+    super::runtime::workspace_stop_parent(params)
+}
+
+fn workspace_parent_space_params(args: &[String]) -> Option<WorkspaceParentSpaceParams> {
+    let mut workspace_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--workspace" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --workspace");
+                    return None;
+                };
+                workspace_id = Some(super::normalize_workspace_id(value));
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return None;
+            }
+        }
+    }
+    Some(WorkspaceParentSpaceParams { workspace_id })
+}
+
 fn workspace_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_workspace_id) = args.first() else {
         eprintln!("usage: herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
@@ -244,6 +291,9 @@ fn print_workspace_help() {
     eprintln!("  herdr workspace get <workspace_id>");
     eprintln!("  herdr workspace focus <workspace_id>");
     eprintln!("  herdr workspace rename <workspace_id> <label>");
+    eprintln!("  herdr workspace become-parent [--workspace ID]");
+    eprintln!("  herdr workspace rescan-children [--workspace ID]");
+    eprintln!("  herdr workspace stop-parent [--workspace ID]");
     eprintln!("  herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
     eprintln!("  herdr workspace close <workspace_id>");
 }

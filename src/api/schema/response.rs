@@ -62,6 +62,11 @@ pub enum ResponseResult {
     WorkspaceList {
         workspaces: Vec<WorkspaceInfo>,
     },
+    WorkspaceParentSpace {
+        parent_workspace_id: String,
+        child_workspace_ids: Vec<String>,
+        cleared_count: usize,
+    },
     WorktreeList {
         source: WorktreeSourceInfo,
         worktrees: Vec<WorktreeInfo>,

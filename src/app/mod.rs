@@ -14,6 +14,7 @@ mod config_io;
 mod creation;
 mod ids;
 mod input;
+mod parent_spaces;
 mod popup;
 mod runtime;
 mod runtime_mutations;
@@ -541,6 +542,7 @@ impl App {
             request_new_tab: false,
             request_new_linked_worktree: None,
             request_open_existing_worktree: None,
+            request_parent_space_action: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
             request_submit_worktree_create: false,
@@ -987,6 +989,17 @@ impl App {
 
             if let Some(ws_idx) = self.state.request_open_existing_worktree.take() {
                 self.open_existing_worktree_dialog(ws_idx);
+                needs_render = true;
+            }
+
+            if let Some((ws_idx, action)) = self.state.request_parent_space_action.take() {
+                if let Err(err) = self.apply_parent_space_action(ws_idx, action) {
+                    tracing::warn!(
+                        code = err.code,
+                        message = %err.message,
+                        "parent-space action failed"
+                    );
+                }
                 needs_render = true;
             }
 
@@ -1673,21 +1686,13 @@ impl App {
                 crate::raw_input::RawInputEvent::Paste(text) => {
                     if self.try_route_paste_to_popup(&text) {
                     } else if self.state.mode != Mode::Terminal {
-                        self.paste_into_active_text_input(&text);
-                    } else {
-                        if let Some(ws_idx) = self.state.active {
-                            if let Some(ws) = self.state.workspaces.get(ws_idx) {
-                                if let Some(focused) = ws.focused_pane_id() {
-                                    if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
-                                        &self.terminal_runtimes,
-                                        ws_idx,
-                                        focused,
-                                    ) {
-                                        let _ = runtime.try_send_paste(text);
-                                    }
-                                }
-                            }
+                        if !self.paste_into_active_text_input(&text)
+                            && matches!(self.state.mode, Mode::Navigate | Mode::Prefix)
+                        {
+                            self.paste_to_focused_pane(text);
                         }
+                    } else {
+                        self.paste_to_focused_pane(text);
                     }
                 }
                 crate::raw_input::RawInputEvent::OuterFocusGained => {
@@ -1710,6 +1715,22 @@ impl App {
                 crate::raw_input::RawInputEvent::Unsupported => {}
             }
             self.sync_prefix_input_source(previous_mode);
+        }
+    }
+
+    fn paste_to_focused_pane(&mut self, text: String) {
+        if let Some(ws_idx) = self.state.active {
+            if let Some(ws) = self.state.workspaces.get(ws_idx) {
+                if let Some(focused) = ws.focused_pane_id() {
+                    if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                        &self.terminal_runtimes,
+                        ws_idx,
+                        focused,
+                    ) {
+                        let _ = runtime.try_send_paste(text);
+                    }
+                }
+            }
         }
     }
 
@@ -5539,7 +5560,10 @@ last_pane = "prefix+tab"
         app.state.selected = 0;
         app.state.confirm_close = false;
         app.state.context_menu = Some(state::ContextMenuState {
-            kind: state::ContextMenuKind::Workspace { ws_idx: 1 },
+            kind: state::ContextMenuKind::Workspace {
+                ws_idx: 1,
+                parent_space: state::ParentSpaceMenu::Unavailable,
+            },
             x: 2,
             y: 2,
             list: state::MenuListState::new(1),
@@ -5599,6 +5623,53 @@ last_pane = "prefix+tab"
                 .map(|create| create.branch.as_str()),
             Some("feature/linear-302")
         );
+    }
+
+    #[tokio::test]
+    async fn route_client_events_pastes_text_into_focused_pane_in_navigate_mode() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("tiled");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) = TerminalRuntime::test_with_channel(80, 24);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Navigate;
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Paste(
+                "navigate-paste".into(),
+            )],
+            true,
+        );
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"navigate-paste")
+        );
+    }
+
+    #[tokio::test]
+    async fn route_client_events_discards_paste_in_modal_without_active_input() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("tiled");
+        let focused = workspace.focused_pane_id().unwrap();
+        let (runtime, mut rx) = TerminalRuntime::test_with_channel(80, 24);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Settings;
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Paste(
+                "discard-modal-paste".into(),
+            )],
+            true,
+        );
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

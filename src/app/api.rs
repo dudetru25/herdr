@@ -966,6 +966,15 @@ impl App {
             Method::WorkspaceMove(params) => {
                 return self.handle_workspace_move(request.id, params);
             }
+            Method::WorkspaceBecomeParent(params) => {
+                return self.handle_workspace_become_parent(request.id, params);
+            }
+            Method::WorkspaceRescanChildren(params) => {
+                return self.handle_workspace_rescan_children(request.id, params);
+            }
+            Method::WorkspaceStopParent(params) => {
+                return self.handle_workspace_stop_parent(request.id, params);
+            }
             Method::WorkspaceReportMetadata(params) => {
                 return self.handle_workspace_report_metadata(request.id, params);
             }

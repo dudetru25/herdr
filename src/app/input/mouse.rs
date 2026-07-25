@@ -6,8 +6,8 @@ use tracing::warn;
 use crate::{
     app::state::{
         AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget,
-        MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
-        WorkspacePressState,
+        MenuListState, Mode, ParentSpaceMenu, RightClickPassthroughGesture, TabPressState,
+        ViewLayout, WorkspacePressState,
     },
     layout::{PaneInfo, SplitBorder},
     selection::Selection,
@@ -562,11 +562,11 @@ impl AppState {
                     };
                     if let Some(card) = cards.iter().find(|card| {
                         mouse.row == card.rect.y
-                            && mouse.column == card.rect.x
+                            && mouse.column == card.rect.x.saturating_add(card.indent as u16 * 2)
                             && mouse.column < card.rect.x + card.rect.width
                     }) {
                         if let Some((key, collapsed)) =
-                            crate::ui::workspace_parent_group_state(self, card.ws_idx)
+                            crate::ui::workspace_display_group_state(self, card.ws_idx)
                         {
                             if collapsed {
                                 self.collapsed_space_keys.remove(&key);
@@ -998,10 +998,12 @@ impl AppState {
                 }
                 if let Some(idx) = self.workspace_at_row(mouse.row) {
                     self.selected = idx;
-                    let kind = self
-                        .workspaces
-                        .get(idx)
-                        .and_then(|ws| {
+                    let kind = self.workspaces.get(idx).map_or(
+                        ContextMenuKind::Workspace {
+                            ws_idx: idx,
+                            parent_space: ParentSpaceMenu::Unavailable,
+                        },
+                        |ws| {
                             let group_state = crate::ui::workspace_parent_group_state(self, idx);
                             let git_space = ws.git_space().cloned().or_else(|| {
                                 ws.resolved_identity_cwd_from(&self.terminals, terminal_runtimes)
@@ -1020,16 +1022,34 @@ impl AppState {
                                 || git_space
                                     .as_ref()
                                     .is_some_and(|space| !space.is_linked_worktree);
-                            show_git_menu.then_some(ContextMenuKind::GitWorkspace {
-                                ws_idx: idx,
-                                is_linked_worktree,
-                                has_worktree_children: group_state.is_some(),
-                                collapsed: group_state
-                                    .as_ref()
-                                    .is_some_and(|(_, collapsed)| *collapsed),
-                            })
-                        })
-                        .unwrap_or(ContextMenuKind::Workspace { ws_idx: idx });
+                            let parent_space = if ws.is_parent_space() {
+                                ParentSpaceMenu::Manage
+                            } else if ws.parent_space().is_some()
+                                || is_linked_worktree
+                                || !ws.identity_cwd.is_dir()
+                            {
+                                ParentSpaceMenu::Unavailable
+                            } else {
+                                ParentSpaceMenu::Become
+                            };
+                            if show_git_menu {
+                                ContextMenuKind::GitWorkspace {
+                                    ws_idx: idx,
+                                    is_linked_worktree,
+                                    has_worktree_children: group_state.is_some(),
+                                    collapsed: group_state
+                                        .as_ref()
+                                        .is_some_and(|(_, collapsed)| *collapsed),
+                                    parent_space,
+                                }
+                            } else {
+                                ContextMenuKind::Workspace {
+                                    ws_idx: idx,
+                                    parent_space,
+                                }
+                            }
+                        },
+                    );
                     self.context_menu = Some(ContextMenuState {
                         kind,
                         x: mouse.column,
@@ -2540,7 +2560,10 @@ mod tests {
     fn hovering_context_menu_updates_highlight() {
         let mut app = app_for_mouse_test();
         app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 0 },
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                parent_space: crate::app::state::ParentSpaceMenu::Unavailable,
+            },
             x: 2,
             y: 2,
             list: MenuListState::new(0),
@@ -2551,6 +2574,60 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::Moved, menu.x + 2, menu.y + 2));
 
         assert_eq!(app.state.context_menu.unwrap().list.highlighted, 1);
+    }
+
+    #[test]
+    fn workspace_right_click_shows_parent_space_actions_only_for_valid_roles() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("workspace")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let card = app.state.view.workspace_card_areas[0].rect;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            card.x + 2,
+            card.y,
+        ));
+
+        assert!(app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("workspace context menu")
+            .items()
+            .contains(&"Become parent space"));
+
+        let mut child_app = app_for_mouse_test();
+        let mut child = Workspace::test_new("child");
+        child.parent_space = Some(crate::workspace::ParentSpaceMembership {
+            key: "folder:/projects".into(),
+            root: "/projects".into(),
+            is_parent: false,
+        });
+        child_app.state.workspaces = vec![child];
+        child_app.state.active = Some(0);
+        child_app.state.selected = 0;
+        child_app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut child_app.state, Rect::new(0, 0, 106, 20));
+        let child_card = child_app.state.view.workspace_card_areas[0].rect;
+
+        child_app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            child_card.x + 2,
+            child_card.y,
+        ));
+
+        let items = child_app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("child context menu")
+            .items();
+        assert!(!items.contains(&"Become parent space"));
+        assert!(!items.contains(&"Re-scan sub-spaces"));
     }
 
     #[test]
@@ -2834,7 +2911,10 @@ mod tests {
         app.state.mode = Mode::Terminal;
 
         app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 1 },
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 1,
+                parent_space: crate::app::state::ParentSpaceMenu::Unavailable,
+            },
             x: 2,
             y: 2,
             list: MenuListState::new(1),
@@ -2874,7 +2954,10 @@ mod tests {
         app.state.selected = 0;
         app.state.confirm_close = false;
         app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 1 },
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 1,
+                parent_space: crate::app::state::ParentSpaceMenu::Unavailable,
+            },
             x: 2,
             y: 2,
             list: MenuListState::new(1),

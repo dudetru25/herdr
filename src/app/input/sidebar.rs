@@ -375,20 +375,8 @@ impl AppState {
         }
 
         let mut insert_indices = Vec::with_capacity(cards.len() + 1);
-        for (idx, card) in cards.iter().enumerate() {
-            let card_group = self
-                .workspaces
-                .get(card.ws_idx)
-                .and_then(|ws| ws.worktree_space())
-                .map(|space| space.key.as_str());
-            let previous_group = idx.checked_sub(1).and_then(|prev_idx| {
-                self.workspaces
-                    .get(cards[prev_idx].ws_idx)
-                    .and_then(|ws| ws.worktree_space())
-                    .map(|space| space.key.as_str())
-            });
-            let inside_group_gap = card_group.is_some() && card_group == previous_group;
-            if !inside_group_gap {
+        for card in &cards {
+            if card.indent == 0 {
                 insert_indices.push(card.ws_idx);
             }
         }

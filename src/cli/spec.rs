@@ -209,6 +209,21 @@ fn workspace_command() -> Command {
                 .arg(required("label", "LABEL").num_args(1..)),
         )
         .subcommand(
+            Command::new("become-parent")
+                .about("Make a workspace a parent space and scan its children")
+                .arg(option("workspace", "ID")),
+        )
+        .subcommand(
+            Command::new("rescan-children")
+                .about("Rescan an existing parent space")
+                .arg(option("workspace", "ID")),
+        )
+        .subcommand(
+            Command::new("stop-parent")
+                .about("Stop treating a workspace as a parent space")
+                .arg(option("workspace", "ID")),
+        )
+        .subcommand(
             Command::new("report-metadata")
                 .about("Report display-only workspace metadata")
                 .arg(required("workspace_id", "WORKSPACE_ID"))

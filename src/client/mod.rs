@@ -1441,7 +1441,7 @@ async fn run_client_loop(
                         info!(
                             bytes = image.bytes.len(),
                             extension = image.extension,
-                            "bridging local clipboard image paste to remote server"
+                            "bridging local clipboard image paste to server"
                         );
                         let msg = ClientMessage::ClipboardImage {
                             extension: image.extension.to_owned(),
@@ -1699,10 +1699,6 @@ fn write_to_server(stream: &mut LocalStream, msg: &ClientMessage) -> io::Result<
 fn client_remote_image_paste_key(
     config: &crate::config::Config,
 ) -> Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)> {
-    if !is_remote_client_process() {
-        return None;
-    }
-
     match config.remote_image_paste_key() {
         Ok(key) => key,
         Err(diagnostic) => {
@@ -1812,11 +1808,11 @@ fn sound_from_notify_message(message: &str) -> Option<crate::sound::Sound> {
 #[cfg(unix)]
 fn should_bridge_clipboard_image_paste(
     data: &[u8],
-    is_remote_client: bool,
+    _is_remote_client: bool,
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
 ) -> bool {
     if data == b"\x1b[200~\x1b[201~" {
-        return is_remote_client;
+        return true;
     }
 
     let Some(remote_image_paste_key) = remote_image_paste_key else {
@@ -2239,6 +2235,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn clipboard_image_paste_key_loads_for_local_client() {
+        let _guard = env_lock().lock().unwrap();
+        let _env = EnvVarsRemovedGuard::new(&["HERDR_REMOTE_KEYBINDINGS"]);
+        let ctrl_v = crate::config::parse_key_combo("ctrl+v").unwrap();
+
+        assert_eq!(
+            client_remote_image_paste_key(&crate::config::Config::default()),
+            Some(ctrl_v)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clipboard_image_paste_bridge_triggers_on_configured_key_and_empty_paste() {
         let ctrl_v = crate::config::parse_key_combo("ctrl+v").unwrap();
         assert!(should_bridge_clipboard_image_paste(
@@ -2256,8 +2265,13 @@ mod tests {
             true,
             None
         ));
-        assert!(!should_bridge_clipboard_image_paste(
+        assert!(should_bridge_clipboard_image_paste(
             b"\x1b[200~\x1b[201~",
+            false,
+            None
+        ));
+        assert!(should_bridge_clipboard_image_paste(
+            &[0x16],
             false,
             Some(ctrl_v)
         ));

@@ -62,6 +62,36 @@ fn request_uses_dot_method_names() {
 }
 
 #[test]
+fn parent_space_requests_use_workspace_method_names() {
+    for (method, expected_name) in [
+        (
+            Method::WorkspaceBecomeParent(WorkspaceParentSpaceParams {
+                workspace_id: Some("w1".into()),
+            }),
+            "workspace.become_parent",
+        ),
+        (
+            Method::WorkspaceRescanChildren(WorkspaceParentSpaceParams { workspace_id: None }),
+            "workspace.rescan_children",
+        ),
+        (
+            Method::WorkspaceStopParent(WorkspaceParentSpaceParams {
+                workspace_id: Some("w1".into()),
+            }),
+            "workspace.stop_parent",
+        ),
+    ] {
+        let request = Request {
+            id: "parent-space".into(),
+            method,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], expected_name);
+        assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+    }
+}
+
+#[test]
 fn agent_start_and_prompt_requests_round_trip() {
     let start = Request {
         id: "start".into(),

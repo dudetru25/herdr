@@ -711,6 +711,33 @@ pub(super) fn apply_context_menu_action(
             leave_modal(state);
         }
         (
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Become parent space"),
+        ) => {
+            state.request_parent_space_action =
+                Some((ws_idx, crate::app::state::ParentSpaceAction::Become));
+            leave_modal(state);
+        }
+        (
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Re-scan sub-spaces"),
+        ) => {
+            state.request_parent_space_action =
+                Some((ws_idx, crate::app::state::ParentSpaceAction::Rescan));
+            leave_modal(state);
+        }
+        (
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Stop being parent"),
+        ) => {
+            state.request_parent_space_action =
+                Some((ws_idx, crate::app::state::ParentSpaceAction::Stop));
+            leave_modal(state);
+        }
+        (
             ContextMenuKind::GitWorkspace {
                 ws_idx, collapsed, ..
             },
@@ -732,13 +759,15 @@ pub(super) fn apply_context_menu_action(
             leave_modal(state);
         }
         (
-            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Rename"),
         ) => {
             open_rename_workspace(state, terminal_runtimes, ws_idx);
         }
         (
-            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Close" | "Close group"),
         ) => {
             state.selected = ws_idx;
@@ -1140,6 +1169,33 @@ impl App {
                 leave_modal(&mut self.state);
             }
             (
+                ContextMenuKind::Workspace { ws_idx, .. }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Become parent space"),
+            ) => {
+                self.state.request_parent_space_action =
+                    Some((ws_idx, crate::app::state::ParentSpaceAction::Become));
+                leave_modal(&mut self.state);
+            }
+            (
+                ContextMenuKind::Workspace { ws_idx, .. }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Re-scan sub-spaces"),
+            ) => {
+                self.state.request_parent_space_action =
+                    Some((ws_idx, crate::app::state::ParentSpaceAction::Rescan));
+                leave_modal(&mut self.state);
+            }
+            (
+                ContextMenuKind::Workspace { ws_idx, .. }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Stop being parent"),
+            ) => {
+                self.state.request_parent_space_action =
+                    Some((ws_idx, crate::app::state::ParentSpaceAction::Stop));
+                leave_modal(&mut self.state);
+            }
+            (
                 ContextMenuKind::GitWorkspace {
                     ws_idx, collapsed, ..
                 },
@@ -1162,12 +1218,12 @@ impl App {
                 leave_modal(&mut self.state);
             }
             (
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
                 Some("Rename"),
             ) => open_rename_workspace(&mut self.state, &self.terminal_runtimes, ws_idx),
             (
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
                 Some("Close" | "Close group"),
             ) => {
@@ -1961,6 +2017,7 @@ mod tests {
                 is_linked_worktree: false,
                 has_worktree_children: true,
                 collapsed: false,
+                parent_space: crate::app::state::ParentSpaceMenu::Unavailable,
             },
             x: 0,
             y: 0,
@@ -1977,6 +2034,29 @@ mod tests {
 
         assert!(state.workspaces.is_empty());
         assert_eq!(state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn context_menu_parent_space_action_is_queued_without_runtime_work() {
+        let mut state = state_with_workspaces(&["parent"]);
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                parent_space: crate::app::state::ParentSpaceMenu::Manage,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 2);
+
+        assert_eq!(
+            state.request_parent_space_action,
+            Some((0, crate::app::state::ParentSpaceAction::Rescan))
+        );
+        assert_eq!(state.mode, Mode::Terminal);
     }
 
     #[test]

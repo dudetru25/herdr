@@ -8,7 +8,7 @@ use ratatui::{
 
 use super::sidebar::{
     agent_panel_entries, agent_panel_entries_from, grouped_child_display_label,
-    next_entry_is_indented_workspace, workspace_list_entries_expanded, AgentPanelEntry,
+    has_later_workspace_sibling, workspace_list_entries_expanded, AgentPanelEntry,
     WorkspaceListEntry,
 };
 use super::status::{agent_icon, state_dot};
@@ -592,7 +592,7 @@ fn render_mobile_switcher_content(
     );
     doc_y += 1;
     let space_entries = workspace_list_entries_expanded(app);
-    for (entry_idx, WorkspaceListEntry::Workspace { ws_idx, indented }) in
+    for (entry_idx, WorkspaceListEntry::Workspace { ws_idx, indent }) in
         space_entries.iter().enumerate()
     {
         let Some(ws) = app.workspaces.get(*ws_idx) else {
@@ -608,25 +608,35 @@ fn render_mobile_switcher_content(
         // Worktrees of the same space render as branches off their parent, so a
         // child gets an L/T connector on its name row and a matching vertical
         // continuation on its detail row.
-        let detail_prefix = if *indented {
-            let last_child = !next_entry_is_indented_workspace(&space_entries, entry_idx);
+        let detail_prefix = if *indent > 0 {
+            let last_child = !has_later_workspace_sibling(&space_entries, entry_idx, *indent);
+            if *indent > 1 {
+                title_spans.push(Span::styled(
+                    "  ".repeat((*indent as usize).saturating_sub(1)),
+                    Style::default().fg(p.overlay0).bg(bg),
+                ));
+            }
             title_spans.push(Span::styled(
                 if last_child { "└─ " } else { "├─ " },
                 Style::default().fg(p.overlay0).bg(bg),
             ));
+            let ancestor_prefix = "  ".repeat((*indent as usize).saturating_sub(1));
             if last_child {
-                "       "
+                format!("  {ancestor_prefix}   ")
             } else {
-                "  │    "
+                format!("  {ancestor_prefix}│  ")
             }
         } else {
-            "  "
+            "  ".to_string()
         };
 
         title_spans.push(Span::styled(dot, dot_style.bg(bg)));
         title_spans.push(Span::styled(" ", Style::default().bg(bg)));
         let raw_label = ws.display_name_from(&app.terminals, terminal_runtimes);
-        let name = if *indented {
+        let name = if ws
+            .worktree_space()
+            .is_some_and(|space| space.is_linked_worktree)
+        {
             grouped_child_display_label(
                 &raw_label,
                 ws.branch().as_deref(),
@@ -635,7 +645,10 @@ fn render_mobile_switcher_content(
         } else {
             raw_label
         };
-        let name_budget = content.width.saturating_sub(if *indented { 8 } else { 5 }) as usize;
+        let name_budget = content
+            .width
+            .saturating_sub(5u16.saturating_add(*indent as u16 * 3))
+            as usize;
         title_spans.push(Span::styled(
             truncate_end(&name, name_budget),
             Style::default()

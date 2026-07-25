@@ -2,11 +2,13 @@ use std::path::PathBuf;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, ResponseResult, WorkspaceCreateParams,
-    WorkspaceMoveParams, WorkspaceRenameParams, WorkspaceReportMetadataParams, WorkspaceTarget,
+    WorkspaceMoveParams, WorkspaceParentSpaceParams, WorkspaceRenameParams,
+    WorkspaceReportMetadataParams, WorkspaceTarget,
 };
 use crate::app::App;
 
 use super::super::api_helpers::{normalize_metadata_source, normalize_metadata_ttl};
+use super::super::state::ParentSpaceAction;
 use super::responses::{encode_error, encode_success};
 
 impl App {
@@ -154,6 +156,65 @@ impl App {
         encode_success(id, ResponseResult::WorkspaceList { workspaces })
     }
 
+    pub(super) fn handle_workspace_become_parent(
+        &mut self,
+        id: String,
+        params: WorkspaceParentSpaceParams,
+    ) -> String {
+        self.handle_workspace_parent_space_action(id, params, ParentSpaceAction::Become)
+    }
+
+    pub(super) fn handle_workspace_rescan_children(
+        &mut self,
+        id: String,
+        params: WorkspaceParentSpaceParams,
+    ) -> String {
+        self.handle_workspace_parent_space_action(id, params, ParentSpaceAction::Rescan)
+    }
+
+    pub(super) fn handle_workspace_stop_parent(
+        &mut self,
+        id: String,
+        params: WorkspaceParentSpaceParams,
+    ) -> String {
+        self.handle_workspace_parent_space_action(id, params, ParentSpaceAction::Stop)
+    }
+
+    fn handle_workspace_parent_space_action(
+        &mut self,
+        id: String,
+        params: WorkspaceParentSpaceParams,
+        action: ParentSpaceAction,
+    ) -> String {
+        let index = if let Some(workspace_id) = params.workspace_id {
+            let Some(index) = self.parse_workspace_id(&workspace_id) else {
+                return workspace_not_found(id, &workspace_id);
+            };
+            if self.state.workspaces.get(index).is_none() {
+                return workspace_not_found(id, &workspace_id);
+            }
+            index
+        } else {
+            let Some(index) = self.workspace_creation_source() else {
+                return encode_error(id, "workspace_not_found", "no workspace is focused");
+            };
+            index
+        };
+
+        let outcome = match self.apply_parent_space_action(index, action) {
+            Ok(outcome) => outcome,
+            Err(err) => return encode_error(id, err.code, err.message),
+        };
+        encode_success(
+            id,
+            ResponseResult::WorkspaceParentSpace {
+                parent_workspace_id: outcome.parent_workspace_id,
+                child_workspace_ids: outcome.child_workspace_ids,
+                cleared_count: outcome.cleared_count,
+            },
+        )
+    }
+
     pub(super) fn handle_workspace_report_metadata(
         &mut self,
         id: String,
@@ -279,8 +340,189 @@ fn workspace_not_found(id: String, workspace_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
-    use crate::{api::schema::SuccessResponse, config::Config, workspace::Workspace};
+    use crate::{
+        api::schema::{ErrorResponse, Method, Request, SuccessResponse},
+        config::Config,
+        workspace::{ParentSpaceMembership, Workspace},
+    };
+
+    static NEXT_PARENT_SPACE_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+    struct ParentSpaceApiFixture {
+        root: PathBuf,
+    }
+
+    impl ParentSpaceApiFixture {
+        fn new() -> Self {
+            let suffix = NEXT_PARENT_SPACE_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "herdr-parent-space-api-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+    }
+
+    impl Drop for ParentSpaceApiFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn parent_space_api_app(workspaces: Vec<Workspace>) -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.default_shell = super::super::test_support::exiting_test_command().into();
+        app.state.workspaces = workspaces;
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        app
+    }
+
+    #[tokio::test]
+    async fn api_parent_space_become_creates_and_adopts_children() {
+        let fixture = ParentSpaceApiFixture::new();
+        let alpha = fixture.root.join("alpha");
+        let beta = fixture.root.join("beta");
+        std::fs::create_dir(&alpha).unwrap();
+        std::fs::create_dir(&beta).unwrap();
+
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = fixture.root.clone();
+        let parent_id = parent.id.clone();
+        let mut existing_child = Workspace::test_new("alpha");
+        existing_child.identity_cwd = alpha.canonicalize().unwrap();
+        let existing_child_id = existing_child.id.clone();
+        let mut app = parent_space_api_app(vec![parent, existing_child]);
+
+        let response = app.handle_api_request(Request {
+            id: "become".into(),
+            method: Method::WorkspaceBecomeParent(WorkspaceParentSpaceParams {
+                workspace_id: None,
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorkspaceParentSpace {
+            parent_workspace_id,
+            child_workspace_ids,
+            cleared_count,
+        } = success.result
+        else {
+            panic!("expected parent-space result");
+        };
+        assert_eq!(parent_workspace_id, parent_id);
+        assert_eq!(cleared_count, 0);
+        assert_eq!(app.state.workspaces.len(), 3);
+        let created_child = app
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| {
+                crate::worktree::canonical_or_original(&workspace.identity_cwd)
+                    == beta.canonicalize().unwrap()
+            })
+            .expect("beta child workspace");
+        assert!(child_workspace_ids.contains(&existing_child_id));
+        assert!(child_workspace_ids.contains(&created_child.id));
+        assert!(app.state.workspaces[0].is_parent_space());
+        assert!(app.state.workspaces[1]
+            .parent_space()
+            .is_some_and(|membership| !membership.is_parent));
+        assert!(created_child
+            .parent_space()
+            .is_some_and(|membership| !membership.is_parent));
+
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[test]
+    fn api_parent_space_become_rejects_linked_worktree_child() {
+        let mut app = app_with_linked_worktree();
+        let workspace_id = app.state.workspaces[0].id.clone();
+
+        let response = app.handle_api_request(Request {
+            id: "linked".into(),
+            method: Method::WorkspaceBecomeParent(WorkspaceParentSpaceParams {
+                workspace_id: Some(workspace_id),
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "linked_worktree_parent_space");
+        assert!(app.state.workspaces[0].parent_space().is_none());
+    }
+
+    #[test]
+    fn api_parent_space_rescan_rejects_non_parent() {
+        let mut app = parent_space_api_app(vec![Workspace::test_new("plain")]);
+
+        let response = app.handle_api_request(Request {
+            id: "rescan".into(),
+            method: Method::WorkspaceRescanChildren(WorkspaceParentSpaceParams {
+                workspace_id: None,
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "not_parent_space");
+    }
+
+    #[test]
+    fn api_parent_space_stop_clears_membership() {
+        let fixture = ParentSpaceApiFixture::new();
+        let root = fixture.root.canonicalize().unwrap();
+        let parent_membership = ParentSpaceMembership {
+            key: format!("folder:{}", root.display()),
+            root: root.clone(),
+            is_parent: true,
+        };
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = root.clone();
+        parent.parent_space = Some(parent_membership.clone());
+        let parent_id = parent.id.clone();
+        let mut child = Workspace::test_new("child");
+        child.parent_space = Some(ParentSpaceMembership {
+            key: parent_membership.key.clone(),
+            root,
+            is_parent: false,
+        });
+        let mut app = parent_space_api_app(vec![parent, child]);
+
+        let response = app.handle_api_request(Request {
+            id: "stop".into(),
+            method: Method::WorkspaceStopParent(WorkspaceParentSpaceParams {
+                workspace_id: Some(parent_id.clone()),
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            success.result,
+            ResponseResult::WorkspaceParentSpace {
+                parent_workspace_id: parent_id,
+                child_workspace_ids: Vec::new(),
+                cleared_count: 2,
+            }
+        );
+        assert!(app
+            .state
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.parent_space().is_none()));
+    }
 
     // `new_cwd = follow` must anchor on the focused pane for every creation
     // surface. Splits and tabs already do; a new workspace must follow the

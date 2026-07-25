@@ -806,6 +806,18 @@ impl HeadlessServer {
             crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
         }
 
+        if let Some((ws_idx, action)) = self.app.state.request_parent_space_action.take() {
+            if let Err(err) = self.app.apply_parent_space_action(ws_idx, action) {
+                tracing::warn!(
+                    code = err.code,
+                    message = %err.message,
+                    "parent-space action failed"
+                );
+            }
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_parent_space_action");
+        }
+
         if let Some(cwd) = self.app.state.request_new_workspace_cwd.take() {
             let response = self.headless_workspace_create(
                 "headless.workspace.create_cwd",

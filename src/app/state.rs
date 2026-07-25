@@ -618,7 +618,7 @@ impl Palette {
 pub struct WorkspaceCardArea {
     pub ws_idx: usize,
     pub rect: Rect,
-    pub indented: bool,
+    pub indent: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1194,15 +1194,31 @@ pub(crate) struct TabPressState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParentSpaceAction {
+    Become,
+    Rescan,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentSpaceMenu {
+    Unavailable,
+    Become,
+    Manage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuKind {
     Workspace {
         ws_idx: usize,
+        parent_space: ParentSpaceMenu,
     },
     GitWorkspace {
         ws_idx: usize,
         is_linked_worktree: bool,
         has_worktree_children: bool,
         collapsed: bool,
+        parent_space: ParentSpaceMenu,
     },
     Tab {
         ws_idx: usize,
@@ -1226,24 +1242,24 @@ pub struct ContextMenuState {
 }
 
 impl ContextMenuState {
-    pub fn items(&self) -> &'static [&'static str] {
-        match self.kind {
-            ContextMenuKind::Workspace { .. } => &["Rename", "Close"],
+    pub fn items(&self) -> Vec<&'static str> {
+        let mut items = match self.kind {
+            ContextMenuKind::Workspace { .. } => vec!["Rename", "Close"],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: false,
                 ..
-            } => &["Rename", "Close", "New worktree", "Open worktree..."],
+            } => vec!["Rename", "Close", "New worktree", "Open worktree..."],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: true,
                 ..
-            } => &["Rename", "Close", "Delete worktree checkout..."],
+            } => vec!["Rename", "Close", "Delete worktree checkout..."],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: true,
                 collapsed: true,
                 ..
-            } => &[
+            } => vec![
                 "Rename",
                 "Close group",
                 "New worktree",
@@ -1255,19 +1271,19 @@ impl ContextMenuState {
                 has_worktree_children: true,
                 collapsed: false,
                 ..
-            } => &[
+            } => vec![
                 "Rename",
                 "Close group",
                 "New worktree",
                 "Open worktree...",
                 "Collapse",
             ],
-            ContextMenuKind::Tab { .. } => &["New tab", "Rename", "Close"],
+            ContextMenuKind::Tab { .. } => vec!["New tab", "Rename", "Close"],
             ContextMenuKind::Pane {
                 has_manual_label: true,
                 source_pane_id: Some(_),
                 ..
-            } => &[
+            } => vec![
                 "Rename pane",
                 "Clear pane name",
                 "Swap with focused pane",
@@ -1280,7 +1296,7 @@ impl ContextMenuState {
                 has_manual_label: false,
                 source_pane_id: Some(_),
                 ..
-            } => &[
+            } => vec![
                 "Rename pane",
                 "Swap with focused pane",
                 "Split right",
@@ -1292,7 +1308,7 @@ impl ContextMenuState {
                 has_manual_label: true,
                 source_pane_id: None,
                 ..
-            } => &[
+            } => vec![
                 "Rename pane",
                 "Clear pane name",
                 "Split right",
@@ -1304,14 +1320,34 @@ impl ContextMenuState {
                 has_manual_label: false,
                 source_pane_id: None,
                 ..
-            } => &[
+            } => vec![
                 "Rename pane",
                 "Split right",
                 "Split down",
                 "Zoom",
                 "Close pane",
             ],
+        };
+        let parent_space = match self.kind {
+            ContextMenuKind::Workspace { parent_space, .. }
+            | ContextMenuKind::GitWorkspace { parent_space, .. } => parent_space,
+            _ => ParentSpaceMenu::Unavailable,
+        };
+        let insert_idx = items
+            .iter()
+            .position(|item| matches!(*item, "Collapse" | "Expand"))
+            .unwrap_or(items.len());
+        match parent_space {
+            ParentSpaceMenu::Unavailable => {}
+            ParentSpaceMenu::Become => {
+                items.insert(insert_idx, "Become parent space");
+            }
+            ParentSpaceMenu::Manage => {
+                items.insert(insert_idx, "Re-scan sub-spaces");
+                items.insert(insert_idx + 1, "Stop being parent");
+            }
         }
+        items
     }
 }
 
@@ -1422,6 +1458,7 @@ pub struct AppState {
     pub request_new_tab: bool,
     pub request_new_linked_worktree: Option<usize>,
     pub request_open_existing_worktree: Option<usize>,
+    pub request_parent_space_action: Option<(usize, ParentSpaceAction)>,
     pub request_new_workspace_cwd: Option<std::path::PathBuf>,
     pub request_remove_linked_worktree: Option<usize>,
     pub request_submit_worktree_create: bool,
@@ -1796,6 +1833,7 @@ impl AppState {
             request_new_tab: false,
             request_new_linked_worktree: None,
             request_open_existing_worktree: None,
+            request_parent_space_action: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
             request_submit_worktree_create: false,
@@ -2245,7 +2283,7 @@ impl AppState {
         }
         if let Some(menu) = &self.context_menu {
             match menu.kind {
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                     assert_workspace_index(ws_idx, "context menu workspace")
                 }
@@ -2464,6 +2502,7 @@ mod tests {
                 is_linked_worktree: true,
                 has_worktree_children: false,
                 collapsed: false,
+                parent_space: ParentSpaceMenu::Unavailable,
             },
             x: 0,
             y: 0,
@@ -2472,7 +2511,7 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "Delete worktree checkout..."]
+            vec!["Rename", "Close", "Delete worktree checkout..."]
         );
     }
 
@@ -2484,6 +2523,7 @@ mod tests {
                 is_linked_worktree: false,
                 has_worktree_children: false,
                 collapsed: false,
+                parent_space: ParentSpaceMenu::Unavailable,
             },
             x: 0,
             y: 0,
@@ -2492,7 +2532,7 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "New worktree", "Open worktree..."]
+            vec!["Rename", "Close", "New worktree", "Open worktree..."]
         );
     }
 
@@ -2504,6 +2544,7 @@ mod tests {
                 is_linked_worktree: false,
                 has_worktree_children: true,
                 collapsed: false,
+                parent_space: ParentSpaceMenu::Unavailable,
             },
             x: 0,
             y: 0,
@@ -2512,13 +2553,44 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            &[
+            vec![
                 "Rename",
                 "Close group",
                 "New worktree",
                 "Open worktree...",
                 "Collapse"
             ]
+        );
+    }
+
+    #[test]
+    fn workspace_context_menu_exposes_parent_space_actions_for_role() {
+        let become_menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                parent_space: ParentSpaceMenu::Become,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        assert_eq!(
+            become_menu.items(),
+            vec!["Rename", "Close", "Become parent space"]
+        );
+
+        let manage = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                parent_space: ParentSpaceMenu::Manage,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        assert_eq!(
+            manage.items(),
+            vec!["Rename", "Close", "Re-scan sub-spaces", "Stop being parent"]
         );
     }
 }

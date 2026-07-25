@@ -1602,6 +1602,23 @@ impl AppState {
         self.selection = None;
         self.selection_autoscroll = None;
         self.mark_session_dirty();
+        let parent_space_key = self
+            .workspaces
+            .get(self.selected)
+            .and_then(|ws| ws.parent_space())
+            .filter(|space| space.is_parent)
+            .map(|space| space.key.clone());
+        if let Some(key) = parent_space_key {
+            for workspace in &mut self.workspaces {
+                if workspace
+                    .parent_space()
+                    .is_some_and(|membership| membership.key == key)
+                {
+                    workspace.parent_space = None;
+                }
+            }
+            self.collapsed_space_keys.remove(&key);
+        }
         let close_indices = self
             .workspaces
             .get(self.selected)
@@ -4398,6 +4415,53 @@ mod tests {
         assert_eq!(state.workspaces[0].display_name(), "notes");
         assert_eq!(state.active, Some(0));
         assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn close_parent_space_keeps_children_and_clears_membership() {
+        let mut state = app_with_workspaces(&["parent", "child", "notes"]);
+        state.workspaces[0].parent_space = Some(crate::workspace::ParentSpaceMembership {
+            key: "folder:/projects".into(),
+            root: "/projects".into(),
+            is_parent: true,
+        });
+        state.workspaces[1].parent_space = Some(crate::workspace::ParentSpaceMembership {
+            key: "folder:/projects".into(),
+            root: "/projects".into(),
+            is_parent: false,
+        });
+        state.selected = 0;
+        state.active = Some(0);
+
+        state.close_selected_workspace();
+
+        assert_eq!(state.workspaces.len(), 2);
+        assert_eq!(state.workspaces[0].display_name(), "child");
+        assert!(state.workspaces[0].parent_space.is_none());
+        assert_eq!(state.workspaces[1].display_name(), "notes");
+    }
+
+    #[test]
+    fn close_parent_space_child_only_closes_that_workspace() {
+        let mut state = app_with_workspaces(&["parent", "child", "notes"]);
+        state.workspaces[0].parent_space = Some(crate::workspace::ParentSpaceMembership {
+            key: "folder:/projects".into(),
+            root: "/projects".into(),
+            is_parent: true,
+        });
+        state.workspaces[1].parent_space = Some(crate::workspace::ParentSpaceMembership {
+            key: "folder:/projects".into(),
+            root: "/projects".into(),
+            is_parent: false,
+        });
+        state.selected = 1;
+        state.active = Some(1);
+
+        state.close_selected_workspace();
+
+        assert_eq!(state.workspaces.len(), 2);
+        assert!(state.workspaces[0].is_parent_space());
+        assert_eq!(state.workspaces[1].display_name(), "notes");
     }
 
     #[test]
