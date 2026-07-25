@@ -2080,7 +2080,7 @@ impl AppState {
         self.selection_autoscroll = None;
     }
 
-    pub(crate) fn copy_word_at_pane_cell(
+    pub(crate) fn select_word_at_pane_cell(
         &mut self,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
         pane_id: crate::layout::PaneId,
@@ -2130,23 +2130,30 @@ impl AppState {
             return false;
         };
 
-        // Copy the token and keep its selection visible as short-lived feedback.
         let mut selection = Selection::range(pane_id, viewport_row, start_col, end_col, metrics);
         if !selection.finish() {
             return false;
         }
 
-        let Some(text) = rt
-            .extract_selection(&selection)
-            .filter(|text| !text.is_empty())
-        else {
-            self.clear_selection();
-            return false;
+        let text = if self.copy_on_select {
+            let Some(text) = rt
+                .extract_selection(&selection)
+                .filter(|text| !text.is_empty())
+            else {
+                self.clear_selection();
+                return false;
+            };
+            Some(text)
+        } else {
+            None
         };
-        self.request_clipboard_write = Some(text.into_bytes());
+
         self.selection = Some(selection);
         self.selection_autoscroll = None;
-        info!("copied double-clicked token to clipboard");
+        if let Some(text) = text {
+            self.request_clipboard_write = Some(text.into_bytes());
+            info!("copied double-clicked token to clipboard");
+        }
         true
     }
 
@@ -2201,7 +2208,7 @@ impl AppState {
             Some(sel) => sel,
             None => return,
         };
-        if !sel.finish() {
+        if !sel.is_finalized() && !sel.finish() {
             return;
         }
 
@@ -2617,11 +2624,21 @@ impl AppState {
             }
 
             let ws = &mut self.workspaces[ws_idx];
-            if ws.cached_git_branch != result.branch {
+            if ws.cached_identity_cwd != result.resolved_identity_cwd {
+                ws.cached_identity_cwd = result.resolved_identity_cwd;
+            }
+            if ws.cached_auto_label != result.auto_label {
+                ws.cached_auto_label = result.auto_label;
+                changed |= ws.custom_name.is_none();
+            }
+            if ws.cached_git_status_key != result.status_cache_key {
+                ws.cached_git_status_key = result.status_cache_key;
+            }
+            if result.demand.branch && ws.cached_git_branch != result.branch {
                 ws.cached_git_branch = result.branch;
                 changed = true;
             }
-            if ws.cached_git_ahead_behind != result.ahead_behind {
+            if result.demand.ahead_behind && ws.cached_git_ahead_behind != result.ahead_behind {
                 ws.cached_git_ahead_behind = result.ahead_behind;
                 changed = true;
             }
@@ -2810,7 +2827,7 @@ impl AppState {
                 seq,
                 ..
             } => {
-                if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
+                if crate::agent_resume::is_official_agent_source(&source, &agent_label) {
                     Vec::new()
                 } else {
                     self.update_terminal_state(pane_id, |terminal| {
@@ -2907,8 +2924,16 @@ impl AppState {
             previous_state: change.previous_state,
             previous_seen,
             previous_presentation: change.previous_presentation.clone(),
-            agent_label: change.agent_label.clone(),
-            known_agent: change.known_agent,
+            agent_label: if agent_released {
+                change.previous_agent_label.clone()
+            } else {
+                change.agent_label.clone()
+            },
+            known_agent: if agent_released {
+                change.previous_known_agent
+            } else {
+                change.known_agent
+            },
             state: change.state,
             seen,
             presentation: change.presentation.clone(),
@@ -3028,7 +3053,11 @@ impl AppState {
             return None;
         }
 
-        let agent_label = change.agent_label.clone()?;
+        let agent_label = change
+            .agent_label
+            .clone()
+            .or_else(|| change.previous_agent_label.clone())?;
+        let known_agent = change.known_agent.or(change.previous_known_agent);
         let kind = client_notification_kind.unwrap_or(match sound {
             Some(crate::sound::Sound::Request) => ToastKind::NeedsAttention,
             Some(crate::sound::Sound::Done) | None => ToastKind::Finished,
@@ -3041,7 +3070,7 @@ impl AppState {
                 pane_id,
                 workspace_id,
                 agent_label,
-                change.known_agent,
+                known_agent,
                 kind,
                 change.state,
             );
@@ -3053,7 +3082,7 @@ impl AppState {
                 pane_id,
                 workspace_id,
                 agent_label,
-                known_agent: change.known_agent,
+                known_agent,
                 kind,
                 state: change.state,
                 deadline: {
@@ -3088,7 +3117,10 @@ impl AppState {
         if terminal_state.state != expected_state {
             return None;
         }
-        if terminal_state.effective_agent_label() != Some(agent_label.as_str()) {
+        if terminal_state
+            .effective_agent_label()
+            .is_some_and(|current| current != agent_label)
+        {
             return None;
         }
 
@@ -3098,7 +3130,8 @@ impl AppState {
         let sound = sound_for_toast_kind(kind, suppress_active_tab_notifications)
             .filter(|_| self.sound.allows(known_agent));
         let build_toast = || {
-            let workspace_label = self.workspaces[ws_idx].display_name();
+            let workspace_label =
+                self.workspaces[ws_idx].display_name_from_terminals(&self.terminals);
             let context =
                 notification_context(&self.workspaces[ws_idx], &workspace_label, ws_idx, pane_id);
             ToastNotification {
@@ -3899,7 +3932,10 @@ mod tests {
             &terminal_runtimes,
             vec![WorkspaceGitStatus {
                 workspace_id: first_id,
-                resolved_identity_cwd: first_cwd,
+                resolved_identity_cwd: first_cwd.clone(),
+                status_cache_key: first_cwd,
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "one".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
                 space: None,
@@ -3926,6 +3962,9 @@ mod tests {
             vec![WorkspaceGitStatus {
                 workspace_id,
                 resolved_identity_cwd: std::path::PathBuf::from("/definitely/not/current"),
+                status_cache_key: std::path::PathBuf::from("/definitely/not/current"),
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "stale".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 1)),
                 space: None,
@@ -3935,6 +3974,36 @@ mod tests {
         assert!(!changed);
         assert_eq!(state.workspaces[0].branch().as_deref(), Some("old"));
         assert_eq!(state.workspaces[0].git_ahead_behind(), Some((1, 0)));
+    }
+
+    #[test]
+    fn apply_workspace_git_statuses_ignores_unrequested_branch_changes() {
+        let mut state = app_with_workspaces(&["one"]);
+        let workspace_id = state.workspaces[0].id.clone();
+        let cwd = state.workspaces[0].resolved_identity_cwd().unwrap();
+        state.workspaces[0].cached_auto_label = "one".into();
+        state.workspaces[0].cached_git_branch = Some("old".into());
+
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let changed = state.apply_workspace_git_statuses(
+            &terminal_runtimes,
+            vec![WorkspaceGitStatus {
+                workspace_id,
+                resolved_identity_cwd: cwd.clone(),
+                status_cache_key: cwd,
+                demand: crate::workspace::GitStatusRefreshDemand {
+                    branch: false,
+                    ahead_behind: true,
+                },
+                auto_label: "one".into(),
+                branch: Some("new".into()),
+                ahead_behind: None,
+                space: None,
+            }],
+        );
+
+        assert!(!changed);
+        assert_eq!(state.workspaces[0].branch().as_deref(), Some("old"));
     }
 
     #[test]
@@ -3950,7 +4019,10 @@ mod tests {
             &terminal_runtimes,
             vec![WorkspaceGitStatus {
                 workspace_id,
-                resolved_identity_cwd: cwd,
+                resolved_identity_cwd: cwd.clone(),
+                status_cache_key: cwd,
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "one".into(),
                 branch: None,
                 ahead_behind: None,
                 space: None,
@@ -3975,7 +4047,10 @@ mod tests {
             &terminal_runtimes,
             vec![WorkspaceGitStatus {
                 workspace_id,
-                resolved_identity_cwd: cwd,
+                resolved_identity_cwd: cwd.clone(),
+                status_cache_key: cwd,
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "other".into(),
                 branch: Some("scratch".into()),
                 ahead_behind: None,
                 space: Some(crate::workspace::GitSpaceMetadata {
@@ -5042,7 +5117,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_native_release_report_does_not_clear_screen_state() {
+    fn official_release_preserves_process_owned_agent_identity() {
         let mut state = app_with_workspaces(&["active"]);
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
         let terminal_id = state.workspaces[0]
@@ -5054,24 +5129,51 @@ mod tests {
 
         state.handle_app_event(AppEvent::StateChanged {
             pane_id,
-            agent: Some(Agent::Claude),
+            agent: Some(Agent::Pi),
             state: AgentState::Working,
             visible_blocker: false,
             visible_working: true,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
-        state.handle_app_event(AppEvent::HookAgentReleased {
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path(
+                std::env::current_dir()
+                    .unwrap()
+                    .join("release-session.jsonl")
+                    .display()
+                    .to_string(),
+            )
+            .unwrap(),
+        });
+        terminal.set_hook_authority(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(1),
+        );
+        terminal.set_agent_name("reviewer".into());
+        state.session_dirty = false;
+
+        let updates = state.handle_app_event(AppEvent::HookAgentReleased {
             pane_id,
-            source: "herdr:claude".into(),
-            agent_label: "claude".into(),
-            known_agent: Some(Agent::Claude),
-            seq: Some(1),
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            known_agent: Some(Agent::Pi),
+            seq: Some(2),
         });
 
-        let terminal = state.terminals.get(&terminal_id).unwrap();
+        assert!(updates.is_empty());
+        let terminal = &state.terminals[&terminal_id];
         assert_eq!(terminal.state, AgentState::Working);
-        assert_eq!(terminal.detected_agent, Some(Agent::Claude));
+        assert_eq!(terminal.detected_agent, Some(Agent::Pi));
+        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert!(terminal.full_lifecycle_hook_authority_active());
+        assert!(!state.session_dirty);
     }
 
     #[test]
@@ -5145,7 +5247,7 @@ mod tests {
     }
 
     #[test]
-    fn releasing_an_agent_alias_marks_the_session_dirty() {
+    fn custom_release_clears_report_owned_agent() {
         let mut state = app_with_workspaces(&["active"]);
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
         let terminal_id = state.workspaces[0]
@@ -5153,21 +5255,29 @@ mod tests {
             .unwrap()
             .attached_terminal_id
             .clone();
-        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
-        terminal.set_agent_name("reviewer".into());
-        state.session_dirty = false;
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_hook_authority(
+                "custom:agent".into(),
+                "custom-agent".into(),
+                AgentState::Working,
+                None,
+                Some(1),
+            );
 
         state.handle_app_event(AppEvent::HookAgentReleased {
             pane_id,
-            source: "herdr:pi".into(),
-            agent_label: "pi".into(),
-            known_agent: Some(Agent::Pi),
-            seq: Some(1),
+            source: "custom:agent".into(),
+            agent_label: "custom-agent".into(),
+            known_agent: None,
+            seq: Some(2),
         });
 
-        assert!(state.terminals[&terminal_id].agent_name.is_none());
-        assert!(state.session_dirty);
+        let terminal = &state.terminals[&terminal_id];
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(terminal.state, AgentState::Unknown);
     }
 
     #[test]

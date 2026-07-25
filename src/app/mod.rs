@@ -12,6 +12,7 @@ mod api;
 mod api_helpers;
 mod config_io;
 mod creation;
+mod git_refresh;
 mod ids;
 mod input;
 mod parent_spaces;
@@ -39,6 +40,7 @@ pub(crate) const HEADLESS_ANIMATION_TICK_STEP: u32 = 8;
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
+const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
@@ -111,8 +113,10 @@ pub struct App {
     pub(crate) copy_feedback_deadline: Option<Instant>,
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
+    pub(crate) last_git_repo_discovery_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
+    pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
@@ -120,6 +124,7 @@ pub struct App {
     pub(crate) next_api_worktree_operation_id: u64,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
+    pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_animation_tick: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
@@ -574,7 +579,7 @@ impl App {
                     preview: announcement.preview,
                 }
             }),
-            keybind_help: state::KeybindHelpState { scroll: 0 },
+            keybind_help: state::KeybindHelpState::default(),
             navigator: state::NavigatorState::default(),
             copy_mode: None,
             workspace_scroll: 0,
@@ -737,8 +742,10 @@ impl App {
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
+            last_git_repo_discovery_refresh: Instant::now(),
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
+            git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
             pending_api_worktree_creates: HashMap::new(),
             pending_api_worktree_removes: HashMap::new(),
@@ -746,6 +753,7 @@ impl App {
             next_api_worktree_operation_id: 1,
             last_sidebar_divider_click: None,
             last_pane_click: None,
+            pending_url_click_sources: HashSet::new(),
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_animation_tick: None,
             next_auto_update_check: version_check_enabled
@@ -864,7 +872,7 @@ impl App {
         self.terminal_runtimes.assume_handoff_ownership();
     }
 
-    fn request_full_redraw(&mut self) {
+    fn request_repaint(&mut self) {
         self.full_redraw_pending = true;
     }
 
@@ -892,10 +900,11 @@ impl App {
     pub(crate) fn handle_internal_event_with_prefix_sync(
         &mut self,
         event: crate::events::AppEvent,
-    ) {
+    ) -> bool {
         let previous_mode = self.state.mode;
-        self.handle_internal_event(event);
+        let changed = self.handle_internal_event_with_render_impact(event);
         self.sync_prefix_input_source(previous_mode);
+        changed
     }
 
     #[cfg(test)]
@@ -1059,10 +1068,10 @@ impl App {
                 let _sync_output = SyncOutputGuard::begin()?;
                 let kitty_graphics_enabled = self.state.kitty_graphics_enabled;
                 if self.full_redraw_pending {
-                    if kitty_graphics_enabled {
-                        crate::kitty_graphics::clear_all_host_graphics()?;
+                    for cell in &mut terminal.current_buffer_mut().content {
+                        cell.set_skip(true);
                     }
-                    terminal.clear()?;
+                    terminal.swap_buffers();
                     self.full_redraw_pending = false;
                 }
                 let mut cell_size = crate::kitty_graphics::HostCellSize::default();
@@ -1137,8 +1146,9 @@ impl App {
             match event {
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
-                    self.handle_internal_event_with_prefix_sync(ev);
-                    needs_render = true;
+                    if self.handle_internal_event_with_prefix_sync(ev) {
+                        needs_render = true;
+                    }
                 }
                 LoopEvent::Api(msg) => {
                     if self.handle_api_request_message(*msg) {
@@ -1632,7 +1642,9 @@ impl App {
                             if self.state.popup_pane.is_some() || self.state.mode == Mode::Terminal
                             {
                                 self.suppressed_repeat_keys.remove(&pressed_key_id);
-                                if let Some(target) = self.handle_terminal_key_headless(key) {
+                                if let Some(target) =
+                                    self.handle_terminal_key_headless_from(source_id, key)
+                                {
                                     if !key.is_text_commit {
                                         self.pressed_terminal_keys.insert(
                                             pressed_key_id,
@@ -1661,7 +1673,7 @@ impl App {
                                 || self.state.mode == Mode::Terminal)
                                 && !self.suppressed_repeat_keys.contains(&pressed_key_id)
                             {
-                                let _ = self.handle_terminal_key_headless(key);
+                                let _ = self.handle_terminal_key_headless_from(source_id, key);
                             }
                         }
                         crossterm::event::KeyEventKind::Release => {
@@ -1677,7 +1689,7 @@ impl App {
                 }
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
                     if self.state.popup_pane.is_some() || self.state.mouse_capture {
-                        self.handle_mouse_event_headless(mouse);
+                        self.handle_mouse_event_headless(source_id, mouse);
                     } else {
                         self.state
                             .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
@@ -1705,6 +1717,11 @@ impl App {
                 crate::raw_input::RawInputEvent::HostDefaultColor { kind, color } => {
                     if apply_host_terminal_theme {
                         self.update_host_terminal_theme(kind, color);
+                    }
+                }
+                crate::raw_input::RawInputEvent::HostPaletteColors { colors } => {
+                    if apply_host_terminal_theme {
+                        self.update_host_terminal_palette_colors(&colors);
                     }
                 }
                 crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
@@ -1785,7 +1802,7 @@ impl App {
                 self.handle_context_menu_key_via_api(key_event);
             }
             Mode::KeybindHelp => {
-                input::handle_keybind_help_key(&mut self.state, key_event);
+                input::handle_keybind_help_key(&mut self.state, key);
             }
             Mode::GlobalMenu => {
                 input::handle_global_menu_key(&mut self.state, key_event);
@@ -1816,8 +1833,12 @@ impl App {
     /// Delegates to the same mouse handling logic used in the monolithic
     /// mode (hit-testing against the rendered UI), which works because
     /// the server's AppState maintains view geometry from virtual rendering.
-    fn handle_mouse_event_headless(&mut self, mouse: crossterm::event::MouseEvent) {
-        self.handle_mouse(mouse);
+    fn handle_mouse_event_headless(
+        &mut self,
+        source_id: InputSourceId,
+        mouse: crossterm::event::MouseEvent,
+    ) {
+        self.handle_mouse_from_input_source(source_id, mouse);
     }
 }
 
@@ -2139,6 +2160,20 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_git_status_event_has_no_render_impact() {
+        let mut app = test_app();
+        app.git_refresh_in_flight = true;
+
+        let changed = app.handle_internal_event_with_prefix_sync(AppEvent::GitStatusRefreshed {
+            results: Vec::new(),
+            cache_updates: Vec::new(),
+        });
+
+        assert!(!changed);
+        assert!(!app.git_refresh_in_flight);
+    }
+
+    #[test]
     fn git_status_event_clears_in_flight_refresh() {
         let mut app = test_app();
         app.git_refresh_in_flight = true;
@@ -2165,7 +2200,10 @@ mod tests {
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
             results: vec![crate::workspace::WorkspaceGitStatus {
                 workspace_id,
-                resolved_identity_cwd,
+                resolved_identity_cwd: resolved_identity_cwd.clone(),
+                status_cache_key: resolved_identity_cwd,
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "one".into(),
                 branch: Some("render-dirty-test".into()),
                 ahead_behind: Some((1, 0)),
                 space: None,
@@ -2393,6 +2431,21 @@ mod tests {
             }
         );
         assert!(app.state.toast.is_none());
+    }
+
+    #[test]
+    fn unchanged_git_status_drain_has_no_render_impact() {
+        let mut app = test_app();
+        app.git_refresh_in_flight = true;
+        app.event_tx
+            .try_send(AppEvent::GitStatusRefreshed {
+                results: Vec::new(),
+                cache_updates: Vec::new(),
+            })
+            .unwrap();
+
+        assert!(!app.drain_internal_events());
+        assert!(!app.git_refresh_in_flight);
     }
 
     #[test]
@@ -5868,7 +5921,7 @@ last_pane = "prefix+tab"
     fn route_client_input_updates_host_terminal_theme_from_osc_response() {
         let mut app = test_app();
 
-        app.route_client_input(b"\x1b]11;#123456\x07".to_vec());
+        app.route_client_input(b"\x1b]11;#123456\x07\x1b]4;7;rgb:aaaa/bbbb/cccc\x1b\\".to_vec());
 
         assert_eq!(
             app.state.host_terminal_theme.background,
@@ -5876,6 +5929,34 @@ last_pane = "prefix+tab"
                 r: 0x12,
                 g: 0x34,
                 b: 0x56,
+            })
+        );
+        assert_eq!(
+            app.state.host_terminal_theme.palette[7],
+            Some(crate::terminal_theme::RgbColor {
+                r: 0xaa,
+                g: 0xbb,
+                b: 0xcc,
+            })
+        );
+
+        app.route_client_input(crate::raw_input::GHOSTTY_COLOR_SCHEME_DARK_REPORT.to_vec());
+        assert_eq!(
+            app.state.host_terminal_theme.palette[7],
+            Some(crate::terminal_theme::RgbColor {
+                r: 0xaa,
+                g: 0xbb,
+                b: 0xcc,
+            })
+        );
+
+        app.route_client_input(b"\x1b]4;7;rgb:dddd/eeee/ffff\x1b\\".to_vec());
+        assert_eq!(
+            app.state.host_terminal_theme.palette[7],
+            Some(crate::terminal_theme::RgbColor {
+                r: 0xdd,
+                g: 0xee,
+                b: 0xff,
             })
         );
     }
