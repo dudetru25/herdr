@@ -1740,6 +1740,9 @@ fn workspace_can_start_worktree_action(
     let Some(ws) = state.workspaces.get(ws_idx) else {
         return false;
     };
+    if ws.is_machine() {
+        return false;
+    }
     if ws
         .worktree_space()
         .is_some_and(|space| space.is_linked_worktree)
@@ -1873,6 +1876,38 @@ mod tests {
         app.state.active = (!app.state.workspaces.is_empty()).then_some(0);
         app.state.selected = 0;
         app
+    }
+
+    #[cfg(unix)]
+    fn with_missing_current_dir(test: impl FnOnce()) {
+        struct RestoreCurrentDir(std::path::PathBuf);
+
+        impl Drop for RestoreCurrentDir {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).unwrap();
+            }
+        }
+
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let original = std::env::current_dir().unwrap();
+        let missing = unique_temp_path("missing-interactive-cwd");
+        std::fs::create_dir_all(&missing).unwrap();
+        std::env::set_current_dir(&missing).unwrap();
+        let restore = RestoreCurrentDir(original);
+        std::fs::remove_dir(&missing).unwrap();
+
+        test();
+
+        drop(restore);
+    }
+
+    #[test]
+    fn machine_workspace_suppresses_worktree_actions() {
+        let mut state = state_with_workspaces(&["build"]);
+        state.workspaces[0].machine = Some("build".into());
+        let runtimes = TerminalRuntimeRegistry::new();
+
+        assert!(!workspace_can_start_worktree_action(&state, &runtimes, 0));
     }
 
     #[test]
@@ -2035,6 +2070,8 @@ mod tests {
         app.state.keybinds.new_workspace = crate::config::ActionKeybinds::prefix("g");
 
         app.handle_navigate_key(TerminalKey::new(KeyCode::Char('g'), KeyModifiers::empty()));
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
         assert_eq!(app.state.mode, Mode::RenameWorkspace);
         assert_eq!(app.state.name_input, suggested_name);
@@ -2066,6 +2103,8 @@ mod tests {
         app.state.mode = Mode::Navigate;
 
         app.execute_tui_navigate_action(NavigateAction::NewWorkspace, ActionContext::Navigate);
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
         app.state.name_input = "  logs  ".into();
         app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
@@ -2076,6 +2115,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tui_new_tab_cwd_resolution_error_is_visible() {
+        let mut app = app_with_test_workspaces(&["test"]);
+        app.state.new_terminal_cwd = crate::config::NewTerminalCwdConfig::Current;
+        app.state.prompt_new_tab_name = false;
+        app.state.mode = Mode::Navigate;
+
+        with_missing_current_dir(|| {
+            app.execute_tui_navigate_action(NavigateAction::NewTab, ActionContext::Navigate);
+        });
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        let toast = app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "tab creation failed");
+        assert!(toast.context.contains("tab_create_failed"));
+        assert!(app.toast_deadline.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_pane_split_cwd_resolution_error_is_visible() {
+        let mut app = app_with_test_workspaces(&["test"]);
+        app.state.new_terminal_cwd = crate::config::NewTerminalCwdConfig::Current;
+
+        with_missing_current_dir(|| {
+            app.split_focused_pane_via_api(crate::api::schema::SplitDirection::Right);
+        });
+
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
+        let toast = app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "pane creation failed");
+        assert!(toast.context.contains("pane_split_failed"));
+        assert!(app.toast_deadline.is_some());
+    }
+
     #[test]
     fn cancelling_new_workspace_prompt_creates_nothing() {
         let mut app = app_with_test_workspaces(&["test"]);
@@ -2083,6 +2160,8 @@ mod tests {
         app.state.mode = Mode::Navigate;
 
         app.execute_tui_navigate_action(NavigateAction::NewWorkspace, ActionContext::Navigate);
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
         app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
 
         assert_eq!(app.state.workspaces.len(), 1);
@@ -2679,6 +2758,8 @@ command = "printf literal > '{}'"
         app.state.mode = Mode::Navigate;
 
         app.handle_navigate_key(TerminalKey::new(KeyCode::Char('n'), KeyModifiers::SHIFT));
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
         assert_eq!(app.state.workspaces.len(), 2);
         assert_eq!(app.state.mode, Mode::Terminal);
@@ -2700,6 +2781,8 @@ command = "printf literal > '{}'"
         app.state.mode = Mode::Navigate;
 
         app.handle_navigate_key(TerminalKey::new(KeyCode::Char('N'), KeyModifiers::empty()));
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
         assert_eq!(app.state.workspaces.len(), 2);
         assert_eq!(app.state.mode, Mode::Terminal);

@@ -112,7 +112,7 @@ herdr session delete <name> [--json]
 
 ```bash
 herdr workspace list
-herdr workspace create [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]
+herdr workspace create [--cwd PATH | --machine NAME] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]
 herdr workspace get <workspace_id>
 herdr workspace focus <workspace_id>
 herdr workspace rename <workspace_id> <label>
@@ -127,6 +127,15 @@ herdr workspace create --cwd ~/project --label api --no-focus
 ```
 
 ワークスペースは最上位のプロジェクトまたは作業コンテキストです。作成時に最初のタブとルートペインも作られます。JSON レスポンスの `.result.workspace.workspace_id`、`.result.tab.tab_id`、`.result.root_pane.pane_id` から各 ID を取得できます。
+
+## マシン
+
+```bash
+herdr machine list
+herdr workspace create --machine build
+```
+
+`machine list` は現在の `[[machines]]` レジストリを表示します。`workspace create --machine NAME` は SSH ベースのワークスペースを作成します。`--machine` と `--cwd` は同時に指定できません。
 
 ## Worktree
 

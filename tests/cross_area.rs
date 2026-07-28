@@ -954,7 +954,15 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
     drain_server_messages(&mut client_a, Duration::from_millis(250));
     drain_server_messages(&mut client_b, Duration::from_millis(250));
 
-    let created = workspace_create(&api_socket, "shared-view");
+    let created = send_json_request(
+        &api_socket,
+        "workspace_create",
+        "workspace.create",
+        json!({
+            "label": "shared-view",
+            "focus": true,
+        }),
+    );
     let pane_id = created["result"]["root_pane"]["pane_id"]
         .as_str()
         .expect("root pane id")

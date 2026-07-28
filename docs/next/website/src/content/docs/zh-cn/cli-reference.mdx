@@ -112,7 +112,7 @@ herdr session delete <name> [--json]
 
 ```bash
 herdr workspace list
-herdr workspace create [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]
+herdr workspace create [--cwd PATH | --machine NAME] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]
 herdr workspace get <workspace_id>
 herdr workspace focus <workspace_id>
 herdr workspace rename <workspace_id> <label>
@@ -127,6 +127,15 @@ herdr workspace create --cwd ~/project --label api --no-focus
 ```
 
 工作区是顶层项目或工作上下文。创建工作区也会创建第一个标签页和根窗格。JSON 响应中的 `.result.workspace.workspace_id`、`.result.tab.tab_id` 和 `.result.root_pane.pane_id` 是对应 ID。
+
+## 机器
+
+```bash
+herdr machine list
+herdr workspace create --machine build
+```
+
+`machine list` 输出当前的 `[[machines]]` 注册表。`workspace create --machine NAME` 创建基于 SSH 的工作区；`--machine` 与 `--cwd` 不能同时使用。
 
 ## Worktree
 

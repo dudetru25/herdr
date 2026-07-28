@@ -11,6 +11,17 @@ herdr
 
 Herdr launches or attaches to your default background session. You do not manage sockets. If you detach, agents keep running.
 
+If you are running a source build, validate the shell-visible client before a
+local reload:
+
+```bash
+just reload-local-check
+```
+
+This check does not build, install, change `PATH`, or restart the server. It
+fails when bare `herdr` resolves somewhere other than the repository reload
+destination, or when that client does not match the running server protocol.
+
 ## Create a workspace
 
 When a session has no workspaces, Herdr opens one automatically. A workspace is a project-level container for tabs, panes, and agents. Give each active project its own workspace; this keeps agent state readable in the sidebar.
@@ -18,6 +29,8 @@ When a session has no workspaces, Herdr opens one automatically. A workspace is 
 ## Use the mouse
 
 Herdr is mouse-native, so start by clicking. Click panes, tabs, workspaces, and agents to focus them. Drag split borders to resize. Right-click for context menus, including splitting panes and creating tabs. Drag-select text to copy it to your clipboard; double-click a token to copy it directly. Copying does not require Ctrl+C.
+
+On macOS, use the normal `Cmd+V` shortcut for both text and clipboard images. Herdr preserves bracketed text paste for the focused pane and bridges an image-only clipboard through the same shortcut when the outer terminal reports it. Ghostty 1.3.1 is the verified path; `Ctrl+V` remains normal pane input.
 
 Ctrl-click opens pane links when your terminal sends the modified click to Herdr. This works for OSC 8 hyperlinks and visible `http://` or `https://` URLs. On macOS, use Ctrl-click for Herdr-handled pane links while mouse capture is enabled; Cmd-click is only available through the terminal-native bypass path, such as Shift-Cmd-click or `ui.mouse_capture = false`.
 

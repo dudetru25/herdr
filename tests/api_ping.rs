@@ -2211,7 +2211,10 @@ fn events_subscribe_streams_output_and_agent_status_events() {
 
     let panes = send_request(
         &socket_path,
-        r#"{"id":"req_21","method":"pane.list","params":{}}"#,
+        &format!(
+            r#"{{"id":"req_21","method":"pane.list","params":{{"workspace_id":"{}"}}}}"#,
+            workspace_id
+        ),
     );
     let pane_id = panes["result"]["panes"][0]["pane_id"]
         .as_str()

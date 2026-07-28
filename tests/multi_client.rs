@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
-    unregister_spawned_herdr_pid, CURRENT_PROTOCOL,
+    unregister_spawned_herdr_pid, wait_for_disconnect, CURRENT_PROTOCOL,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -60,17 +60,6 @@ impl Drop for SpawnedHerdr {
 fn cleanup_spawned_herdr(spawned: SpawnedHerdr, base: PathBuf) {
     drop(spawned);
     cleanup_test_base(&base);
-}
-
-fn wait_for_child_exit(child: &mut Box<dyn Child + Send + Sync>) {
-    let _ = child.kill();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if child.try_wait().ok().flatten().is_some() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
 }
 
 fn test_lock() -> MutexGuard<'static, ()> {
@@ -217,6 +206,24 @@ fn wait_for_log_occurrence_count(
             return true;
         }
         thread::sleep(Duration::from_millis(40));
+    }
+    false
+}
+
+fn wait_for_log_occurrence_count_while(
+    path: &Path,
+    needle: &str,
+    min_count: usize,
+    timeout: Duration,
+    mut keep_peer_drained: impl FnMut(),
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if count_log_occurrences(path, needle) >= min_count {
+            return true;
+        }
+        keep_peer_drained();
+        thread::sleep(Duration::from_millis(25));
     }
     false
 }
@@ -844,8 +851,18 @@ fn multi_client_broadcasts_frame_updates_to_all_clients() {
     let mut client_b = connect_raw_client(&client_socket, 100, 30);
 
     // Ensure we have an active pane that can reflect input changes.
-    let (_workspace_id, pane_id) =
-        create_workspace_and_root_pane(&api_socket, "broadcast-client-a-to-b");
+    let response = send_json_request(
+        &api_socket,
+        r#"{"id":"ws_create_broadcast","method":"workspace.create","params":{"label":"broadcast-client-a-to-b","focus":true}}"#,
+    );
+    if response.get("error").is_some() {
+        panic!("workspace.create failed: {response}");
+    }
+    let pane_id = response
+        .pointer("/result/root_pane/pane_id")
+        .and_then(Value::as_str)
+        .expect("workspace.create should return root pane id")
+        .to_string();
 
     // Drain initial frames so we measure the frame caused by new input.
     drain_server_messages(&mut client_a, Duration::from_millis(300));
@@ -1004,11 +1021,14 @@ fn multi_client_client_crash_sigkill_does_not_affect_server() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_file(&client_socket, Duration::from_secs(10));
 
+    let (_workspace_id, pane_id) =
+        create_workspace_and_root_pane(&api_socket, "crashed-client-survivor");
     let mut survivor = connect_raw_client(&client_socket, 100, 30);
     assert!(wait_for_frame(&mut survivor, Duration::from_secs(2)));
 
     let log_path = server_log_path(&config_home);
     let connected_before = count_log_occurrences(&log_path, "client connected");
+    let disconnected_before = count_log_occurrences(&log_path, "client disconnected");
 
     let crashing_client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
 
@@ -1023,13 +1043,22 @@ fn multi_client_client_crash_sigkill_does_not_affect_server() {
         "thin client must complete handshake/attachment before SIGKILL"
     );
 
-    if let Some(pid) = crashing_client.child.process_id() {
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-        }
-    }
-    let mut crashing_client = crashing_client;
-    wait_for_child_exit(&mut crashing_client.child);
+    let crashing_pid = crashing_client
+        .child
+        .process_id()
+        .expect("crashing client should have a process id");
+    let kill_result = unsafe { libc::kill(crashing_pid as libc::pid_t, libc::SIGKILL) };
+    assert_eq!(kill_result, 0, "SIGKILL should reach the peer client");
+    assert!(
+        wait_for_log_occurrence_count_while(
+            &log_path,
+            "client disconnected",
+            disconnected_before + 1,
+            Duration::from_secs(5),
+            || drain_server_messages(&mut survivor, Duration::from_millis(100)),
+        ),
+        "server should observe the SIGKILLed peer disconnect"
+    );
 
     let ping = ping_socket(&api_socket);
     assert!(
@@ -1038,10 +1067,74 @@ fn multi_client_client_crash_sigkill_does_not_affect_server() {
     );
 
     drain_server_messages(&mut survivor, Duration::from_millis(250));
-    send_client_input(&mut survivor, b"echo survivor-still-works\n");
+    send_client_input(&mut survivor, b"echo CRASHED_PEER_SURVIVED\n");
+    assert!(
+        pane_read_recent_contains(
+            &api_socket,
+            &pane_id,
+            "CRASHED_PEER_SURVIVED",
+            Duration::from_secs(5)
+        ),
+        "remaining client should continue operating the same pane"
+    );
+
+    cleanup_spawned_herdr(server, base);
+}
+
+#[test]
+fn malformed_client_frame_disconnects_only_offender_and_session_recovers() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+
+    let (_workspace_id, pane_id) =
+        create_workspace_and_root_pane(&api_socket, "malformed-frame-survivor");
+    let mut survivor = connect_raw_client(&client_socket, 100, 30);
+    let mut offender = connect_raw_client(&client_socket, 90, 28);
+    assert!(wait_for_frame(&mut survivor, Duration::from_secs(2)));
+    let _ = wait_for_frame(&mut offender, Duration::from_secs(2));
+
+    offender
+        .write_all(&[1, 0, 0, 0, 0xff])
+        .expect("write malformed bincode frame");
+    offender.flush().expect("flush malformed frame");
+    assert!(
+        wait_for_disconnect(&mut offender, Duration::from_secs(2))
+            .expect("wait for malformed client EOF"),
+        "malformed client should receive real EOF or reset"
+    );
+
+    assert!(
+        ping_socket(&api_socket).contains("pong"),
+        "server should remain healthy after rejecting one malformed client"
+    );
+    drain_server_messages(&mut survivor, Duration::from_millis(250));
+    send_client_input(&mut survivor, b"echo MALFORMED_PEER_SURVIVED\n");
+    assert!(
+        pane_read_recent_contains(
+            &api_socket,
+            &pane_id,
+            "MALFORMED_PEER_SURVIVED",
+            Duration::from_secs(5)
+        ),
+        "surviving client should keep operating the same pane"
+    );
     assert!(
         wait_for_frame(&mut survivor, Duration::from_secs(2)),
-        "remaining client should continue receiving frames"
+        "surviving client should continue receiving frames"
+    );
+
+    let mut reconnected = connect_raw_client(&client_socket, 80, 24);
+    assert!(
+        wait_for_frame(&mut reconnected, Duration::from_secs(2)),
+        "a fresh client should reconnect after the malformed peer is cleaned up"
     );
 
     cleanup_spawned_herdr(server, base);

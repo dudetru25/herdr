@@ -1,9 +1,9 @@
 use crate::api::schema::{
-    EmptyParams, LayoutSetSplitRatioParams, Method, PaneFocusDirectionParams, PaneRenameParams,
-    PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget, PaneZoomParams, TabCreateParams,
-    TabMoveParams, TabRenameParams, TabTarget, WorkspaceCreateParams, WorkspaceMoveParams,
-    WorkspaceRenameParams, WorkspaceTarget, WorktreeCreateParams, WorktreeOpenParams,
-    WorktreeRemoveParams,
+    EmptyParams, LayoutSetSplitRatioParams, MachineAddParams, Method, PaneFocusDirectionParams,
+    PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget,
+    PaneZoomParams, TabCreateParams, TabMoveParams, TabRenameParams, TabTarget,
+    WorkspaceCreateParams, WorkspaceMoveParams, WorkspaceRenameParams, WorkspaceTarget,
+    WorktreeCreateParams, WorktreeOpenParams, WorktreeRemoveParams,
 };
 
 use super::App;
@@ -37,6 +37,14 @@ impl App {
         self.dispatch_runtime_mutation(id, Method::WorkspaceCreate(params))
     }
 
+    pub(crate) fn runtime_machine_add(
+        &mut self,
+        id: &'static str,
+        params: MachineAddParams,
+    ) -> String {
+        self.dispatch_runtime_mutation(id, Method::MachineAdd(params))
+    }
+
     pub(crate) fn runtime_workspace_rename(
         &mut self,
         id: &'static str,
@@ -66,7 +74,13 @@ impl App {
         id: &'static str,
         params: TabCreateParams,
     ) -> String {
-        self.dispatch_runtime_mutation(id, Method::TabCreate(params))
+        let response = self.dispatch_runtime_mutation(id, Method::TabCreate(params));
+        self.show_runtime_creation_error(
+            &response,
+            "tab creation failed",
+            "Herdr could not read the response while creating the tab.",
+        );
+        response
     }
 
     pub(crate) fn runtime_tab_focus(&mut self, id: &'static str, tab_id: String) -> String {
@@ -134,7 +148,13 @@ impl App {
         id: &'static str,
         params: PaneSplitParams,
     ) -> String {
-        self.dispatch_runtime_mutation(id, Method::PaneSplit(params))
+        let response = self.dispatch_runtime_mutation(id, Method::PaneSplit(params));
+        self.show_runtime_creation_error(
+            &response,
+            "pane creation failed",
+            "Herdr could not read the response while creating the pane.",
+        );
+        response
     }
 
     pub(crate) fn runtime_pane_zoom(&mut self, id: &'static str, params: PaneZoomParams) -> String {
@@ -147,6 +167,32 @@ impl App {
         params: LayoutSetSplitRatioParams,
     ) -> String {
         self.dispatch_runtime_mutation(id, Method::LayoutSetSplitRatio(params))
+    }
+
+    fn show_runtime_creation_error(
+        &mut self,
+        response: &str,
+        title: &'static str,
+        unreadable_message: &'static str,
+    ) {
+        let context = if let Ok(error) =
+            serde_json::from_str::<crate::api::schema::ErrorResponse>(response)
+        {
+            format!("{}: {}", error.error.code, error.error.message)
+        } else if serde_json::from_str::<crate::api::schema::SuccessResponse>(response).is_ok() {
+            return;
+        } else {
+            unreadable_message.to_string()
+        };
+        let previous_toast = self.state.toast.clone();
+        self.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::NeedsAttention,
+            title: title.to_string(),
+            context,
+            position: None,
+            target: None,
+        });
+        self.sync_toast_deadline(previous_toast);
     }
 
     pub(crate) fn runtime_worktree_create_deferred(

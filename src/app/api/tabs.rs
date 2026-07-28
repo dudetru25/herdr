@@ -62,9 +62,30 @@ impl App {
         } else {
             return encode_error(id, "workspace_not_found", "no active workspace");
         };
-        let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| {
-            self.resolve_new_terminal_cwd(self.focused_pane_cwd_in_workspace(ws_idx))
-        });
+        let machine_argv = match self.state.machine_ssh_argv_for_workspace(ws_idx) {
+            Ok(argv) => argv,
+            Err(err) => return encode_error(id, "tab_create_failed", err.to_string()),
+        };
+        if machine_argv.is_some() && cwd.is_some() {
+            return encode_error(
+                id,
+                "tab_create_failed",
+                "cwd is not supported for machine workspace tabs",
+            );
+        }
+        let cwd = if machine_argv.is_some() {
+            self.state.workspaces[ws_idx].identity_cwd.clone()
+        } else {
+            match cwd.map(PathBuf::from) {
+                Some(cwd) => cwd,
+                None => match self
+                    .resolve_new_terminal_cwd(self.focused_pane_cwd_in_workspace(ws_idx))
+                {
+                    Ok(cwd) => cwd,
+                    Err(err) => return encode_error(id, "tab_create_failed", err.to_string()),
+                },
+            }
+        };
         let (rows, cols) = self.state.estimate_pane_size();
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
@@ -79,15 +100,27 @@ impl App {
             .get_mut(ws_idx)
             .ok_or_else(|| std::io::Error::other("workspace disappeared"))
             .and_then(|ws| {
-                ws.create_tab(
-                    rows,
-                    cols,
-                    cwd,
-                    scrollback_limit_bytes,
-                    host_terminal_theme,
-                    crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode),
-                    extra_env,
-                )
+                if let Some(argv) = machine_argv.as_deref() {
+                    ws.create_tab_argv_command(
+                        rows,
+                        cols,
+                        cwd,
+                        argv,
+                        extra_env,
+                        scrollback_limit_bytes,
+                        host_terminal_theme,
+                    )
+                } else {
+                    ws.create_tab(
+                        rows,
+                        cols,
+                        cwd,
+                        scrollback_limit_bytes,
+                        host_terminal_theme,
+                        crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode),
+                        extra_env,
+                    )
+                }
             });
         match result {
             Ok((tab_idx, terminal, runtime)) => {
@@ -301,7 +334,7 @@ mod tests {
     use super::*;
     use crate::{
         api::schema::SuccessResponse,
-        config::{Config, ShellModeConfig},
+        config::{Config, MachineConfig, ShellModeConfig},
         workspace::Workspace,
     };
 
@@ -420,6 +453,68 @@ mod tests {
             crate::worktree::canonical_or_original(created_cwd),
             crate::worktree::canonical_or_original(&cached_cwd)
         );
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn machine_tab_create_uses_current_registry_and_fails_when_removed() {
+        let config = Config {
+            machines: vec![MachineConfig {
+                name: "build".into(),
+                target: "-V".into(),
+                cwd: None,
+            }],
+            ..Config::default()
+        };
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, event_hub);
+        let mut workspace = Workspace::test_new("build");
+        workspace.machine = Some("build".into());
+        workspace.identity_cwd = std::env::current_dir().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+
+        app.state.machines[0].target = "-Q".into();
+        let response = app.handle_tab_create(
+            "machine-tab".into(),
+            TabCreateParams {
+                workspace_id: None,
+                cwd: None,
+                focus: false,
+                label: None,
+                env: Default::default(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::TabCreated { .. }));
+        let created = &app.state.workspaces[0].tabs[1];
+        let terminal_id = created.terminal_id(created.root_pane).unwrap();
+        assert_eq!(
+            app.state.terminals[terminal_id]
+                .launch_argv
+                .as_ref()
+                .unwrap(),
+            &["ssh".to_string(), "-t".to_string(), "-Q".to_string()]
+        );
+
+        app.state.machines.clear();
+        let response = app.handle_tab_create(
+            "removed-machine".into(),
+            TabCreateParams {
+                workspace_id: None,
+                cwd: None,
+                focus: false,
+                label: None,
+                env: Default::default(),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "tab_create_failed");
+        assert!(error.error.message.contains("build"));
+
         shutdown_test_runtimes(&mut app);
     }
 }

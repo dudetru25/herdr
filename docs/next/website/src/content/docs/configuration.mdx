@@ -79,6 +79,29 @@ new_cwd = "follow"
 
 `new_cwd = "follow"` keeps the default behavior and inherits the source pane or workspace. When there is no source workspace, Herdr starts in `$HOME`. Use `"home"` to always start in `$HOME`, `"current"` to use Herdr's process directory, or a fixed path such as `"~/Projects"`. Explicit `--cwd` values from the CLI or socket API still take precedence.
 
+## SSH machine spaces
+
+Register machines that Herdr can open through plain SSH. The remote machine does not need Herdr installed.
+
+Left-click New to create a Local workspace immediately. Right-click New to open a target picker with Local, every configured machine, and Add remote machine. The add form asks for a unique name, an SSH target, and an optional remote working directory. Save & open writes the machine to `config.toml`, reloads the live registry, and opens its workspace. Herdr validates the fields before saving, but it does not probe SSH connectivity; authentication and connection errors appear in the new terminal.
+
+```toml
+[[machines]]
+name = "build"
+target = "builder@example.com"
+cwd = "~/src/herdr"
+
+[[machines]]
+name = "prod"
+target = "ssh://deploy.example.com:2222"
+```
+
+`name` is the unique, non-empty registry name shown in the picker. `target` must be non-empty, must not begin with `-`, and is passed to `ssh` as one destination argument; it may be an SSH alias, `user@host`, or `ssh://host:port`. `cwd` is optional; when present, it must be non-empty and Herdr starts the remote login there with `cd` and `$SHELL`, so it requires a POSIX-compatible remote login shell. Omit `cwd` for PowerShell, `cmd.exe`, or other non-POSIX SSH targets. The add form trims surrounding whitespace and treats a blank optional working directory as omitted. Invalid fields, duplicate names, and config write or reload failures keep the form open and do not open a workspace.
+
+Use the picker, `herdr workspace create --machine build`, or `workspace.create` in the socket API to create a machine workspace. Every ordinary pane created in that workspace starts a new SSH session. Machine workspaces use the local home directory only as internal identity state and do not participate in Git, worktree, or parent-space discovery.
+
+`herdr server reload-config` replaces the live machine registry for future pane launches. Existing SSH panes are unchanged. Removing or renaming a machine causes subsequent pane, tab, and restore launches bound to its old name to fail instead of falling back to a local shell.
+
 ## Worktrees
 
 Set the root directory Herdr uses for Git worktree checkouts created from the sidebar:

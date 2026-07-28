@@ -330,9 +330,15 @@ pub fn wait_for_message_variant(
     timeout: Duration,
     variant: u32,
 ) -> Result<bool, String> {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .map_err(|e| e.to_string())?;
+    if let Err(err) = stream.set_read_timeout(Some(Duration::from_millis(200))) {
+        if matches!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotConnected
+        ) {
+            return Ok(false);
+        }
+        return Err(err.to_string());
+    }
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match read_server_message(stream) {
@@ -347,20 +353,23 @@ pub fn wait_for_message_variant(
 pub fn wait_for_disconnect(stream: &mut UnixStream, timeout: Duration) -> Result<bool, String> {
     stream.set_nonblocking(true).map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
-    let mut idle_since = None;
+    let mut bytes = [0u8; 8192];
     let result = loop {
-        match read_server_message(stream) {
-            Ok(_) => idle_since = None,
+        match stream.read(&mut bytes) {
+            Ok(0) => break Ok(true),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(err)
-                if err.to_ascii_lowercase().contains("would block")
-                    || err.contains("Resource temporarily unavailable") =>
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                ) =>
             {
-                let idle_started = *idle_since.get_or_insert_with(Instant::now);
-                if idle_started.elapsed() >= Duration::from_millis(200) {
-                    break Ok(true);
-                }
+                break Ok(true);
             }
-            Err(_) => break Ok(true),
+            Err(err) => break Err(err.to_string()),
         }
         if Instant::now() >= deadline {
             break Ok(false);

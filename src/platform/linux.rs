@@ -2,7 +2,7 @@ use std::{
     collections::{HashSet, VecDeque},
     io::Write,
     os::fd::RawFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -12,6 +12,10 @@ use super::{
 };
 
 const WSL_MARKER_ENV_VARS: &[&str] = &["WSL_DISTRO_NAME", "WSL_INTEROP"];
+
+pub(crate) fn replace_file_platform(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcGroupMember {

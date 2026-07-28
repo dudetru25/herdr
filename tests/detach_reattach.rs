@@ -4,10 +4,10 @@
 mod support;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +18,8 @@ use support::{
     register_spawned_herdr_pid, send_detach, send_input, unregister_spawned_herdr_pid,
     wait_for_disconnect, wait_for_message_variant, wait_for_socket, wait_until, CURRENT_PROTOCOL,
 };
+
+const MAX_INPUT_PAYLOAD: usize = 1024 * 1024;
 
 fn unique_test_dir() -> PathBuf {
     let nanos = SystemTime::now()
@@ -33,6 +35,28 @@ fn unique_test_dir() -> PathBuf {
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+}
+
+struct SpawnedTerminalAttach {
+    master: Option<Box<dyn MasterPty + Send>>,
+    child: Box<dyn Child + Send + Sync>,
+    writer: Option<Box<dyn Write + Send>>,
+    reader: Option<thread::JoinHandle<()>>,
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Drop for SpawnedTerminalAttach {
+    fn drop(&mut self) {
+        let pid = self.child.process_id();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.writer.take();
+        self.master.take();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        unregister_spawned_herdr_pid(pid);
+    }
 }
 
 impl Drop for SpawnedHerdr {
@@ -109,6 +133,62 @@ fn spawn_server(
     SpawnedHerdr {
         _master: pair.master,
         child,
+    }
+}
+
+fn spawn_terminal_attach(
+    config_home: &PathBuf,
+    runtime_dir: &PathBuf,
+    api_socket_path: &PathBuf,
+    terminal_id: &str,
+) -> SpawnedTerminalAttach {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let writer = pair.master.take_writer().unwrap();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let reader_output = output.clone();
+    let reader = thread::spawn(move || {
+        let mut bytes = [0_u8; 4096];
+        while let Ok(read) = reader.read(&mut bytes) {
+            if read == 0 {
+                break;
+            }
+            reader_output
+                .lock()
+                .unwrap()
+                .extend_from_slice(&bytes[..read]);
+        }
+    });
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.arg("terminal");
+    cmd.arg("attach");
+    cmd.arg(terminal_id);
+    cmd.env("HERDR_DISABLE_SOUND", "1");
+    cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("HERDR_SOCKET_PATH", api_socket_path);
+    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env("SHELL", "/bin/sh");
+    cmd.env("TERM", "xterm-256color");
+    cmd.env_remove("HERDR_ENV");
+    let child = pair.slave.spawn_command(cmd).unwrap();
+    register_spawned_herdr_pid(child.process_id());
+    drop(pair.slave);
+
+    SpawnedTerminalAttach {
+        master: Some(pair.master),
+        child,
+        writer: Some(writer),
+        reader: Some(reader),
+        output,
     }
 }
 
@@ -249,9 +329,144 @@ fn first_pane_id(response: &Value) -> String {
         .to_string()
 }
 
+fn first_terminal_id(response: &Value) -> String {
+    response["result"]["panes"]
+        .as_array()
+        .expect("pane.list should return an array")
+        .first()
+        .and_then(|pane| pane["terminal_id"].as_str())
+        .expect("pane.list should include terminal_id")
+        .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn direct_attach_translates_real_bracketed_paste_and_restores_host_mode_on_reattach() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    let created = workspace_create(&api_socket, "direct-paste");
+    assert!(created.get("error").is_none(), "{created}");
+    let workspace_id = workspace_id_by_label(&workspace_list(&api_socket), "direct-paste");
+    let panes = pane_list(&api_socket, &workspace_id);
+    let pane_id = first_pane_id(&panes);
+    let terminal_id = first_terminal_id(&panes);
+
+    for marker in ["DIRECT_PASTE_FIRST", "DIRECT_PASTE_SECOND"] {
+        let mut attached =
+            spawn_terminal_attach(&config_home, &runtime_dir, &api_socket, &terminal_id);
+        assert!(wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || attached
+                .output
+                .lock()
+                .unwrap()
+                .windows(b"\x1b[?2004h".len())
+                .any(|window| window == b"\x1b[?2004h")
+        ));
+
+        let command = format!("\x1b[200~echo {marker}\n\x1b[201~");
+        attached
+            .writer
+            .as_mut()
+            .unwrap()
+            .write_all(command.as_bytes())
+            .unwrap();
+        attached.writer.as_mut().unwrap().flush().unwrap();
+        assert!(wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(25),
+            || pane_read_recent_text(&api_socket, &pane_id).contains(marker)
+        ));
+
+        attached
+            .writer
+            .as_mut()
+            .unwrap()
+            .write_all(&[0x02, b'q'])
+            .unwrap();
+        attached.writer.as_mut().unwrap().flush().unwrap();
+        assert!(wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || attached.child.try_wait().unwrap().is_some()
+        ));
+        assert!(wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || attached
+                .output
+                .lock()
+                .unwrap()
+                .windows(b"\x1b[?2004l".len())
+                .any(|window| window == b"\x1b[?2004l")
+        ));
+
+        let output = attached.output.lock().unwrap();
+        assert!(
+            !output
+                .windows(b"\x1b[?1004h".len())
+                .any(|window| window == b"\x1b[?1004h"),
+            "direct attach must not enable host focus reporting"
+        );
+        assert!(
+            !output
+                .windows(b"\x1b[=".len())
+                .any(|window| window == b"\x1b[="),
+            "direct attach must not force Kitty keyboard enhancement flags"
+        );
+    }
+
+    let mut attached = spawn_terminal_attach(&config_home, &runtime_dir, &api_socket, &terminal_id);
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || attached
+            .output
+            .lock()
+            .unwrap()
+            .windows(b"\x1b[?2004h".len())
+            .any(|window| window == b"\x1b[?2004h")
+    ));
+    attached
+        .writer
+        .as_mut()
+        .unwrap()
+        .write_all(b"\x1b[200~\x02q\x02\x02\n\x1b[201~")
+        .unwrap();
+    attached.writer.as_mut().unwrap().flush().unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        attached.child.try_wait().unwrap().is_none(),
+        "Ctrl+B sequences inside a bracketed paste must not detach the client"
+    );
+    attached
+        .writer
+        .as_mut()
+        .unwrap()
+        .write_all(b"echo DIRECT_CONTROL_PASTE_SURVIVED\n")
+        .unwrap();
+    attached.writer.as_mut().unwrap().flush().unwrap();
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || pane_read_recent_text(&api_socket, &pane_id).contains("DIRECT_CONTROL_PASTE_SURVIVED")
+    ));
+
+    cleanup_spawned_herdr(spawned, base);
+}
 
 #[test]
 fn navigate_q_detaches_client_and_server_persists() {
@@ -272,6 +487,8 @@ fn navigate_q_detaches_client_and_server_persists() {
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
+    let created = workspace_create(&api_socket, "navigate-detach");
+    assert!(created.get("error").is_none(), "{created}");
 
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
@@ -308,7 +525,7 @@ fn navigate_q_detaches_client_and_server_persists() {
     // The client should receive a ServerShutdown with reason "detached"
     // shortly after the quit/detach key. There may be some frames in
     // between from the mode change, so we read multiple messages.
-    let got_shutdown = wait_for_message_variant(&mut stream, Duration::from_secs(2), 2)
+    let got_shutdown = wait_for_message_variant(&mut stream, Duration::from_secs(2), 4)
         .expect("wait for shutdown message")
         || wait_for_disconnect(&mut stream, Duration::from_secs(1)).expect("wait for disconnect");
     assert!(
@@ -481,6 +698,180 @@ fn reattach_after_detach_shows_current_state() {
         list_response.contains("reattach-test"),
         "workspace should still exist after detach/reattach: {list_response}"
     );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn direct_attach_real_pty_paste_boundaries_are_bounded_and_recoverable() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let reader_script = base.join("read-exact-paste.py");
+
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &reader_script,
+        r#"import os
+import pathlib
+import select
+import sys
+import termios
+import time
+import tty
+
+expected_len = int(sys.argv[1])
+expected_byte = int(sys.argv[2])
+ready_path = pathlib.Path(sys.argv[3])
+result_path = pathlib.Path(sys.argv[4])
+fd = sys.stdin.fileno()
+original = termios.tcgetattr(fd)
+data = bytearray()
+try:
+    tty.setraw(fd)
+    ready_path.write_text("ready")
+    deadline = time.monotonic() + 45
+    while len(data) < expected_len and time.monotonic() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.25)
+        if readable:
+            data.extend(os.read(fd, min(65536, expected_len - len(data))))
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, original)
+result_path.write_text(f"{len(data)}:{int(all(value == expected_byte for value in data))}")
+"#,
+    )
+    .unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    let created = workspace_create(&api_socket, "direct-paste-boundaries");
+    assert!(created.get("error").is_none(), "{created}");
+    let workspace_id =
+        workspace_id_by_label(&workspace_list(&api_socket), "direct-paste-boundaries");
+    let panes = pane_list(&api_socket, &workspace_id);
+    let pane_id = first_pane_id(&panes);
+    let terminal_id = first_terminal_id(&panes);
+    let mut attached = spawn_terminal_attach(&config_home, &runtime_dir, &api_socket, &terminal_id);
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || attached
+            .output
+            .lock()
+            .unwrap()
+            .windows(b"\x1b[?2004h".len())
+            .any(|window| window == b"\x1b[?2004h")
+    ));
+
+    for (label, payload_len) in [("below", 32), ("at", MAX_INPUT_PAYLOAD)] {
+        let ready = base.join(format!("{label}-ready"));
+        let result = base.join(format!("{label}-result"));
+        let command = format!(
+            "python3 {} {} {} {} {}\n",
+            reader_script.display(),
+            payload_len,
+            b'x',
+            ready.display(),
+            result.display()
+        );
+        assert!(pane_send_text(&api_socket, &pane_id, &command)
+            .get("error")
+            .is_none());
+        assert!(wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(25),
+            || ready.exists()
+        ));
+
+        let mut paste = Vec::with_capacity(b"\x1b[200~".len() + payload_len + b"\x1b[201~".len());
+        paste.extend_from_slice(b"\x1b[200~");
+        paste.resize(b"\x1b[200~".len() + payload_len, b'x');
+        paste.extend_from_slice(b"\x1b[201~");
+        attached.writer.as_mut().unwrap().write_all(&paste).unwrap();
+        attached.writer.as_mut().unwrap().flush().unwrap();
+
+        let expected = format!("{payload_len}:1");
+        let received = wait_until(Duration::from_secs(50), Duration::from_millis(25), || {
+            fs::read_to_string(&result).ok().as_deref() == Some(expected.as_str())
+        });
+        assert!(
+            received,
+            "{label} paste result mismatch: expected {expected:?}, got {:?}",
+            fs::read_to_string(&result).ok()
+        );
+    }
+
+    let ready = base.join("above-ready");
+    let result = base.join("above-result");
+    let recovery = vec![b'R'; 32];
+    let command = format!(
+        "python3 {} {} {} {} {}\n",
+        reader_script.display(),
+        recovery.len(),
+        b'R',
+        ready.display(),
+        result.display()
+    );
+    assert!(pane_send_text(&api_socket, &pane_id, &command)
+        .get("error")
+        .is_none());
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || ready.exists()
+    ));
+
+    let mut oversized =
+        Vec::with_capacity(b"\x1b[200~".len() + MAX_INPUT_PAYLOAD + 1 + b"\x1b[201~".len());
+    oversized.extend_from_slice(b"\x1b[200~");
+    oversized.resize(b"\x1b[200~".len() + MAX_INPUT_PAYLOAD + 1, b'x');
+    oversized.extend_from_slice(b"\x1b[201~");
+    attached
+        .writer
+        .as_mut()
+        .unwrap()
+        .write_all(&oversized)
+        .unwrap();
+    attached.writer.as_mut().unwrap().flush().unwrap();
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !result.exists(),
+        "oversized paste leaked bytes into the target PTY"
+    );
+
+    let mut recovery_paste = b"\x1b[200~".to_vec();
+    recovery_paste.extend_from_slice(&recovery);
+    recovery_paste.extend_from_slice(b"\x1b[201~");
+    attached
+        .writer
+        .as_mut()
+        .unwrap()
+        .write_all(&recovery_paste)
+        .unwrap();
+    attached.writer.as_mut().unwrap().flush().unwrap();
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || fs::read_to_string(&result).ok().as_deref() == Some("32:1")
+    ));
+
+    attached
+        .writer
+        .as_mut()
+        .unwrap()
+        .write_all(&[0x02, b'q'])
+        .unwrap();
+    attached.writer.as_mut().unwrap().flush().unwrap();
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(20),
+        || attached.child.try_wait().unwrap().is_some()
+    ));
 
     cleanup_spawned_herdr(spawned, base);
 }

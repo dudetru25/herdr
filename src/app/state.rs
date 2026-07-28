@@ -621,6 +621,52 @@ pub struct WorkspaceCardArea {
     pub indent: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MachineCreateField {
+    Name,
+    Target,
+    Cwd,
+}
+
+impl MachineCreateField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Target,
+            Self::Target => Self::Cwd,
+            Self::Cwd => Self::Name,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Name => Self::Cwd,
+            Self::Target => Self::Name,
+            Self::Cwd => Self::Target,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineCreateState {
+    pub name: String,
+    pub target: String,
+    pub cwd: String,
+    pub focused: MachineCreateField,
+    pub error: Option<String>,
+}
+
+impl Default for MachineCreateState {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            target: String::new(),
+            cwd: String::new(),
+            focused: MachineCreateField::Name,
+            error: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateState {
     pub source_workspace_id: String,
@@ -801,6 +847,7 @@ pub enum Mode {
     RenameWorkspace,
     RenameTab,
     RenamePane,
+    AddRemoteMachine,
     NewLinkedWorktree,
     OpenExistingWorktree,
     ConfirmRemoveWorktree,
@@ -1210,6 +1257,9 @@ pub enum ParentSpaceMenu {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuKind {
+    WorkspaceCreateTarget {
+        machines: Vec<String>,
+    },
     Workspace {
         ws_idx: usize,
         parent_space: ParentSpaceMenu,
@@ -1243,8 +1293,13 @@ pub struct ContextMenuState {
 }
 
 impl ContextMenuState {
-    pub fn items(&self) -> Vec<&'static str> {
-        let mut items = match self.kind {
+    pub fn items(&self) -> Vec<&str> {
+        let mut items = match &self.kind {
+            ContextMenuKind::WorkspaceCreateTarget { machines } => std::iter::once("Local")
+                .chain(machines.iter().map(String::as_str))
+                .chain(machines.is_empty().then_some("No machines registered"))
+                .chain(std::iter::once("Add remote machine…"))
+                .collect(),
             ContextMenuKind::Workspace { .. } => vec!["Rename", "Close"],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
@@ -1329,9 +1384,9 @@ impl ContextMenuState {
                 "Close pane",
             ],
         };
-        let parent_space = match self.kind {
+        let parent_space = match &self.kind {
             ContextMenuKind::Workspace { parent_space, .. }
-            | ContextMenuKind::GitWorkspace { parent_space, .. } => parent_space,
+            | ContextMenuKind::GitWorkspace { parent_space, .. } => *parent_space,
             _ => ParentSpaceMenu::Unavailable,
         };
         let insert_idx = items
@@ -1349,6 +1404,19 @@ impl ContextMenuState {
             }
         }
         items
+    }
+
+    pub fn visible_offset(&self, viewport_height: usize) -> usize {
+        let item_count = self.items().len();
+        if viewport_height == 0 || item_count <= viewport_height {
+            return 0;
+        }
+
+        self.list
+            .highlighted
+            .saturating_add(1)
+            .saturating_sub(viewport_height)
+            .min(item_count - viewport_height)
     }
 }
 
@@ -1459,6 +1527,7 @@ pub struct AppState {
     /// The server's event loop checks this and handles client detach.
     pub detach_requested: bool,
     pub request_new_workspace: bool,
+    pub request_new_workspace_machine: Option<String>,
     pub request_new_tab: bool,
     pub request_new_linked_worktree: Option<usize>,
     pub request_open_existing_worktree: Option<usize>,
@@ -1479,6 +1548,7 @@ pub struct AppState {
     pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
     pub rename_pane_target: Option<PaneId>,
+    pub machine_create: Option<MachineCreateState>,
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
@@ -1568,6 +1638,7 @@ pub struct AppState {
     /// `[experimental] switch_ascii_input_source_in_prefix`.
     pub switch_ascii_input_source_in_prefix: bool,
     pub kitty_graphics_enabled: bool,
+    pub machines: Vec<crate::config::MachineConfig>,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
@@ -1630,6 +1701,20 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn machine_ssh_argv_for_workspace(
+        &self,
+        ws_idx: usize,
+    ) -> Result<Option<Vec<String>>, crate::config::MachineLookupError> {
+        let Some(machine) = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(crate::workspace::Workspace::machine_name)
+        else {
+            return Ok(None);
+        };
+        crate::config::machine_ssh_argv(&self.machines, machine).map(Some)
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -1834,6 +1919,7 @@ impl AppState {
             detach_exits: false,
             detach_requested: false,
             request_new_workspace: false,
+            request_new_workspace_machine: None,
             request_new_tab: false,
             request_new_linked_worktree: None,
             request_open_existing_worktree: None,
@@ -1850,6 +1936,7 @@ impl AppState {
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
             rename_pane_target: None,
+            machine_create: None,
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
@@ -1936,6 +2023,7 @@ impl AppState {
             cjk_ime_cursor_shape: 2, // steady_block
             switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
+            machines: Vec::new(),
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
@@ -2286,13 +2374,14 @@ impl AppState {
             assert_tab_index(press.ws_idx, press.tab_idx, "tab press");
         }
         if let Some(menu) = &self.context_menu {
-            match menu.kind {
+            match &menu.kind {
+                ContextMenuKind::WorkspaceCreateTarget { .. } => {}
                 ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
-                    assert_workspace_index(ws_idx, "context menu workspace")
+                    assert_workspace_index(*ws_idx, "context menu workspace")
                 }
                 ContextMenuKind::Tab { ws_idx, tab_idx } => {
-                    assert_tab_index(ws_idx, tab_idx, "context menu tab")
+                    assert_tab_index(*ws_idx, *tab_idx, "context menu tab")
                 }
                 ContextMenuKind::Pane {
                     ws_idx,
@@ -2301,18 +2390,18 @@ impl AppState {
                     source_pane_id,
                     ..
                 } => {
-                    assert_tab_index(ws_idx, tab_idx, "context menu pane tab");
+                    assert_tab_index(*ws_idx, *tab_idx, "context menu pane tab");
                     assert!(
-                        self.workspaces[ws_idx].tabs[tab_idx]
+                        self.workspaces[*ws_idx].tabs[*tab_idx]
                             .panes
-                            .contains_key(&pane_id),
+                            .contains_key(pane_id),
                         "context menu pane references pane {:?} outside workspace {} tab {}",
                         pane_id,
                         ws_idx,
                         tab_idx
                     );
                     if let Some(source_pane_id) = source_pane_id {
-                        assert_live_pane(source_pane_id, "context menu source pane");
+                        assert_live_pane(*source_pane_id, "context menu source pane");
                     }
                 }
             }
@@ -2373,6 +2462,45 @@ mod tests {
         assert!(ws.public_pane_number(new_pane).is_some());
         state.ensure_test_terminals();
 
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn machine_spawn_resolution_uses_live_registry_and_preserves_invariants() {
+        let mut state = AppState::test_new();
+        let mut workspace = crate::workspace::Workspace::test_new("build");
+        workspace.machine = Some("build".into());
+        workspace.custom_name = Some("build".into());
+        state.workspaces = vec![workspace];
+        state.active = Some(0);
+        state.selected = 0;
+        state.ensure_test_terminals();
+        state.machines = vec![crate::config::MachineConfig {
+            name: "build".into(),
+            target: "first@example.com".into(),
+            cwd: None,
+        }];
+
+        assert_eq!(
+            state.machine_ssh_argv_for_workspace(0).unwrap(),
+            Some(vec![
+                "ssh".to_string(),
+                "-t".to_string(),
+                "first@example.com".to_string()
+            ])
+        );
+        state.machines[0].target = "second@example.com".into();
+        assert_eq!(
+            state.machine_ssh_argv_for_workspace(0).unwrap(),
+            Some(vec![
+                "ssh".to_string(),
+                "-t".to_string(),
+                "second@example.com".to_string()
+            ])
+        );
+        state.machines.clear();
+        let error = state.machine_ssh_argv_for_workspace(0).unwrap_err();
+        assert_eq!(error.to_string(), "machine \"build\" is not configured");
         state.assert_invariants_for_test();
     }
 

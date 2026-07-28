@@ -6,6 +6,7 @@ mod agents;
 mod env;
 mod integrations;
 mod layouts;
+mod machines;
 mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
@@ -979,6 +980,8 @@ impl App {
             Method::WorkspaceCreate(params) => {
                 return self.handle_workspace_create(request.id, params);
             }
+            Method::MachineList(_) => return self.handle_machine_list(request.id),
+            Method::MachineAdd(params) => return self.handle_machine_add(request.id, params),
             Method::WorkspaceFocus(target) => {
                 return self.handle_workspace_focus(request.id, target)
             }

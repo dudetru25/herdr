@@ -1049,6 +1049,12 @@
             "label": {
               "type": "string"
             },
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "number": {
               "format": "uint",
               "minimum": 0,
@@ -2257,6 +2263,27 @@
           "required": [
             "path",
             "ratio"
+          ],
+          "type": "object"
+        },
+        "MachineAddParams": {
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "target"
           ],
           "type": "object"
         },
@@ -4077,6 +4104,12 @@
                 "string",
                 "null"
               ]
+            },
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "type": "object"
@@ -4495,6 +4528,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorkspaceCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "machine.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "machine.add",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MachineAddParams"
             }
           },
           "required": [
@@ -7181,6 +7246,27 @@
             }
           ]
         },
+        "MachineInfo": {
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "target"
+          ],
+          "type": "object"
+        },
         "NotificationShowReason": {
           "enum": [
             "shown",
@@ -8614,6 +8700,41 @@
             },
             {
               "properties": {
+                "machines": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/MachineInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "machine_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "machines"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "machine": {
+                  "$ref": "#/schemas/success_response/$defs/MachineInfo"
+                },
+                "type": {
+                  "const": "machine_added",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "machine"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "child_workspace_ids": {
                   "items": {
                     "type": "string"
@@ -9772,6 +9893,12 @@
             },
             "label": {
               "type": "string"
+            },
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "number": {
               "format": "uint",

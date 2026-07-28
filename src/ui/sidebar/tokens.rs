@@ -21,6 +21,7 @@ pub(super) enum ResolvedTokenKind {
     TerminalTitle(String),
     Branch(String),
     GitStatus { ahead: usize, behind: usize },
+    MachineBadge,
     Custom(String),
 }
 
@@ -95,13 +96,14 @@ pub(super) struct SpaceTokenContext<'a> {
     pub ahead_behind: Option<(usize, usize)>,
     pub tokens: &'a std::collections::HashMap<String, String>,
     pub suppress_git_details: bool,
+    pub machine: bool,
 }
 
 pub(super) fn space_rows(
     config: &SpacesSidebarConfig,
     context: SpaceTokenContext<'_>,
 ) -> Vec<Vec<ResolvedToken>> {
-    config
+    let mut rows = config
         .rows
         .iter()
         .filter_map(|row| {
@@ -138,12 +140,27 @@ pub(super) fn space_rows(
                 .collect::<Vec<_>>();
             (!resolved.is_empty()).then_some(resolved)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if context.machine {
+        let badge = ResolvedToken::new(
+            ResolvedTokenKind::MachineBadge,
+            SidebarTokenStyle::default(),
+        );
+        if let Some(first) = rows.first_mut() {
+            first.push(badge);
+        } else {
+            rows.push(vec![badge]);
+        }
+    }
+    rows
 }
 
 pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'static str {
     if matches!(previous.kind, ResolvedTokenKind::StateIcon)
-        || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
+        || matches!(
+            current.kind,
+            ResolvedTokenKind::GitStatus { .. } | ResolvedTokenKind::MachineBadge
+        )
     {
         " "
     } else {
@@ -300,6 +317,7 @@ mod tests {
                     ahead_behind: Some((2, 1)),
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: true,
+                    machine: false,
                 },
             ),
             vec![vec![
@@ -327,11 +345,43 @@ mod tests {
                     ahead_behind: None,
                     tokens: &tokens,
                     suppress_git_details: false,
+                    machine: false,
                 },
             ),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Custom(
                 "2 changes".into()
             ))]]
+        );
+    }
+
+    #[test]
+    fn machine_space_row_adds_ssh_badge_and_suppresses_git_tokens() {
+        let config = SpacesSidebarConfig {
+            rows: vec![vec![
+                SpaceSidebarToken::Workspace,
+                SpaceSidebarToken::Branch,
+                SpaceSidebarToken::GitStatus,
+            ]],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            space_rows(
+                &config,
+                SpaceTokenContext {
+                    workspace: "build",
+                    branch: Some("main"),
+                    state_text: "idle",
+                    ahead_behind: Some((2, 1)),
+                    tokens: &std::collections::HashMap::new(),
+                    suppress_git_details: true,
+                    machine: true,
+                },
+            ),
+            vec![vec![
+                ResolvedToken::unstyled(ResolvedTokenKind::Workspace("build".into())),
+                ResolvedToken::unstyled(ResolvedTokenKind::MachineBadge),
+            ]]
         );
     }
 }

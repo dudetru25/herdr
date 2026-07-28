@@ -101,6 +101,7 @@ impl App {
                 Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                     self.handle_rename_key_via_api(key_event)
                 }
+                Mode::AddRemoteMachine => self.handle_add_remote_machine_key(key_event),
                 Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
                 Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
@@ -151,6 +152,7 @@ impl App {
                 insert_rename_input_text(&mut self.state, text);
                 true
             }
+            Mode::AddRemoteMachine => self.insert_add_remote_machine_text(text),
             Mode::NewLinkedWorktree => {
                 self.insert_worktree_create_text(text);
                 true
@@ -333,7 +335,14 @@ impl App {
             if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
                 match action {
                     MouseAction::NewWorkspace => {
-                        self.begin_tui_workspace_create("tui.mouse.workspace.create")
+                        self.begin_tui_local_workspace_create("tui.mouse.workspace.create_local")
+                    }
+                    MouseAction::WorkspaceCreateTarget => {
+                        let new_button = self.state.sidebar_new_button_rect();
+                        self.begin_tui_workspace_create_at(
+                            new_button.x.saturating_add(new_button.width),
+                            new_button.y,
+                        );
                     }
                     MouseAction::Settings(action) => match action {
                         SettingsAction::SaveTheme(name) => self.save_theme(&name),
@@ -377,6 +386,7 @@ impl App {
                     MouseAction::RenameModal(action) => {
                         self.apply_rename_mouse_action_via_api(action)
                     }
+                    MouseAction::AddRemoteMachineSubmit => self.submit_add_remote_machine(),
                     MouseAction::ConfirmCloseAccept => self.confirm_close_accept_via_api(),
                     MouseAction::ContextMenu { menu, idx } => {
                         self.apply_context_menu_action_via_api(menu, idx)
@@ -646,9 +656,11 @@ pub(crate) fn is_modal_paste_shortcut(key: &KeyEvent) -> bool {
 
 pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
     match state.mode {
-        Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane | Mode::NewLinkedWorktree => {
-            true
-        }
+        Mode::RenameWorkspace
+        | Mode::RenameTab
+        | Mode::RenamePane
+        | Mode::AddRemoteMachine
+        | Mode::NewLinkedWorktree => true,
         Mode::OpenExistingWorktree => state
             .worktree_open
             .as_ref()
@@ -694,10 +706,20 @@ impl AppState {
                     terminal_runtimes,
                 )
             });
-        let cwd = Some(super::creation::resolve_new_terminal_cwd(
-            &self.new_terminal_cwd,
-            follow_cwd,
-        ));
+        let cwd =
+            match super::creation::resolve_new_terminal_cwd(&self.new_terminal_cwd, follow_cwd) {
+                Ok(cwd) => Some(cwd),
+                Err(err) => {
+                    self.toast = Some(super::state::ToastNotification {
+                        kind: super::state::ToastKind::NeedsAttention,
+                        title: "pane creation failed".to_string(),
+                        context: err.to_string(),
+                        position: None,
+                        target: None,
+                    });
+                    return;
+                }
+            };
 
         let previous_focus = self.current_pane_focus_target();
         if let Some(ws_idx) = self.active {
@@ -905,6 +927,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn paste_routes_to_focused_add_remote_machine_field() {
+        let mut app = test_app();
+        app.state.mode = Mode::AddRemoteMachine;
+        app.state.machine_create = Some(crate::app::state::MachineCreateState {
+            focused: crate::app::state::MachineCreateField::Target,
+            ..Default::default()
+        });
+
+        app.handle_paste("dev@example.com".into()).await;
+
+        let create = app.state.machine_create.as_ref().unwrap();
+        assert_eq!(create.target, "dev@example.com");
+        assert!(create.name.is_empty());
+        assert!(create.cwd.is_empty());
+    }
+
     #[test]
     fn modal_paste_shortcut_matches_platform_primary_v() {
         #[cfg(target_os = "macos")]
@@ -931,6 +970,9 @@ mod tests {
         let mut state = AppState::test_new();
 
         state.mode = Mode::RenameTab;
+        assert!(modal_paste_target_active(&state));
+
+        state.mode = Mode::AddRemoteMachine;
         assert!(modal_paste_target_active(&state));
 
         state.mode = Mode::Navigator;

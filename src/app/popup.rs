@@ -151,7 +151,10 @@ impl App {
         let cwd = cwd.or_else(|| {
             active_tab.cwd_for_pane(focused_pane, &self.state.terminals, &self.terminal_runtimes)
         });
-        let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+        let cwd = match cwd {
+            Some(cwd) => cwd,
+            None => std::env::current_dir()?,
+        };
         let pane_id = PaneId::alloc();
         let terminal_id = TerminalId::alloc();
         let launch_env = PaneLaunchEnv::from_extra(extra_env).without_pane_identity();

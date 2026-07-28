@@ -205,6 +205,40 @@ impl TerminalRuntime {
         .map(Self)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_argv_command_with_initial_history(
+        pane_id: PaneId,
+        rows: u16,
+        cols: u16,
+        cwd: std::path::PathBuf,
+        argv: &[String],
+        launch_env: &crate::pane::PaneLaunchEnv,
+        agent_detection: crate::pane::AgentDetection,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        initial_history_ansi: Option<&str>,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<AtomicBool>,
+    ) -> std::io::Result<Self> {
+        crate::pane::PaneRuntime::spawn_argv_command_with_initial_history(
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            argv,
+            launch_env,
+            agent_detection,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            initial_history_ansi,
+            events,
+            render_notify,
+            render_dirty,
+        )
+        .map(Self)
+    }
+
     pub fn apply_host_terminal_theme(&self, theme: crate::terminal_theme::TerminalTheme) {
         self.0.apply_host_terminal_theme(theme);
     }

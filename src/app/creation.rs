@@ -13,21 +13,63 @@ use crate::{config::NewTerminalCwdConfig, workspace::Workspace};
 pub(crate) fn resolve_new_terminal_cwd(
     policy: &NewTerminalCwdConfig,
     follow_cwd: Option<PathBuf>,
-) -> PathBuf {
+) -> std::io::Result<PathBuf> {
     match policy {
-        NewTerminalCwdConfig::Follow => follow_cwd
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("/")),
-        NewTerminalCwdConfig::Home => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("/")),
-        NewTerminalCwdConfig::Current => {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+        NewTerminalCwdConfig::Follow => {
+            match follow_cwd.or_else(|| std::env::var_os("HOME").map(PathBuf::from)) {
+                Some(cwd) => Ok(cwd),
+                None => std::env::current_dir(),
+            }
         }
-        NewTerminalCwdConfig::Path(path) => crate::worktree::expand_tilde_path(path),
+        NewTerminalCwdConfig::Home => match std::env::var_os("HOME").map(PathBuf::from) {
+            Some(home) => Ok(home),
+            None => std::env::current_dir(),
+        },
+        NewTerminalCwdConfig::Current => std::env::current_dir(),
+        NewTerminalCwdConfig::Path(path) => Ok(crate::worktree::expand_tilde_path(path)),
     }
+}
+
+pub(crate) fn machine_identity_cwd() -> std::io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    if let Some(home) = home.as_ref() {
+        if home.is_dir() {
+            return Ok(home.clone());
+        }
+    }
+
+    #[cfg(windows)]
+    let profile = std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    #[cfg(windows)]
+    if let Some(profile) = profile.as_ref() {
+        if profile.is_dir() {
+            return Ok(profile.clone());
+        }
+    }
+
+    if let Some(home) = home {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("local home directory {} does not exist", home.display()),
+        ));
+    }
+
+    #[cfg(windows)]
+    if let Some(profile) = profile {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("local home directory {} does not exist", profile.display()),
+        ));
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "local home directory is not configured",
+    ))
 }
 
 pub(super) fn launch_cwd_for_terminal(
@@ -48,7 +90,38 @@ pub(super) fn launch_cwd_for_terminal(
         })
 }
 
+fn workspace_create_response(response: &str) -> Result<(), String> {
+    if let Ok(success) = serde_json::from_str::<crate::api::schema::SuccessResponse>(response) {
+        return match success.result {
+            crate::api::schema::ResponseResult::WorkspaceCreated { .. } => Ok(()),
+            _ => Err("Herdr returned an unexpected response while creating the workspace.".into()),
+        };
+    }
+    if let Ok(error) = serde_json::from_str::<crate::api::schema::ErrorResponse>(response) {
+        return Err(error.error.message);
+    }
+    Err("Herdr could not read the response while creating the workspace.".into())
+}
+
 impl App {
+    pub(crate) fn show_workspace_create_error(&mut self, message: String) {
+        let previous_toast = self.state.toast.clone();
+        self.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::NeedsAttention,
+            title: "workspace creation failed".to_string(),
+            context: message,
+            position: None,
+            target: None,
+        });
+        self.sync_toast_deadline(previous_toast);
+    }
+
+    pub(crate) fn apply_workspace_create_response(&mut self, response: &str) {
+        if let Err(message) = workspace_create_response(response) {
+            self.show_workspace_create_error(message);
+        }
+    }
+
     pub(super) fn seed_cwd_from_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
         self.state
             .workspaces
@@ -77,7 +150,10 @@ impl App {
         self.launch_cwd_for_pane_in_workspace(ws_idx, pane_id)
     }
 
-    pub(super) fn resolve_new_terminal_cwd(&self, follow_cwd: Option<PathBuf>) -> PathBuf {
+    pub(super) fn resolve_new_terminal_cwd(
+        &self,
+        follow_cwd: Option<PathBuf>,
+    ) -> std::io::Result<PathBuf> {
         resolve_new_terminal_cwd(&self.state.new_terminal_cwd, follow_cwd)
     }
 
@@ -96,31 +172,82 @@ impl App {
         })
     }
 
-    pub(super) fn begin_tui_workspace_create(&mut self, request_id: &'static str) {
+    pub(crate) fn begin_tui_workspace_create(&mut self, _request_id: &'static str) {
+        let sidebar = self.state.view.sidebar_rect;
+        self.begin_tui_workspace_create_at(
+            sidebar.x.saturating_add(1),
+            sidebar.y.saturating_add(sidebar.height.saturating_sub(1)),
+        );
+    }
+
+    pub(super) fn begin_tui_workspace_create_at(&mut self, x: u16, y: u16) {
+        let machines = self
+            .state
+            .machines
+            .iter()
+            .map(|machine| machine.name.clone())
+            .collect();
+        self.state.context_menu = Some(super::state::ContextMenuState {
+            kind: super::state::ContextMenuKind::WorkspaceCreateTarget { machines },
+            x,
+            y,
+            list: super::state::MenuListState::new(0),
+        });
+        self.state.mode = Mode::ContextMenu;
+    }
+
+    pub(super) fn begin_tui_local_workspace_create(&mut self, request_id: &'static str) {
         if self.state.prompt_new_workspace_name {
             let follow_cwd = self.workspace_creation_source().and_then(|ws_idx| {
                 self.focused_pane_cwd_in_workspace(ws_idx)
                     .or_else(|| self.seed_cwd_from_workspace(ws_idx))
             });
-            let cwd = self.resolve_new_terminal_cwd(follow_cwd);
+            let cwd = match self.resolve_new_terminal_cwd(follow_cwd) {
+                Ok(cwd) => cwd,
+                Err(err) => {
+                    self.show_workspace_create_error(err.to_string());
+                    self.state.mode = Mode::Navigate;
+                    return;
+                }
+            };
             super::input::open_new_workspace_dialog(&mut self.state, cwd);
             return;
         }
 
-        self.runtime_workspace_create(
+        let response = self.runtime_workspace_create(
             request_id,
             crate::api::schema::WorkspaceCreateParams {
                 cwd: None,
+                machine: None,
                 focus: true,
                 label: None,
                 env: Default::default(),
             },
         );
+        self.apply_workspace_create_response(&response);
         self.state.mode = if self.state.active.is_some() {
             Mode::Terminal
         } else {
             Mode::Navigate
         };
+    }
+
+    pub(super) fn begin_tui_machine_workspace_create(
+        &mut self,
+        request_id: &'static str,
+        machine: String,
+    ) {
+        let response = self.runtime_workspace_create(
+            request_id,
+            crate::api::schema::WorkspaceCreateParams {
+                cwd: None,
+                machine: Some(machine),
+                focus: true,
+                label: None,
+                env: Default::default(),
+            },
+        );
+        self.apply_workspace_create_response(&response);
     }
 
     /// Create a workspace with a real PTY (needs event_tx).
@@ -130,7 +257,14 @@ impl App {
             self.focused_pane_cwd_in_workspace(ws_idx)
                 .or_else(|| self.seed_cwd_from_workspace(ws_idx))
         });
-        let initial_cwd = self.resolve_new_terminal_cwd(follow_cwd);
+        let initial_cwd = match self.resolve_new_terminal_cwd(follow_cwd) {
+            Ok(cwd) => cwd,
+            Err(err) => {
+                self.show_workspace_create_error(err.to_string());
+                self.state.mode = Mode::Navigate;
+                return;
+            }
+        };
         if let Err(e) = self.create_workspace_with_events(initial_cwd, true) {
             error!(err = %e, "failed to create workspace");
             self.state.mode = Mode::Navigate;
@@ -145,7 +279,13 @@ impl App {
             self.focused_pane_cwd_in_workspace(ws_idx)
                 .or_else(|| self.seed_cwd_from_workspace(ws_idx))
         });
-        let initial_cwd = self.resolve_new_terminal_cwd(follow_cwd);
+        let initial_cwd = match self.resolve_new_terminal_cwd(follow_cwd) {
+            Ok(cwd) => cwd,
+            Err(err) => {
+                self.show_workspace_create_error(err.to_string());
+                return;
+            }
+        };
         match self.create_tab_with_options(initial_cwd, true) {
             Ok(created_idx) => {
                 let created_workspace = active_before.is_none();
@@ -242,8 +382,21 @@ impl App {
         focus: bool,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<usize> {
+        let prepared = self.prepare_workspace_with_launch_env(initial_cwd, extra_env)?;
+        Ok(self.finish_created_workspace(prepared, focus))
+    }
+
+    pub(super) fn prepare_workspace_with_launch_env(
+        &self,
+        initial_cwd: PathBuf,
+        extra_env: Vec<(String, String)>,
+    ) -> std::io::Result<(
+        Workspace,
+        crate::terminal::TerminalState,
+        crate::terminal::TerminalRuntime,
+    )> {
         let (rows, cols) = self.state.estimate_pane_size();
-        let (ws, terminal, runtime) = Workspace::new_with_extra_env(
+        Workspace::new_with_extra_env(
             initial_cwd,
             rows,
             cols,
@@ -254,7 +407,44 @@ impl App {
             self.render_notify.clone(),
             self.render_dirty.clone(),
             extra_env,
+        )
+    }
+
+    pub(crate) fn create_machine_workspace_with_launch_env(
+        &mut self,
+        machine: String,
+        focus: bool,
+        extra_env: Vec<(String, String)>,
+    ) -> std::io::Result<usize> {
+        let argv = crate::config::machine_ssh_argv(&self.state.machines, &machine)
+            .map_err(std::io::Error::other)?;
+        let initial_cwd = machine_identity_cwd()?;
+        let (rows, cols) = self.state.estimate_pane_size();
+        let (ws, terminal, runtime) = Workspace::new_machine_argv_command_with_extra_env(
+            machine,
+            initial_cwd,
+            rows,
+            cols,
+            &argv,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+            extra_env,
         )?;
+        Ok(self.finish_created_workspace((ws, terminal, runtime), focus))
+    }
+
+    pub(super) fn finish_created_workspace(
+        &mut self,
+        (ws, terminal, runtime): (
+            Workspace,
+            crate::terminal::TerminalState,
+            crate::terminal::TerminalRuntime,
+        ),
+        focus: bool,
+    ) -> usize {
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.terminals.insert(terminal.id.clone(), terminal);
         self.state.workspaces.push(ws);
@@ -269,7 +459,7 @@ impl App {
             self.state.mode = Mode::Terminal;
         }
         self.schedule_session_save();
-        Ok(idx)
+        idx
     }
 
     pub(super) fn collect_panes_for_workspace(
@@ -501,6 +691,7 @@ impl App {
                 crate::workspace::public_tab_id_for_number(&ws.id, ws.active_tab + 1)
             }),
             agent_status: pane_agent_status(agg_state, seen),
+            machine: ws.machine.clone(),
             tokens: ws.metadata_tokens.values(),
             worktree: ws
                 .worktree_space()

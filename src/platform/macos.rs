@@ -15,6 +15,10 @@ use super::{
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 
+pub(crate) fn replace_file_platform(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
+
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false
 }

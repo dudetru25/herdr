@@ -200,7 +200,10 @@ impl App {
         ) {
             return encode_error(id, code, message);
         }
-        let context = self.merge_plugin_context(params.context, &id);
+        let context = match self.merge_plugin_context(params.context, &id) {
+            Ok(context) => context,
+            Err(err) => return encode_error(id, err.code, err.message),
+        };
         let log = match self.start_plugin_command(
             &plugin,
             Some(action.action_id.clone()),
@@ -239,7 +242,9 @@ impl App {
             &action.qualified_id(),
         )
         .map_err(|(_, message)| message)?;
-        let mut context = self.current_plugin_context("keybinding");
+        let mut context = self
+            .current_plugin_context("keybinding")
+            .map_err(|err| err.message)?;
         context.invocation_source = Some("keybinding".to_string());
         self.start_plugin_command(
             &plugin,
@@ -290,7 +295,14 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return Ok(false);
         };
-        let mut context = self.plugin_context_for_pane(ws_idx, pane_id, "link_click");
+        let mut context = match self.plugin_context_for_pane(ws_idx, pane_id, "link_click") {
+            Ok(context) => context,
+            Err(err) => {
+                let message = err.message.clone();
+                self.show_plugin_context_error(&err);
+                return Err(message);
+            }
+        };
         context.invocation_source = Some("link_click".to_string());
         context.clicked_url = Some(url.to_string());
         context.link_handler_id = Some(handler.id);
@@ -2004,7 +2016,9 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         assert_eq!(panes[0].pane_id, root_public);
         assert!(panes[0].focused);
         assert_eq!(
-            app.current_plugin_context("popup-open").focused_pane_id,
+            app.current_plugin_context("popup-open")
+                .unwrap()
+                .focused_pane_id,
             Some(root_public)
         );
         assert!(event_hub.events_after(0).is_empty());
@@ -2433,7 +2447,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PLUG
         );
         app.state.selection = Some(crate::selection::Selection::range(pane_id, 0, 0, 4, None));
 
-        let context = app.current_plugin_context("selection-test");
+        let context = app.current_plugin_context("selection-test").unwrap();
 
         assert_eq!(context.selected_text.as_deref(), Some("hello"));
     }
@@ -2589,16 +2603,18 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
         let closed_tab_id = format!("{workspace_id}:t99");
         let closed_pane_id = format!("{workspace_id}:p99");
 
-        let tab_context = app.plugin_context_for_event(
-            &crate::api::schema::EventEnvelope {
-                event: crate::api::schema::EventKind::TabClosed,
-                data: crate::api::schema::EventData::TabClosed {
-                    tab_id: closed_tab_id.clone(),
-                    workspace_id: workspace_id.clone(),
+        let tab_context = app
+            .plugin_context_for_event(
+                &crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::TabClosed,
+                    data: crate::api::schema::EventData::TabClosed {
+                        tab_id: closed_tab_id.clone(),
+                        workspace_id: workspace_id.clone(),
+                    },
                 },
-            },
-            "tab.closed",
-        );
+                "tab.closed",
+            )
+            .unwrap();
         assert_eq!(
             tab_context.workspace_id.as_deref(),
             Some(workspace_id.as_str())
@@ -2606,16 +2622,18 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
         assert_eq!(tab_context.tab_id.as_deref(), Some(closed_tab_id.as_str()));
         assert_eq!(tab_context.focused_pane_id, None);
 
-        let pane_context = app.plugin_context_for_event(
-            &crate::api::schema::EventEnvelope {
-                event: crate::api::schema::EventKind::PaneClosed,
-                data: crate::api::schema::EventData::PaneClosed {
-                    pane_id: closed_pane_id.clone(),
-                    workspace_id: workspace_id.clone(),
+        let pane_context = app
+            .plugin_context_for_event(
+                &crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::PaneClosed,
+                    data: crate::api::schema::EventData::PaneClosed {
+                        pane_id: closed_pane_id.clone(),
+                        workspace_id: workspace_id.clone(),
+                    },
                 },
-            },
-            "pane.closed",
-        );
+                "pane.closed",
+            )
+            .unwrap();
         assert_eq!(
             pane_context.workspace_id.as_deref(),
             Some(workspace_id.as_str())
@@ -2654,18 +2672,20 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
             checkout_path: "/repo/herdr-other".into(),
             is_linked_worktree: true,
         });
-        let changed_context = app.plugin_context_for_event(
-            &crate::api::schema::EventEnvelope {
-                event: crate::api::schema::EventKind::WorktreeRemoved,
-                data: crate::api::schema::EventData::WorktreeRemoved {
-                    workspace_id: workspace_id.clone(),
-                    workspace: Some(workspace.clone()),
-                    worktree: worktree.clone(),
-                    forced: true,
+        let changed_context = app
+            .plugin_context_for_event(
+                &crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::WorktreeRemoved,
+                    data: crate::api::schema::EventData::WorktreeRemoved {
+                        workspace_id: workspace_id.clone(),
+                        workspace: Some(workspace.clone()),
+                        worktree: worktree.clone(),
+                        forced: true,
+                    },
                 },
-            },
-            "worktree.removed",
-        );
+                "worktree.removed",
+            )
+            .unwrap();
         assert_eq!(
             changed_context
                 .worktree
@@ -2675,18 +2695,20 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_CONTEXT_JSON\" > {}"]
         );
 
         app.state.workspaces.clear();
-        let removed_context = app.plugin_context_for_event(
-            &crate::api::schema::EventEnvelope {
-                event: crate::api::schema::EventKind::WorktreeRemoved,
-                data: crate::api::schema::EventData::WorktreeRemoved {
-                    workspace_id: workspace_id.clone(),
-                    workspace: Some(workspace),
-                    worktree,
-                    forced: true,
+        let removed_context = app
+            .plugin_context_for_event(
+                &crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::WorktreeRemoved,
+                    data: crate::api::schema::EventData::WorktreeRemoved {
+                        workspace_id: workspace_id.clone(),
+                        workspace: Some(workspace),
+                        worktree,
+                        forced: true,
+                    },
                 },
-            },
-            "worktree.removed",
-        );
+                "worktree.removed",
+            )
+            .unwrap();
         assert_eq!(
             removed_context.workspace_id.as_deref(),
             Some(workspace_id.as_str())

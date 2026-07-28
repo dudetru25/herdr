@@ -4,6 +4,7 @@ pub mod agents;
 pub mod common;
 pub mod events;
 pub mod integrations;
+pub mod machines;
 pub mod panes;
 pub mod plugins;
 pub mod response;
@@ -17,6 +18,7 @@ pub use agents::*;
 pub use common::*;
 pub use events::*;
 pub use integrations::*;
+pub use machines::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
@@ -65,6 +67,10 @@ pub enum Method {
     SessionSnapshot(EmptyParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
+    #[serde(rename = "machine.list")]
+    MachineList(EmptyParams),
+    #[serde(rename = "machine.add")]
+    MachineAdd(MachineAddParams),
     #[serde(rename = "workspace.list")]
     WorkspaceList(EmptyParams),
     #[serde(rename = "workspace.get")]

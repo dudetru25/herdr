@@ -52,6 +52,8 @@ pub struct WorkspaceSnapshot {
     pub id: Option<String>,
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     pub identity_cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
@@ -158,6 +160,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
         Self {
             id: None,
             custom_name: snap.custom_name,
+            machine: None,
             identity_cwd,
             worktree_space: None,
             parent_space: None,
@@ -290,11 +293,19 @@ fn capture_workspace(
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
         custom_name: ws.custom_name.clone(),
-        identity_cwd: ws
-            .resolved_identity_cwd_from(terminals, terminal_runtimes)
-            .unwrap_or_else(|| ws.identity_cwd.clone()),
-        worktree_space: ws.worktree_space.clone(),
-        parent_space: ws.parent_space.clone(),
+        machine: ws.machine.clone(),
+        identity_cwd: if ws.is_machine() {
+            ws.identity_cwd.clone()
+        } else {
+            ws.resolved_identity_cwd_from(terminals, terminal_runtimes)
+                .unwrap_or_else(|| ws.identity_cwd.clone())
+        },
+        worktree_space: (!ws.is_machine())
+            .then(|| ws.worktree_space.clone())
+            .flatten(),
+        parent_space: (!ws.is_machine())
+            .then(|| ws.parent_space.clone())
+            .flatten(),
         public_pane_numbers: ws
             .public_pane_numbers
             .iter()
@@ -619,6 +630,25 @@ mod tests {
     }
 
     #[test]
+    fn machine_workspace_snapshot_round_trip_preserves_registry_name() {
+        let mut state = state_with_workspaces(&["build"]);
+        state.workspaces[0].machine = Some("build".into());
+        state.workspaces[0].custom_name = Some("build".into());
+
+        let captured = capture_from_state(&state);
+        assert_eq!(captured.workspaces[0].machine.as_deref(), Some("build"));
+        let json = serde_json::to_string(&captured).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert_eq!(restored.workspaces[0].machine.as_deref(), Some("build"));
+        assert_eq!(restored.workspaces[0].custom_name.as_deref(), Some("build"));
+        assert_eq!(
+            restored.workspaces[0].identity_cwd,
+            state.workspaces[0].identity_cwd
+        );
+    }
+
+    #[test]
     fn round_trip_layout_snapshot() {
         let layout = LayoutSnapshot::Split {
             direction: DirectionSnapshot::Horizontal,
@@ -670,6 +700,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
+                machine: None,
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
                 worktree_space: None,
                 parent_space: None,
@@ -1261,6 +1292,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("test-ws".to_string()),
                 custom_name: Some("fallback test".to_string()),
+                machine: None,
                 identity_cwd: PathBuf::from("/tmp"),
                 worktree_space: None,
                 parent_space: None,

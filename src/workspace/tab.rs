@@ -338,12 +338,14 @@ impl Tab {
         command: Option<SplitCommand<'_>>,
     ) -> std::io::Result<NewPane> {
         let previous_focus = self.layout.focused();
+        let actual_cwd = match cwd {
+            Some(cwd) => cwd,
+            None => std::env::current_dir()?,
+        };
         let new_id = match ratio {
             Some(ratio) => self.layout.split_focused_with_ratio(direction, ratio),
             None => self.layout.split_focused(direction),
         };
-        let actual_cwd =
-            cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
         let launch_argv = if let Some(SplitCommand::Argv { argv, .. }) = &command {
             Some((*argv).to_vec())
         } else {

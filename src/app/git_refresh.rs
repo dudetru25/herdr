@@ -118,6 +118,7 @@ impl App {
         self.state
             .workspaces
             .iter()
+            .filter(|workspace| !workspace.is_machine())
             .filter_map(|ws| {
                 let cwd =
                     ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)?;
@@ -203,6 +204,24 @@ fn refresh_workspace_git_statuses_with_cache_and_demand(
 mod tests {
     use super::*;
     use crate::workspace::Workspace;
+
+    #[test]
+    fn machine_workspace_is_excluded_from_git_refresh_discovery() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut workspace = Workspace::test_new("build");
+        workspace.machine = Some("build".into());
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+
+        assert!(app.workspace_git_refresh_items(true).is_empty());
+    }
 
     #[test]
     fn git_refresh_deduplicates_workspaces_with_same_cache_key() {

@@ -34,6 +34,14 @@ herdr status server
 herdr status client
 ```
 
+Use `herdr status --json` for the exact client binary path, client and server
+protocol versions, and their compatibility result. The narrower
+`status client --json` and `status server --json` forms report only their named
+side. From a source checkout, `just reload-local-check` performs the full
+read-only compatibility check and also verifies that bare `herdr` resolves to
+the repository reload destination. It does not build, install, change `PATH`,
+or hand off the server.
+
 API schema commands:
 
 ```bash
@@ -116,7 +124,7 @@ Use `default` as the session name when you need to stop the default session expl
 
 ```bash
 herdr workspace list
-herdr workspace create [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]
+herdr workspace create [--cwd PATH | --machine NAME] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]
 herdr workspace get <workspace_id>
 herdr workspace focus <workspace_id>
 herdr workspace rename <workspace_id> <label>
@@ -131,6 +139,15 @@ herdr workspace create --cwd ~/project --label api --no-focus
 ```
 
 A workspace is the top-level project or work context. Creating one also creates its first tab and root pane. The JSON response exposes their IDs as `.result.workspace.workspace_id`, `.result.tab.tab_id`, and `.result.root_pane.pane_id`.
+
+## Machines
+
+```bash
+herdr machine list
+herdr workspace create --machine build
+```
+
+`machine list` prints the live `[[machines]]` registry. `workspace create --machine NAME` creates an SSH-backed workspace; `--machine` and `--cwd` are mutually exclusive.
 
 ## Worktrees
 

@@ -82,11 +82,47 @@ fn spawn_server_with_env(
         "HERDR_CLIENT_SOCKET_PATH",
         runtime_dir.join("herdr-client.sock"),
     );
+    cmd.env_remove("HERDR_STARTUP_CWD");
     cmd.env("SHELL", "/bin/sh");
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
 
+    let child = pair.slave.spawn_command(cmd).unwrap();
+    register_spawned_herdr_pid(child.process_id());
+    SpawnedHerdr {
+        _master: pair.master,
+        child,
+    }
+}
+
+fn spawn_app_client(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+    client_socket: &Path,
+) -> SpawnedHerdr {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("HERDR_SOCKET_PATH", api_socket);
+    cmd.env("HERDR_CLIENT_SOCKET_PATH", client_socket);
+    cmd.env_remove("HERDR_ENV");
+    cmd.env("SHELL", "/bin/sh");
+    cmd.env("TERM", "xterm-256color");
+
+    let mut client_output = pair.master.try_clone_reader().unwrap();
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut client_output, &mut std::io::sink());
+    });
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
     SpawnedHerdr {
@@ -402,6 +438,29 @@ fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> Strin
     }
     panic!(
         "{} did not contain {needle:?}; last text was {last_text:?}",
+        path.display()
+    );
+}
+
+fn wait_for_file_occurrences(
+    path: &Path,
+    needle: &str,
+    expected: usize,
+    timeout: Duration,
+) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut last_text = String::new();
+    while Instant::now() < deadline {
+        if let Ok(text) = fs::read_to_string(path) {
+            last_text = text;
+            if last_text.matches(needle).count() >= expected {
+                return last_text;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "{} did not contain {expected} occurrences of {needle:?}; last text was {last_text:?}",
         path.display()
     );
 }
@@ -770,6 +829,49 @@ fn live_handoff_preserves_installed_plugins() {
 }
 
 #[test]
+fn live_handoff_reconnects_foreground_app_client() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let server_log = config_home.join("herdr-dev/herdr-server.log");
+
+    let spawned_server = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+    register_runtime_dir(&runtime_dir);
+
+    let mut spawned_client =
+        spawn_app_client(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_file_occurrences(&server_log, "client connected", 1, Duration::from_secs(10));
+    assert!(
+        spawned_client.child.try_wait().unwrap().is_none(),
+        "foreground app client exited before live handoff"
+    );
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned_server);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+    wait_for_file_occurrences(&server_log, "client connected", 2, Duration::from_secs(10));
+    assert!(
+        spawned_client.child.try_wait().unwrap().is_none(),
+        "foreground app client exited instead of reconnecting after live handoff"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_preserves_pane_process_io() {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -846,8 +948,8 @@ fn live_handoff_preserves_pane_process_io() {
             "params": {"pane_id": second_pane_id, "text": second_command, "keys": ["Enter"]}
         }),
     ));
-    support::wait_for_file(&marker, Duration::from_secs(5));
-    support::wait_for_file(&second_marker, Duration::from_secs(5));
+    wait_for_file_contains(&marker, "READY", Duration::from_secs(5));
+    wait_for_file_contains(&second_marker, "SECOND_READY", Duration::from_secs(5));
     let pid_text = fs::read_to_string(&marker).unwrap();
     let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
     let second_pid_text = fs::read_to_string(&second_marker).unwrap();
@@ -1228,7 +1330,7 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\nexec /bin/sleep 30\n",
+            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n",
             started_marker.display()
         ),
     )
@@ -1696,12 +1798,18 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let server_log = config_home.join("herdr-dev/herdr-server.log");
     let marker = base.join("child.pid");
     let received_marker = base.join("received");
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
     register_runtime_dir(&runtime_dir);
+    let mut spawned_client =
+        spawn_app_client(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_file_occurrences(&server_log, "client connected", 1, Duration::from_secs(10));
 
     let created = request(
         &api_socket,
@@ -1745,7 +1853,12 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
         "bad protocol handoff should fail: {failed}"
     );
     wait_for_api(&api_socket, Duration::from_secs(5));
+    wait_for_file_occurrences(&server_log, "client connected", 2, Duration::from_secs(10));
     assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
+    assert!(
+        spawned_client.child.try_wait().unwrap().is_none(),
+        "foreground app client exited instead of reconnecting to the rolled-back server"
+    );
 
     assert_ok(request(
         &api_socket,

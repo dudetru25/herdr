@@ -79,6 +79,10 @@ new_cwd = "follow"
 
 `new_cwd = "follow"` はデフォルトの挙動を保ち、元のペインまたはワークスペースを継承します。元のワークスペースがない場合、Herdr は `$HOME` で起動します。常に `$HOME` で起動するには `"home"` を、Herdr のプロセスディレクトリを使うには `"current"` を、または `"~/Projects"` のような固定パスを使ってください。CLI またはソケット API から明示的に指定された `--cwd` の値は引き続き優先されます。
 
+## SSH マシンスペース
+
+`[[machines]]` で通常の SSH 接続先を登録できます。`cwd` を指定すると Herdr はリモート側で `cd` と `$SHELL` を使うため、POSIX 互換のログインシェルが必要です。PowerShell、`cmd.exe`、またはその他の非 POSIX SSH 接続先では `cwd` を省略してください。
+
 ## Worktree
 
 サイドバーから作成される Git worktree チェックアウトに Herdr が使うルートディレクトリを設定します:

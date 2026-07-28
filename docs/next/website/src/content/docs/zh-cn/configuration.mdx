@@ -79,6 +79,10 @@ new_cwd = "follow"
 
 `new_cwd = "follow"` 保持默认行为，并继承来源窗格或工作区。没有来源工作区时，Herdr 从 `$HOME` 启动。使用 `"home"` 可始终从 `$HOME` 启动，使用 `"current"` 可采用 Herdr 的进程目录，也可以指定 `"~/Projects"` 这样的固定路径。CLI 或 socket API 显式提供的 `--cwd` 值仍然优先。
 
+## SSH 机器空间
+
+可通过 `[[machines]]` 注册普通 SSH 目标。指定 `cwd` 时，Herdr 会在远端使用 `cd` 和 `$SHELL`，因此远端登录 shell 必须兼容 POSIX。对于 PowerShell、`cmd.exe` 或其他非 POSIX SSH 目标，请省略 `cwd`。
+
 ## Worktree
 
 设置 Herdr 从侧边栏创建 Git worktree 检出时使用的根目录：

@@ -46,32 +46,41 @@ fn immediate_subdirectories(root: &Path) -> Result<Vec<PathBuf>, ParentSpaceActi
     })?;
     let mut directories = Vec::new();
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                warn!(path = %root.display(), %err, "failed to read parent-space entry");
-                continue;
-            }
-        };
+        let entry = entry.map_err(|err| {
+            ParentSpaceActionError::new(
+                "parent_space_scan_failed",
+                format!(
+                    "failed to read an entry in parent-space root {}: {err}",
+                    root.display()
+                ),
+            )
+        })?;
         if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(err) => {
-                warn!(path = %entry.path().display(), %err, "failed to inspect parent-space entry");
-                continue;
-            }
-        };
+        let entry_path = entry.path();
+        let file_type = entry.file_type().map_err(|err| {
+            ParentSpaceActionError::new(
+                "parent_space_scan_failed",
+                format!(
+                    "failed to inspect parent-space entry {}: {err}",
+                    entry_path.display()
+                ),
+            )
+        })?;
         if !file_type.is_dir() {
             continue;
         }
-        match entry.path().canonicalize() {
-            Ok(path) => directories.push((entry.file_name(), path)),
-            Err(err) => {
-                warn!(path = %entry.path().display(), %err, "failed to canonicalize sub-space");
-            }
-        }
+        let canonical_path = entry_path.canonicalize().map_err(|err| {
+            ParentSpaceActionError::new(
+                "parent_space_scan_failed",
+                format!(
+                    "failed to canonicalize sub-space {}: {err}",
+                    entry_path.display()
+                ),
+            )
+        })?;
+        directories.push((entry.file_name(), canonical_path));
     }
     directories.sort_by(|(left, _), (right, _)| left.cmp(right));
     let mut seen = HashSet::new();
@@ -82,39 +91,40 @@ fn immediate_subdirectories(root: &Path) -> Result<Vec<PathBuf>, ParentSpaceActi
 }
 
 impl AppState {
-    fn apply_parent_space_scan(
-        &mut self,
+    fn plan_parent_space_scan(
+        &self,
         parent_idx: usize,
-        membership: &ParentSpaceMembership,
         directories: &[PathBuf],
-    ) -> ParentSpaceScanPlan {
-        let Some(parent) = self.workspaces.get_mut(parent_idx) else {
-            return ParentSpaceScanPlan {
-                adopted_indices: Vec::new(),
-                missing_directories: Vec::new(),
-            };
-        };
-        parent.parent_space = Some(membership.clone());
+    ) -> Result<ParentSpaceScanPlan, ParentSpaceActionError> {
+        if self.workspaces.get(parent_idx).is_none() {
+            return Err(ParentSpaceActionError::new(
+                "workspace_not_found",
+                "workspace not found",
+            ));
+        }
 
         let existing_paths = self
             .workspaces
             .iter()
             .enumerate()
-            .filter_map(
-                |(ws_idx, workspace)| match workspace.identity_cwd.canonicalize() {
-                    Ok(path) => Some((ws_idx, path)),
-                    Err(err) => {
-                        warn!(
-                            workspace_id = %workspace.id,
-                            path = %workspace.identity_cwd.display(),
-                            %err,
-                            "failed to canonicalize workspace identity for parent-space adoption"
-                        );
-                        None
-                    }
-                },
-            )
-            .collect::<Vec<_>>();
+            .filter(|(_, workspace)| !workspace.is_machine())
+            .map(|(ws_idx, workspace)| {
+                workspace
+                    .identity_cwd
+                    .canonicalize()
+                    .map(|path| (ws_idx, path))
+                    .map_err(|err| {
+                        ParentSpaceActionError::new(
+                            "parent_space_scan_failed",
+                            format!(
+                                "failed to canonicalize workspace {} at {}: {err}",
+                                workspace.id,
+                                workspace.identity_cwd.display()
+                            ),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut adopted_indices = Vec::new();
         let mut missing_directories = Vec::new();
@@ -126,16 +136,42 @@ impl AppState {
                 missing_directories.push(directory.clone());
                 continue;
             };
-            let previous_parent_key = self
-                .workspaces
-                .get(existing_idx)
-                .and_then(|workspace| workspace.parent_space())
+            adopted_indices.push(existing_idx);
+        }
+        Ok(ParentSpaceScanPlan {
+            adopted_indices,
+            missing_directories,
+        })
+    }
+
+    fn apply_parent_space_scan(
+        &mut self,
+        parent_idx: usize,
+        membership: &ParentSpaceMembership,
+        plan: &ParentSpaceScanPlan,
+    ) -> Result<(), ParentSpaceActionError> {
+        if self.workspaces.get(parent_idx).is_none()
+            || plan
+                .adopted_indices
+                .iter()
+                .any(|index| self.workspaces.get(*index).is_none())
+        {
+            return Err(ParentSpaceActionError::new(
+                "workspace_not_found",
+                "workspace disappeared while applying parent-space scan",
+            ));
+        }
+        self.workspaces[parent_idx].parent_space = Some(membership.clone());
+
+        for &existing_idx in &plan.adopted_indices {
+            let previous_parent_key = self.workspaces[existing_idx]
+                .parent_space()
                 .filter(|previous| previous.is_parent && previous.key != membership.key)
                 .map(|previous| previous.key.clone());
             if let Some(previous_parent_key) = previous_parent_key {
                 warn!(
                     workspace_id = %self.workspaces[existing_idx].id,
-                    path = %directory.display(),
+                    path = %self.workspaces[existing_idx].identity_cwd.display(),
                     "demoting an existing parent space during adoption"
                 );
                 for workspace in &mut self.workspaces {
@@ -153,18 +189,13 @@ impl AppState {
                 root: membership.root.clone(),
                 is_parent: false,
             };
-            if let Some(workspace) = self.workspaces.get_mut(existing_idx) {
-                if workspace.parent_space.as_ref() != Some(&child_membership) {
-                    workspace.parent_space = Some(child_membership);
-                    adopted_indices.push(existing_idx);
-                }
+            let workspace = &mut self.workspaces[existing_idx];
+            if workspace.parent_space.as_ref() != Some(&child_membership) {
+                workspace.parent_space = Some(child_membership);
             }
         }
         self.mark_session_dirty();
-        ParentSpaceScanPlan {
-            adopted_indices,
-            missing_directories,
-        }
+        Ok(())
     }
 
     fn clear_parent_space_group(&mut self, parent_idx: usize) -> usize {
@@ -194,6 +225,18 @@ impl AppState {
 }
 
 impl App {
+    pub(crate) fn show_parent_space_error(&mut self, err: &ParentSpaceActionError) {
+        let previous_toast = self.state.toast.clone();
+        self.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::NeedsAttention,
+            title: "parent-space action failed".to_string(),
+            context: format!("{}: {}", err.code, err.message),
+            position: None,
+            target: None,
+        });
+        self.sync_toast_deadline(previous_toast);
+    }
+
     pub(crate) fn apply_parent_space_action(
         &mut self,
         ws_idx: usize,
@@ -206,6 +249,12 @@ impl App {
             ));
         };
         let parent_workspace_id = workspace.id.clone();
+        if workspace.is_machine() {
+            return Err(ParentSpaceActionError::new(
+                "machine_workspace_parent_space",
+                "machine workspaces cannot participate in parent spaces",
+            ));
+        }
         match action {
             ParentSpaceAction::Become => {
                 if self.workspace_is_linked_worktree(ws_idx) {
@@ -313,42 +362,44 @@ impl App {
         };
 
         let directories = immediate_subdirectories(&membership.root)?;
-        let plan = self
-            .state
-            .apply_parent_space_scan(ws_idx, &membership, &directories);
-        let mut child_workspace_ids = plan
-            .adopted_indices
-            .into_iter()
-            .filter_map(|child_idx| {
-                self.state
-                    .workspaces
-                    .get(child_idx)
-                    .map(|workspace| workspace.id.clone())
-            })
-            .collect::<Vec<_>>();
-        for path in plan.missing_directories {
-            match self.create_workspace_with_options(path.clone(), false) {
-                Ok(child_idx) => {
-                    if let Some(child) = self.state.workspaces.get_mut(child_idx) {
-                        child.parent_space = Some(ParentSpaceMembership {
-                            key: membership.key.clone(),
-                            root: membership.root.clone(),
-                            is_parent: false,
-                        });
-                        child_workspace_ids.push(child.id.clone());
-                    }
-                    self.emit_workspace_open_events(child_idx);
-                }
-                Err(err) => {
-                    return Err(ParentSpaceActionError::new(
+        let plan = self.state.plan_parent_space_scan(ws_idx, &directories)?;
+        let mut prepared_children = Vec::with_capacity(plan.missing_directories.len());
+        for path in &plan.missing_directories {
+            let prepared = self
+                .prepare_workspace_with_launch_env(path.clone(), Vec::new())
+                .map_err(|err| {
+                    ParentSpaceActionError::new(
                         "parent_space_child_create_failed",
                         format!(
                             "failed to create child workspace for {}: {err}",
                             path.display()
                         ),
-                    ));
-                }
-            }
+                    )
+                })?;
+            prepared_children.push(prepared);
+        }
+
+        self.state
+            .apply_parent_space_scan(ws_idx, &membership, &plan)?;
+        let mut child_workspace_ids = plan
+            .adopted_indices
+            .iter()
+            .map(|&child_idx| self.state.workspaces[child_idx].id.clone())
+            .collect::<Vec<_>>();
+        let mut created_indices = Vec::with_capacity(prepared_children.len());
+        for prepared in prepared_children {
+            let child_idx = self.finish_created_workspace(prepared, false);
+            let child = &mut self.state.workspaces[child_idx];
+            child.parent_space = Some(ParentSpaceMembership {
+                key: membership.key.clone(),
+                root: membership.root.clone(),
+                is_parent: false,
+            });
+            child_workspace_ids.push(child.id.clone());
+            created_indices.push(child_idx);
+        }
+        for child_idx in created_indices {
+            self.emit_workspace_open_events(child_idx);
         }
         self.state.mark_session_dirty();
         Ok(ParentSpaceActionOutcome {
@@ -398,6 +449,17 @@ mod tests {
         }
     }
 
+    fn test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
     #[test]
     fn scan_adopts_existing_workspace_and_rescan_only_returns_missing_directories() {
         let fixture = TempFixture::new();
@@ -429,7 +491,10 @@ mod tests {
                 alpha.canonicalize().unwrap()
             ]
         );
-        let plan = state.apply_parent_space_scan(0, &membership, &directories);
+        let plan = state.plan_parent_space_scan(0, &directories).unwrap();
+        state
+            .apply_parent_space_scan(0, &membership, &plan)
+            .unwrap();
         assert_eq!(
             plan.missing_directories,
             vec![archive.canonicalize().unwrap()]
@@ -447,13 +512,71 @@ mod tests {
 
         let beta = fixture.root.join("beta");
         std::fs::create_dir(&beta).unwrap();
-        let plan = state.apply_parent_space_scan(
-            0,
-            &membership,
-            &immediate_subdirectories(&fixture.root).unwrap(),
-        );
+        let plan = state
+            .plan_parent_space_scan(0, &immediate_subdirectories(&fixture.root).unwrap())
+            .unwrap();
+        state
+            .apply_parent_space_scan(0, &membership, &plan)
+            .unwrap();
         assert_eq!(plan.missing_directories, vec![beta.canonicalize().unwrap()]);
         assert_eq!(state.workspaces.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn child_creation_failure_leaves_parent_space_state_unchanged() {
+        let fixture = TempFixture::new();
+        let adopted_path = fixture.root.join("adopted");
+        let missing_path = fixture.root.join("missing");
+        std::fs::create_dir(&adopted_path).unwrap();
+        std::fs::create_dir(&missing_path).unwrap();
+
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = fixture.root.clone();
+        let mut adopted = Workspace::test_new("adopted");
+        adopted.identity_cwd = adopted_path.canonicalize().unwrap();
+        let mut app = test_app();
+        app.state.workspaces = vec![parent, adopted];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.default_shell = fixture.root.join("missing-shell").display().to_string();
+
+        let err = app
+            .apply_parent_space_action(0, ParentSpaceAction::Become)
+            .unwrap_err();
+
+        assert_eq!(err.code, "parent_space_child_create_failed");
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert!(app
+            .state
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.parent_space().is_none()));
+        assert_eq!(app.terminal_runtimes.len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entry_canonicalization_failure_does_not_commit_parent_membership() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = TempFixture::new();
+        std::fs::create_dir(fixture.root.join("child")).unwrap();
+        let original_permissions = std::fs::metadata(&fixture.root).unwrap().permissions();
+        std::fs::set_permissions(&fixture.root, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = fixture.root.clone();
+        let mut app = test_app();
+        app.state.workspaces = vec![parent];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let result = app.apply_parent_space_action(0, ParentSpaceAction::Become);
+
+        std::fs::set_permissions(&fixture.root, original_permissions).unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "parent_space_scan_failed");
+        assert!(app.state.workspaces[0].parent_space().is_none());
+        assert_eq!(app.state.workspaces.len(), 1);
     }
 
     #[test]

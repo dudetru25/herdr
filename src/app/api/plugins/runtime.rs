@@ -181,7 +181,18 @@ impl App {
     }
 
     pub(crate) fn run_plugin_startup_hooks(&mut self) {
-        let mut context = self.current_plugin_context("plugin.startup");
+        let mut context = match self.current_plugin_context("plugin.startup") {
+            Ok(context) => context,
+            Err(err) => {
+                tracing::warn!(
+                    code = err.code,
+                    message = %err.message,
+                    "failed to resolve plugin startup context"
+                );
+                self.show_plugin_context_error(&err);
+                return;
+            }
+        };
         context.invocation_source = Some("startup".to_string());
         let mut plugins = self
             .state
@@ -239,7 +250,18 @@ impl App {
             return;
         }
         let event_json = serde_json::to_string(event).ok();
-        let context = self.plugin_context_for_event(event, event_name);
+        let context = match self.plugin_context_for_event(event, event_name) {
+            Ok(context) => context,
+            Err(err) => {
+                tracing::warn!(
+                    code = err.code,
+                    message = %err.message,
+                    "failed to resolve plugin event context"
+                );
+                self.show_plugin_context_error(&err);
+                return;
+            }
+        };
         for plugin in plugins {
             for hook in plugin.events.clone() {
                 if hook.on != event_name {

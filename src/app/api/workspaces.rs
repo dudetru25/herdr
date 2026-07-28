@@ -42,18 +42,38 @@ impl App {
         id: String,
         params: WorkspaceCreateParams,
     ) -> String {
-        let cwd = params.cwd.map(PathBuf::from).unwrap_or_else(|| {
-            let follow_cwd = self.workspace_creation_source().and_then(|ws_idx| {
-                self.focused_pane_cwd_in_workspace(ws_idx)
-                    .or_else(|| self.seed_cwd_from_workspace(ws_idx))
-            });
-            self.resolve_new_terminal_cwd(follow_cwd)
-        });
+        if params.machine.is_some() && params.cwd.is_some() {
+            return encode_error(
+                id,
+                "workspace_create_invalid",
+                "machine and cwd are mutually exclusive",
+            );
+        }
         let extra_env = match super::env::normalize_launch_env(params.env) {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
-        match self.create_workspace_with_launch_env(cwd, params.focus, extra_env) {
+        let created = if let Some(machine) = params.machine {
+            self.create_machine_workspace_with_launch_env(machine, params.focus, extra_env)
+        } else {
+            let cwd = match params.cwd.map(PathBuf::from) {
+                Some(cwd) => cwd,
+                None => {
+                    let follow_cwd = self.workspace_creation_source().and_then(|ws_idx| {
+                        self.focused_pane_cwd_in_workspace(ws_idx)
+                            .or_else(|| self.seed_cwd_from_workspace(ws_idx))
+                    });
+                    match self.resolve_new_terminal_cwd(follow_cwd) {
+                        Ok(cwd) => cwd,
+                        Err(err) => {
+                            return encode_error(id, "workspace_create_failed", err.to_string())
+                        }
+                    }
+                }
+            };
+            self.create_workspace_with_launch_env(cwd, params.focus, extra_env)
+        };
+        match created {
             Ok(index) => {
                 if let Some(label) = params.label {
                     if let Some(workspace) = self.state.workspaces.get_mut(index) {
@@ -346,7 +366,7 @@ mod tests {
     use super::*;
     use crate::{
         api::schema::{ErrorResponse, Method, Request, SuccessResponse},
-        config::Config,
+        config::{Config, MachineConfig},
         workspace::{ParentSpaceMembership, Workspace},
     };
 
@@ -389,6 +409,119 @@ mod tests {
         app.state.selected = 0;
         app.state.ensure_test_terminals();
         app
+    }
+
+    fn machine_config(target: &str) -> Config {
+        Config {
+            machines: vec![MachineConfig {
+                name: "build".into(),
+                target: target.into(),
+                cwd: None,
+            }],
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_create_machine_spawns_ssh_root_and_uses_local_identity() {
+        let config = machine_config("-V");
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        let response = app.handle_workspace_create(
+            "machine".into(),
+            WorkspaceCreateParams {
+                cwd: None,
+                machine: Some("build".into()),
+                focus: true,
+                label: None,
+                env: Default::default(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorkspaceCreated { workspace, .. } = success.result else {
+            panic!("expected workspace create response");
+        };
+        assert_eq!(workspace.machine.as_deref(), Some("build"));
+        let created = &app.state.workspaces[0];
+        assert_eq!(created.machine_name(), Some("build"));
+        assert_eq!(created.custom_name.as_deref(), Some("build"));
+        assert!(created.identity_cwd.is_dir());
+        let terminal_id = created.terminal_id(created.tabs[0].root_pane).unwrap();
+        assert_eq!(
+            app.state.terminals[terminal_id]
+                .launch_argv
+                .as_ref()
+                .unwrap(),
+            &["ssh".to_string(), "-t".to_string(), "-V".to_string()]
+        );
+        app.state.assert_invariants_for_test();
+
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[test]
+    fn workspace_create_rejects_machine_with_cwd() {
+        let mut app = parent_space_api_app(Vec::new());
+        let response = app.handle_workspace_create(
+            "machine".into(),
+            WorkspaceCreateParams {
+                cwd: Some("/tmp".into()),
+                machine: Some("build".into()),
+                focus: false,
+                label: None,
+                env: Default::default(),
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "workspace_create_invalid");
+    }
+
+    #[test]
+    fn machine_workspace_parent_space_action_is_rejected() {
+        let mut workspace = Workspace::test_new("build");
+        workspace.machine = Some("build".into());
+        let workspace_id = workspace.id.clone();
+        let mut app = parent_space_api_app(vec![workspace]);
+
+        let response = app.handle_api_request(Request {
+            id: "machine-parent".into(),
+            method: Method::WorkspaceBecomeParent(WorkspaceParentSpaceParams {
+                workspace_id: Some(workspace_id.clone()),
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "machine_workspace_parent_space");
+        assert_eq!(
+            error.error.message,
+            "machine workspaces cannot participate in parent spaces"
+        );
+        assert!(app.state.workspaces[0].parent_space().is_none());
+    }
+
+    #[test]
+    fn machine_workspace_close_removes_its_terminal_state() {
+        let mut workspace = Workspace::test_new("build");
+        workspace.machine = Some("build".into());
+        let workspace_id = workspace.id.clone();
+        let terminal_id = workspace
+            .terminal_id(workspace.tabs[0].root_pane)
+            .cloned()
+            .expect("machine root terminal");
+        let mut app = parent_space_api_app(vec![workspace]);
+        assert!(app.state.terminals.contains_key(&terminal_id));
+
+        let response =
+            app.handle_workspace_close("machine-close".into(), WorkspaceTarget { workspace_id });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert!(app.state.workspaces.is_empty());
+        assert!(!app.state.terminals.contains_key(&terminal_id));
+        assert!(app.state.session_dirty);
     }
 
     #[tokio::test]
@@ -582,6 +715,7 @@ mod tests {
             "req".into(),
             WorkspaceCreateParams {
                 cwd: None,
+                machine: None,
                 focus: false,
                 label: None,
                 env: Default::default(),

@@ -108,19 +108,27 @@ pub(crate) const GHOSTTY_COLOR_SCHEME_LIGHT_REPORT: &[u8] = b"\x1b[?997;2n";
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
-/// Returns whether `data` is exactly one complete bracketed-paste sequence.
+/// Returns the UTF-8 payload length when `data` is exactly one complete
+/// bracketed-paste sequence.
 ///
 /// Client transport uses this to distinguish recoverable oversized interactive
 /// pastes from generic oversized input, which remains a protocol violation.
-pub(crate) fn is_complete_text_bracketed_paste(data: &[u8]) -> bool {
+pub(crate) fn complete_text_bracketed_paste_len(data: &[u8]) -> Option<usize> {
     if !data.starts_with(BRACKETED_PASTE_START) {
-        return false;
+        return None;
     }
-    let Some(end) = find_subsequence(data, BRACKETED_PASTE_END) else {
-        return false;
-    };
-    end + BRACKETED_PASTE_END.len() == data.len()
-        && std::str::from_utf8(&data[BRACKETED_PASTE_START.len()..end]).is_ok()
+    let end = find_subsequence(data, BRACKETED_PASTE_END)?;
+    if end + BRACKETED_PASTE_END.len() != data.len()
+        || std::str::from_utf8(&data[BRACKETED_PASTE_START.len()..end]).is_err()
+    {
+        return None;
+    }
+    Some(end - BRACKETED_PASTE_START.len())
+}
+
+#[cfg(test)]
+pub(crate) fn is_complete_text_bracketed_paste(data: &[u8]) -> bool {
+    complete_text_bracketed_paste_len(data).is_some()
 }
 
 #[derive(Debug)]
@@ -205,6 +213,7 @@ impl RawInputFramer {
 pub(crate) struct RawInputByteFramer {
     buffer: Vec<u8>,
     discard_until: Option<ControlStringFamily>,
+    discard_oversized_bracketed_paste: bool,
     discarded_tail_bytes: usize,
     lone_escape_recently_flushed: bool,
     host_color_replies_awaited: u16,
@@ -288,6 +297,11 @@ impl RawInputByteFramer {
                 self.discard_until = None;
                 self.discarded_tail_bytes = 0;
             }
+            return chunks;
+        }
+
+        if self.discard_oversized_bracketed_paste {
+            tracing::trace!("waiting for oversized bracketed paste terminator");
             return chunks;
         }
 
@@ -442,6 +456,49 @@ impl RawInputByteFramer {
                 self.discard_until = None;
                 self.discarded_tail_bytes = 0;
                 continue;
+            }
+
+            if self.discard_oversized_bracketed_paste {
+                let Some(end) = find_subsequence(&self.buffer, BRACKETED_PASTE_END) else {
+                    retain_possible_terminator_prefix(&mut self.buffer, BRACKETED_PASTE_END);
+                    break;
+                };
+                self.buffer.drain(..end + BRACKETED_PASTE_END.len());
+                self.discard_oversized_bracketed_paste = false;
+                continue;
+            }
+
+            if self.buffer.starts_with(BRACKETED_PASTE_START) {
+                if let Some(end) = find_subsequence(&self.buffer, BRACKETED_PASTE_END) {
+                    let paste_len = end.saturating_sub(BRACKETED_PASTE_START.len());
+                    if paste_len > crate::protocol::MAX_INPUT_PAYLOAD {
+                        tracing::warn!(
+                            size = paste_len,
+                            max = crate::protocol::MAX_INPUT_PAYLOAD,
+                            "discarding oversized bracketed paste"
+                        );
+                        self.buffer.drain(..end + BRACKETED_PASTE_END.len());
+                        continue;
+                    }
+                } else if self
+                    .buffer
+                    .len()
+                    .saturating_sub(BRACKETED_PASTE_START.len())
+                    .saturating_sub(possible_terminator_prefix_len(
+                        &self.buffer,
+                        BRACKETED_PASTE_END,
+                    ))
+                    > crate::protocol::MAX_INPUT_PAYLOAD
+                {
+                    tracing::warn!(
+                        size_at_least = self.buffer.len() - BRACKETED_PASTE_START.len(),
+                        max = crate::protocol::MAX_INPUT_PAYLOAD,
+                        "discarding oversized bracketed paste until its terminator"
+                    );
+                    self.discard_oversized_bracketed_paste = true;
+                    retain_possible_terminator_prefix(&mut self.buffer, BRACKETED_PASTE_END);
+                    break;
+                }
             }
 
             if self.split_coalesced_escape && self.buffer.starts_with(b"\x1b\x1b") {
@@ -763,6 +820,22 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
     let text = std::str::from_utf8(&buffer[..consumed]).ok()?;
     let key = parse_terminal_key_sequence(text)?.as_text_commit();
     Some((RawInputEvent::Key(key), consumed))
+}
+
+fn retain_possible_terminator_prefix(buffer: &mut Vec<u8>, terminator: &[u8]) {
+    let keep = possible_terminator_prefix_len(buffer, terminator);
+    if keep == 0 {
+        buffer.clear();
+    } else {
+        buffer.drain(..buffer.len() - keep);
+    }
+}
+
+fn possible_terminator_prefix_len(buffer: &[u8], terminator: &[u8]) -> usize {
+    (1..terminator.len())
+        .rev()
+        .find(|&len| buffer.ends_with(&terminator[..len]))
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1972,6 +2045,64 @@ mod tests {
             panic!("expected paste");
         };
         assert_eq!(text, "hello\nworld");
+    }
+
+    #[test]
+    fn oversized_split_bracketed_paste_is_bounded_and_discarded_through_terminator() {
+        let mut framer = RawInputByteFramer::for_host_input();
+        let mut first = BRACKETED_PASTE_START.to_vec();
+        first.extend(std::iter::repeat_n(
+            b'x',
+            crate::protocol::MAX_INPUT_PAYLOAD,
+        ));
+        assert!(framer.push(&first).is_empty());
+        assert!(framer.push(b"y").is_empty());
+        assert!(framer.discard_oversized_bracketed_paste);
+        assert!(framer.buffer.len() < BRACKETED_PASTE_END.len());
+
+        let chunks = framer.push(b"\x1b[201~z");
+        assert_eq!(chunks, vec![b"z".to_vec()]);
+        assert!(!framer.discard_oversized_bracketed_paste);
+        assert!(framer.buffer.is_empty());
+    }
+
+    #[test]
+    fn oversized_complete_bracketed_paste_does_not_leak_payload_or_tail() {
+        let mut framer = RawInputByteFramer::for_host_input();
+        let mut input = BRACKETED_PASTE_START.to_vec();
+        input.extend(std::iter::repeat_n(
+            b'x',
+            crate::protocol::MAX_INPUT_PAYLOAD + 1,
+        ));
+        input.extend_from_slice(BRACKETED_PASTE_END);
+        input.push(b'z');
+
+        assert_eq!(framer.push(&input), vec![b"z".to_vec()]);
+        assert!(framer.buffer.is_empty());
+    }
+
+    #[test]
+    fn exact_max_bracketed_paste_accepts_split_terminator_prefix() {
+        let mut framer = RawInputByteFramer::for_host_input();
+        let mut input = BRACKETED_PASTE_START.to_vec();
+        input.extend(std::iter::repeat_n(
+            b'x',
+            crate::protocol::MAX_INPUT_PAYLOAD,
+        ));
+
+        assert!(framer.push(&input).is_empty());
+        assert!(framer.push(&BRACKETED_PASTE_END[..4]).is_empty());
+        assert!(!framer.discard_oversized_bracketed_paste);
+
+        let chunks = framer.push(&BRACKETED_PASTE_END[4..]);
+        assert_eq!(chunks.len(), 1);
+        assert!(is_complete_text_bracketed_paste(&chunks[0]));
+        assert_eq!(
+            chunks[0].len(),
+            BRACKETED_PASTE_START.len()
+                + crate::protocol::MAX_INPUT_PAYLOAD
+                + BRACKETED_PASTE_END.len()
+        );
     }
 
     #[test]
