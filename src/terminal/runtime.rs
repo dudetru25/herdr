@@ -205,6 +205,7 @@ impl TerminalRuntime {
         .map(Self)
     }
 
+    // Wrapper mirrors pane runtime restoration arguments, including captured history.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_argv_command_with_initial_history(
         pane_id: PaneId,

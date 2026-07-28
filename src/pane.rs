@@ -1709,6 +1709,7 @@ impl PaneRuntime {
         )
     }
 
+    // Runtime restoration threads the normal construction inputs together with captured history.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_argv_command_with_initial_history(
         pane_id: PaneId,

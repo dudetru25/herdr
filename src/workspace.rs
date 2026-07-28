@@ -392,6 +392,7 @@ impl Workspace {
         )
     }
 
+    // Machine-aware workspace construction keeps launch and rendering inputs explicit.
     #[allow(clippy::too_many_arguments)]
     pub fn new_machine_argv_command_with_extra_env(
         machine: String,
