@@ -1315,7 +1315,9 @@ fn shell_mode_uses_login_shell(
 ) -> bool {
     match mode {
         crate::config::ShellModeConfig::Auto => target == ShellLaunchTarget::Macos,
-        crate::config::ShellModeConfig::Login => true,
+        // Windows shells have no shared login-shell convention. Launch the
+        // configured shell directly instead of portable-pty's cmd.exe default.
+        crate::config::ShellModeConfig::Login => target != ShellLaunchTarget::Windows,
         crate::config::ShellModeConfig::NonLogin => false,
     }
 }
@@ -3054,6 +3056,10 @@ mod tests {
             ShellLaunchTarget::OtherUnix
         ));
         assert!(!shell_mode_uses_login_shell(
+            crate::config::ShellModeConfig::Login,
+            ShellLaunchTarget::Windows
+        ));
+        assert!(!shell_mode_uses_login_shell(
             crate::config::ShellModeConfig::NonLogin,
             ShellLaunchTarget::Macos
         ));
@@ -3166,6 +3172,26 @@ mod tests {
     }
 
     #[test]
+    fn windows_login_mode_preserves_configured_shell() {
+        let cmd = pane_shell_command_builder_for_target(
+            PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::Login),
+            ShellLaunchTarget::Windows,
+        )
+        .unwrap();
+
+        assert!(!cmd.is_default_prog());
+        assert_eq!(
+            cmd.get_argv(),
+            &[
+                std::ffi::OsString::from("pwsh.exe"),
+                std::ffi::OsString::from("-NoExit"),
+                std::ffi::OsString::from("-Command"),
+                std::ffi::OsString::from(WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND),
+            ]
+        );
+    }
+
+    #[test]
     fn unix_powershell_builder_launches_plain_shell() {
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("pwsh", crate::config::ShellModeConfig::NonLogin),
@@ -3177,7 +3203,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_powershell_pane_shell_predicate_requires_windows_and_non_login() {
+    fn windows_powershell_pane_shell_predicate_requires_windows_and_powershell() {
         let pwsh = PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::NonLogin);
         assert!(uses_windows_powershell_pane_shell_for_target(
             pwsh,
@@ -3191,7 +3217,7 @@ mod tests {
             pwsh,
             ShellLaunchTarget::Macos
         ));
-        assert!(!uses_windows_powershell_pane_shell_for_target(
+        assert!(uses_windows_powershell_pane_shell_for_target(
             PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::Login),
             ShellLaunchTarget::Windows
         ));

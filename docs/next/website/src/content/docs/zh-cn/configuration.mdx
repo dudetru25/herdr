@@ -68,7 +68,7 @@ default_shell = "nu"
 shell_mode = "auto"
 ```
 
-`shell_mode = "auto"` 会在 macOS 上启动登录 shell，让 `/usr/libexec/path_helper` 等仅登录时生效的 PATH 设置和 Homebrew shell 初始化在新窗格中运行。在其他平台上，它会保持现有的非登录 shell 行为。使用 `"login"` 强制以登录 shell 启动，或使用 `"non_login"` 禁用登录 shell。命令窗格、分离式自定义命令按键绑定和显式 argv 启动仍使用现有的命令执行路径。
+`shell_mode = "auto"` 会在 macOS 上启动登录 shell，让 `/usr/libexec/path_helper` 等仅登录时生效的 PATH 设置和 Homebrew shell 初始化在新窗格中运行。在其他平台上，它会保持现有的非登录 shell 行为。使用 `"login"` 可在 Unix 上强制启动登录 shell，使用 `"non_login"` 可禁用登录 shell。Windows shell 没有通用的可移植登录 shell 约定，因此在任一显式模式下都会正常启动已配置的 shell。命令窗格、分离式自定义命令按键绑定和显式 argv 启动仍使用现有的命令执行路径。
 
 设置新窗格、标签页和工作区的工作目录策略：
 

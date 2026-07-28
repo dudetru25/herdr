@@ -135,7 +135,7 @@ as JSON for clients and agents that want a simple bootstrap command.
 {"id":"req_machine_workspace","method":"workspace.create","params":{"machine":"build","focus":true}}
 ```
 
-`machine.add` trims the submitted fields. It rejects an empty name or target, a target beginning with `-`, a blank provided `cwd`, or a duplicate machine name. These failures return `invalid_machine` or `machine_already_exists`; config persistence and reload failures return `config_update_failed` or `config_reload_failed`. Every error leaves the live registry unchanged, and persistence failures do not replace the existing config. The method does not probe SSH connectivity and does not create a workspace; call `workspace.create` with the returned machine name when you want to open one.
+`machine.add` trims the submitted fields. It rejects an empty name or target, a target beginning with `-`, a blank provided `cwd`, or a duplicate machine name. These failures return `invalid_machine` or `machine_already_exists`; config persistence and reload failures return `config_update_failed` or `config_reload_failed`. Every error leaves the live registry unchanged, and persistence failures do not replace the existing config. If the new machine applies while an unrelated config section reports a diagnostic, the method returns success and leaves that diagnostic visible in Herdr. The method does not probe SSH connectivity and does not create a workspace; call `workspace.create` with the returned machine name when you want to open one.
 
 For `workspace.create`, `machine` and `cwd` are mutually exclusive. Workspace records persist and expose the optional machine registry name; the SSH target is resolved from live config on every future pane launch.
 

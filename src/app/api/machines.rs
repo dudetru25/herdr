@@ -131,19 +131,6 @@ fn encode_machine_add_after_reload(
             "saved machine but it did not appear in the live registry",
         );
     };
-    if report.status == crate::config::ConfigReloadStatus::Partial {
-        let details = report.diagnostics.join("; ");
-        return encode_error(
-            id,
-            "config_reload_partial",
-            if details.is_empty() {
-                "saved machine but config reload was partial".to_string()
-            } else {
-                format!("saved machine but config reload was partial: {details}")
-            },
-        );
-    }
-
     encode_success(
         id,
         ResponseResult::MachineAdded {
@@ -362,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_add_applies_valid_machine_when_an_unrelated_section_is_invalid() {
+    fn machine_add_succeeds_when_an_unrelated_section_is_invalid() {
         let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let path = temp_config_path("partial-reload");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -386,10 +373,12 @@ mod tests {
                 cwd: None,
             },
         );
-        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(error.error.code, "config_reload_partial");
-        assert!(error.error.message.contains("partial"));
-        assert!(error.error.message.contains("invalid ui config"));
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::MachineAdded { machine } = success.result else {
+            panic!("expected machine added");
+        };
+        assert_eq!(machine.name, "build");
+        assert_eq!(machine.target, "host");
         assert_eq!(app.state.machines[0].name, "build");
         assert!(app.state.config_diagnostic.is_some());
 
