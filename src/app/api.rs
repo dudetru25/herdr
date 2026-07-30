@@ -30,6 +30,78 @@ enum RuntimeExitAction {
 }
 
 impl App {
+    fn handle_worker_run_submit(
+        &mut self,
+        id: String,
+        params: crate::api::schema::WorkerRunSubmitParams,
+    ) -> String {
+        match crate::worker_runs::WorkerRunStore::persistent().submit(params) {
+            Ok((run, disposition)) => responses::encode_success(
+                id,
+                crate::api::schema::ResponseResult::WorkerRunSubmitted { run, disposition },
+            ),
+            Err(error) => responses::encode_error(id, error.code, error.message),
+        }
+    }
+
+    fn handle_worker_run_get(
+        &mut self,
+        id: String,
+        target: crate::api::schema::WorkerRunTarget,
+    ) -> String {
+        match crate::worker_runs::WorkerRunStore::persistent().get(&target.run_id) {
+            Ok(run) => {
+                responses::encode_success(id, crate::api::schema::ResponseResult::WorkerRun { run })
+            }
+            Err(error) => responses::encode_error(id, error.code, error.message),
+        }
+    }
+
+    fn handle_worker_run_cancel(
+        &mut self,
+        id: String,
+        params: crate::api::schema::WorkerRunCancelParams,
+    ) -> String {
+        match crate::worker_runs::WorkerRunStore::persistent()
+            .cancel(&params.run_id, params.reason.as_deref())
+        {
+            Ok((run, disposition)) => responses::encode_success(
+                id,
+                crate::api::schema::ResponseResult::WorkerRunCancelled { run, disposition },
+            ),
+            Err(error) => responses::encode_error(id, error.code, error.message),
+        }
+    }
+
+    fn handle_worker_run_timeout(
+        &mut self,
+        id: String,
+        params: crate::api::schema::WorkerRunTimeoutParams,
+    ) -> String {
+        match crate::worker_runs::WorkerRunStore::persistent()
+            .timeout(&params.run_id, &params.reason)
+        {
+            Ok(run) => {
+                responses::encode_success(id, crate::api::schema::ResponseResult::WorkerRun { run })
+            }
+            Err(error) => responses::encode_error(id, error.code, error.message),
+        }
+    }
+
+    fn handle_worker_run_result(
+        &mut self,
+        id: String,
+        target: crate::api::schema::WorkerRunResultTarget,
+    ) -> String {
+        match crate::worker_runs::WorkerRunStore::persistent().result(&target.result_ref) {
+            Ok(result) => responses::encode_success(
+                id,
+                crate::api::schema::ResponseResult::WorkerRunResult { result },
+            ),
+            Err(error) => responses::encode_error(id, error.code, error.message),
+        }
+    }
+
     pub(crate) fn dispatch_api_request(
         &mut self,
         id: &'static str,
@@ -1047,6 +1119,19 @@ impl App {
                     "invalid_request",
                     "agent.wait is handled by the api server",
                 );
+            }
+            Method::WorkerRunSubmit(params) => {
+                return self.handle_worker_run_submit(request.id, params)
+            }
+            Method::WorkerRunGet(target) => return self.handle_worker_run_get(request.id, target),
+            Method::WorkerRunCancel(params) => {
+                return self.handle_worker_run_cancel(request.id, params)
+            }
+            Method::WorkerRunTimeout(params) => {
+                return self.handle_worker_run_timeout(request.id, params)
+            }
+            Method::WorkerRunResult(target) => {
+                return self.handle_worker_run_result(request.id, target)
             }
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentExplain(target) => return self.handle_agent_explain(request.id, target),

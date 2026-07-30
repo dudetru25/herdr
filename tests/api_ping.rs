@@ -310,6 +310,191 @@ fn ping_over_socket_returns_version() {
 }
 
 #[test]
+fn worker_run_api_is_durable_idempotent_and_result_ref_addressable() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let submit_request = serde_json::json!({
+        "id": "worker_submit",
+        "method": "worker.run.submit",
+        "params": {
+            "attempt_id": "TASK-10.1:integration-1",
+            "request_hash": format!("sha256:{}", "a".repeat(64)),
+            "context_hash": format!("sha256:{}", "b".repeat(64)),
+            "execution": {
+                "kind": "deterministic",
+                "result": {
+                    "summary": "socket worker completed",
+                    "change": {
+                        "kind": "code",
+                        "changedFiles": ["src/lib.rs"]
+                    },
+                    "artifacts": [{
+                        "kind": "patch",
+                        "ref": "artifact://worker/change.patch",
+                        "hash": format!("sha256:{}", "c".repeat(64)),
+                        "mediaType": "text/x-diff"
+                    }]
+                }
+            }
+        }
+    });
+    let submitted = send_request(&socket_path, &submit_request.to_string());
+    assert_eq!(submitted["result"]["type"], "worker_run_submitted");
+    assert_eq!(submitted["result"]["disposition"], "created");
+    assert_eq!(submitted["result"]["run"]["state"], "succeeded");
+    let run_id = submitted["result"]["run"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let result_ref = submitted["result"]["run"]["result_ref"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut duplicate_request = submit_request.clone();
+    duplicate_request["id"] = "worker_duplicate".into();
+    let duplicate = send_request(&socket_path, &duplicate_request.to_string());
+    assert_eq!(duplicate["result"]["disposition"], "duplicate-equivalent");
+    assert_eq!(duplicate["result"]["run"]["run_id"], run_id);
+
+    let mut conflict_request = submit_request.clone();
+    conflict_request["id"] = "worker_conflict".into();
+    conflict_request["params"]["request_hash"] = format!("sha256:{}", "d".repeat(64)).into();
+    let conflict = send_request(&socket_path, &conflict_request.to_string());
+    assert_eq!(conflict["error"]["code"], "worker_run_attempt_conflict");
+
+    let fetched = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "worker_get",
+            "method": "worker.run.get",
+            "params": {"run_id": run_id}
+        })
+        .to_string(),
+    );
+    assert_eq!(fetched["result"]["run"]["run_id"], run_id);
+    assert_eq!(fetched["result"]["run"]["state"], "succeeded");
+
+    let result = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "worker_result",
+            "method": "worker.run.result",
+            "params": {"result_ref": result_ref}
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        result["result"]["result"]["schema"],
+        "skills-herdr-worker-result/v1"
+    );
+    assert_eq!(result["result"]["result"]["runRef"], run_id);
+    assert_eq!(result["result"]["result"]["artifacts"][0]["kind"], "patch");
+
+    let unknown = send_request(
+        &socket_path,
+        r#"{"id":"worker_unknown","method":"worker.run.result","params":{"result_ref":"worker-run://worker-run:00000000000000000000000000000000/result"}}"#,
+    );
+    assert_eq!(unknown["error"]["code"], "worker_run_not_found");
+
+    let deferred = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "worker_deferred",
+            "method": "worker.run.submit",
+            "params": {
+                "attempt_id": "TASK-10.1:integration-cancel",
+                "request_hash": format!("sha256:{}", "e".repeat(64)),
+                "context_hash": format!("sha256:{}", "f".repeat(64)),
+                "execution": {"kind": "deterministic"}
+            }
+        })
+        .to_string(),
+    );
+    let deferred_run_id = deferred["result"]["run"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resumed = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "worker_resume",
+            "method": "worker.run.get",
+            "params": {"run_id": deferred_run_id}
+        })
+        .to_string(),
+    );
+    assert_eq!(resumed["result"]["run"]["run_id"], deferred_run_id);
+    assert_eq!(resumed["result"]["run"]["state"], "running");
+
+    let cancelled = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "worker_cancel",
+            "method": "worker.run.cancel",
+            "params": {
+                "run_id": deferred_run_id,
+                "reason": "integration cancellation"
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(cancelled["result"]["disposition"], "requested");
+    assert_eq!(cancelled["result"]["run"]["state"], "cancelled");
+    let cancelled_again = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "worker_cancel_again",
+            "method": "worker.run.cancel",
+            "params": {"run_id": deferred_run_id}
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        cancelled_again["result"]["disposition"],
+        "already-requested"
+    );
+
+    let timeout = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "worker_timeout_submit",
+            "method": "worker.run.submit",
+            "params": {
+                "attempt_id": "TASK-10.1:integration-timeout",
+                "request_hash": format!("sha256:{}", "1".repeat(64)),
+                "context_hash": format!("sha256:{}", "2".repeat(64)),
+                "execution": {"kind": "deterministic"}
+            }
+        })
+        .to_string(),
+    );
+    let timeout_run_id = timeout["result"]["run"]["run_id"].as_str().unwrap();
+    let timed_out = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "worker_timeout",
+            "method": "worker.run.timeout",
+            "params": {
+                "run_id": timeout_run_id,
+                "reason": "approved deadline elapsed"
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(timed_out["result"]["run"]["state"], "timed-out");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
 fn server_reload_agent_manifests_reports_runtime_override() {
     let _lock = test_lock();
     let base = unique_test_dir();

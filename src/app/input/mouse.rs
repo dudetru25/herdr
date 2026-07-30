@@ -2733,7 +2733,9 @@ mod tests {
     #[test]
     fn workspace_right_click_shows_parent_space_actions_only_for_valid_roles() {
         let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![Workspace::test_new("workspace")];
+        let mut workspace = Workspace::test_new("workspace");
+        workspace.identity_cwd = std::env::temp_dir();
+        app.state.workspaces = vec![workspace];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;

@@ -1326,3 +1326,56 @@ fn popup_close_request_round_trips() {
     assert_eq!(json["method"], "popup.close");
     assert_eq!(json["params"], serde_json::json!({}));
 }
+
+#[test]
+fn worker_run_requests_round_trip_with_hash_bound_deterministic_execution() {
+    let request = Request {
+        id: "worker-submit".into(),
+        method: Method::WorkerRunSubmit(WorkerRunSubmitParams {
+            attempt_id: "TASK-4.2:attempt-1".into(),
+            request_hash:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .into(),
+            context_hash:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .into(),
+            deadline_unix_ms: Some(1_900_000_000_000),
+            execution: WorkerRunExecution::Deterministic {
+                result: Some(WorkerRunResultTemplate {
+                    summary: "deterministic worker completed".into(),
+                    change: WorkerRunChange {
+                        kind: WorkerRunChangeKind::None,
+                        changed_files: Vec::new(),
+                    },
+                    artifacts: vec![WorkerRunArtifact {
+                        kind: WorkerRunArtifactKind::ValidationReport,
+                        reference: "artifact://deterministic/result.json".into(),
+                        hash:
+                            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                                .into(),
+                        media_type: "application/json".into(),
+                    }],
+                }),
+            },
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "worker.run.submit");
+    assert_eq!(json["params"]["attempt_id"], "TASK-4.2:attempt-1");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+
+    let result = Request {
+        id: "worker-result".into(),
+        method: Method::WorkerRunResult(WorkerRunResultTarget {
+            result_ref: "worker-run://worker-run:0123456789abcdef0123456789abcdef/result".into(),
+        }),
+    };
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["method"], "worker.run.result");
+    assert_eq!(
+        json["params"]["result_ref"],
+        "worker-run://worker-run:0123456789abcdef0123456789abcdef/result"
+    );
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), result);
+}
