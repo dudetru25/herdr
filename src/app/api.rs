@@ -35,12 +35,122 @@ impl App {
         id: String,
         params: crate::api::schema::WorkerRunSubmitParams,
     ) -> String {
-        match crate::worker_runs::WorkerRunStore::persistent().submit(params) {
+        match crate::worker_runs::WorkerRunStore::persistent()
+            .submit_with_initializer(params, |launch| self.initialize_worker_launch(launch))
+        {
             Ok((run, disposition)) => responses::encode_success(
                 id,
                 crate::api::schema::ResponseResult::WorkerRunSubmitted { run, disposition },
             ),
             Err(error) => responses::encode_error(id, error.code, error.message),
+        }
+    }
+
+    fn initialize_worker_launch(
+        &mut self,
+        launch: &crate::worker_adapters::WorkerLaunchSpec,
+    ) -> Result<String, crate::worker_runs::WorkerRunError> {
+        let prerequisite = crate::worker_adapters::smoke_prerequisite(
+            launch.metadata.harness,
+            crate::worker_placements::WorkerPlacementKind::LocalPane,
+        );
+        if !prerequisite.is_available() {
+            return Err(crate::worker_runs::WorkerRunError::new(
+                "worker_harness_unavailable",
+                prerequisite
+                    .reason
+                    .unwrap_or_else(|| "selected worker harness is unavailable".into()),
+            ));
+        }
+        let workspace_id = launch
+            .metadata
+            .placement
+            .strip_prefix("local-pane:")
+            .ok_or_else(|| {
+                crate::worker_runs::WorkerRunError::new(
+                    "worker_placement_blocked",
+                    "resolved placement does not identify a local workspace",
+                )
+            })?;
+        let ws_idx = self.parse_workspace_id(workspace_id).ok_or_else(|| {
+            crate::worker_runs::WorkerRunError::new(
+                "worker_placement_unavailable",
+                format!("local workspace {workspace_id:?} is unavailable"),
+            )
+        })?;
+        if self.state.workspaces[ws_idx].is_machine() {
+            return Err(crate::worker_runs::WorkerRunError::new(
+                "worker_placement_unavailable",
+                "remote machine workspaces are unavailable for worker placement",
+            ));
+        }
+
+        let (rows, cols) = self.state.estimate_pane_size();
+        let result = self.state.workspaces[ws_idx].create_tab_isolated_argv_command(
+            rows.max(4),
+            cols.max(10),
+            launch.cwd.clone(),
+            &launch.argv,
+            launch.environment.clone(),
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+        );
+        let (tab_idx, terminal, runtime) = result.map_err(|error| {
+            crate::worker_runs::WorkerRunError::new(
+                "worker_harness_unavailable",
+                format!(
+                    "{} worker failed to initialize in the approved local pane: {error}",
+                    match launch.metadata.harness {
+                        crate::api::schema::WorkerHarness::Codex => "codex",
+                        crate::api::schema::WorkerHarness::Claude => "claude",
+                    }
+                ),
+            )
+        })?;
+        let terminal_id = terminal.id.clone();
+        self.terminal_runtimes.insert(terminal.id.clone(), runtime);
+        self.state.terminals.insert(terminal.id.clone(), terminal);
+        let pane_id = self.state.workspaces[ws_idx].tabs[tab_idx].root_pane;
+        self.supervised_worker_runs
+            .insert(pane_id, (terminal_id, launch.run_id.clone()));
+        self.state.remove_alias_shadowed_by_new_pane(pane_id);
+        let public_pane_id = self.public_pane_id(ws_idx, pane_id).ok_or_else(|| {
+            crate::worker_runs::WorkerRunError::new(
+                "worker_placement_blocked",
+                "initialized worker pane has no public identity",
+            )
+        })?;
+        Ok(format!("local-pane:{public_pane_id}"))
+    }
+
+    /// Supervise one approved worker pane: its observed termination drives the
+    /// run to an explicit terminal state. A pane that died without an observed
+    /// exit status is reported as an unsuccessful termination, never ignored.
+    fn complete_supervised_worker_run(&mut self, pane_id: crate::layout::PaneId) {
+        let Some((terminal_id, run_id)) = self.supervised_worker_runs.remove(&pane_id) else {
+            return;
+        };
+        let termination = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .and_then(|runtime| runtime.exit_observation())
+            .map(|observation| crate::worker_runs::WorkerHarnessTermination {
+                success: observation.success,
+                status: observation.status,
+            })
+            .unwrap_or_else(|| crate::worker_runs::WorkerHarnessTermination {
+                success: false,
+                status: "the approved worker pane died without an observed exit status".into(),
+            });
+        if let Err(error) =
+            crate::worker_runs::WorkerRunStore::persistent().complete_harness(&run_id, &termination)
+        {
+            tracing::error!(
+                run = %run_id,
+                code = error.code,
+                err = %error.message,
+                "failed to record the supervised worker run terminal state"
+            );
         }
     }
 
@@ -244,6 +354,10 @@ impl App {
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
             self.handle_worktree_remove_finished(*result);
             return;
+        }
+
+        if let AppEvent::PaneDied { pane_id } = &ev {
+            self.complete_supervised_worker_run(*pane_id);
         }
 
         if let AppEvent::PaneDied { pane_id } = &ev {

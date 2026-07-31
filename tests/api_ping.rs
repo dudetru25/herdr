@@ -284,6 +284,91 @@ fn event_by_kind<'a>(events: &'a [serde_json::Value], kind: &str) -> &'a serde_j
         .unwrap_or_else(|| panic!("missing event {kind}"))
 }
 
+fn worker_request(instruction: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "skills-herdr-worker-request/v1",
+        "role": "implementation-worker",
+        "capabilities": ["read-repository", "edit-repository"],
+        "context": {
+            "schema": "skills-herdr-worker-context/v1",
+            "instruction": instruction,
+            "repository_ref": "github.com/example/project",
+            "revision": format!("sha256:{}", "a".repeat(64)),
+            "inputs": [{
+                "ref": "skills-attempt://TASK-10.2/input",
+                "hash": format!("sha256:{}", "b".repeat(64))
+            }]
+        },
+        "lifecycle": {},
+        "result_contract": {
+            "schema": "skills-herdr-worker-result/v1",
+            "require_patch_for_code_changes": true
+        }
+    })
+}
+
+fn canonical_json_bytes(value: &serde_json::Value, output: &mut Vec<u8>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            output.push(b'{');
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key).unwrap();
+                output.push(b':');
+                canonical_json_bytes(&object[key], output);
+            }
+            output.push(b'}');
+        }
+        serde_json::Value::Array(items) => {
+            output.push(b'[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                canonical_json_bytes(item, output);
+            }
+            output.push(b']');
+        }
+        _ => serde_json::to_writer(output, value).unwrap(),
+    }
+}
+
+fn worker_json_hash(value: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut bytes = Vec::new();
+    canonical_json_bytes(value, &mut bytes);
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+/// Artifact tree the server resolves patch bytes from for one worker attempt.
+fn worker_artifact_root(config_home: &Path, attempt_id: &str) -> PathBuf {
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    config_home
+        .join(app_dir)
+        .join("worker-run-artifacts")
+        .join(attempt_id)
+}
+
+fn bind_worker_hashes(params: &mut serde_json::Value) {
+    params["context_hash"] = worker_json_hash(&params["request"]["context"]).into();
+    params["request_hash"] = worker_json_hash(&params["request"]).into();
+}
+
 #[test]
 fn ping_over_socket_returns_version() {
     let _lock = test_lock();
@@ -320,30 +405,38 @@ fn worker_run_api_is_durable_idempotent_and_result_ref_addressable() {
     let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
+    // The recorded patch hash must cover real published bytes, not a constant.
+    let attempt_id = "TASK-10.1:integration-1";
+    let patch: &[u8] = b"diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
+    let artifact_root = worker_artifact_root(&config_home, attempt_id);
+    fs::create_dir_all(&artifact_root).unwrap();
+    fs::write(artifact_root.join("change.patch"), patch).unwrap();
+
+    let mut submit_params = serde_json::json!({
+        "attempt_id": attempt_id,
+        "request": worker_request("complete the socket fixture"),
+        "execution": {
+            "kind": "deterministic",
+            "result": {
+                "summary": "socket worker completed",
+                "change": {
+                    "kind": "code",
+                    "changedFiles": ["src/lib.rs"]
+                },
+                "artifacts": [{
+                    "kind": "patch",
+                    "ref": "change.patch",
+                    "hash": sha256_hash(patch),
+                    "mediaType": "text/x-diff"
+                }]
+            }
+        }
+    });
+    bind_worker_hashes(&mut submit_params);
     let submit_request = serde_json::json!({
         "id": "worker_submit",
         "method": "worker.run.submit",
-        "params": {
-            "attempt_id": "TASK-10.1:integration-1",
-            "request_hash": format!("sha256:{}", "a".repeat(64)),
-            "context_hash": format!("sha256:{}", "b".repeat(64)),
-            "execution": {
-                "kind": "deterministic",
-                "result": {
-                    "summary": "socket worker completed",
-                    "change": {
-                        "kind": "code",
-                        "changedFiles": ["src/lib.rs"]
-                    },
-                    "artifacts": [{
-                        "kind": "patch",
-                        "ref": "artifact://worker/change.patch",
-                        "hash": format!("sha256:{}", "c".repeat(64)),
-                        "mediaType": "text/x-diff"
-                    }]
-                }
-            }
-        }
+        "params": submit_params
     });
     let submitted = send_request(&socket_path, &submit_request.to_string());
     assert_eq!(submitted["result"]["type"], "worker_run_submitted");
@@ -366,7 +459,11 @@ fn worker_run_api_is_durable_idempotent_and_result_ref_addressable() {
 
     let mut conflict_request = submit_request.clone();
     conflict_request["id"] = "worker_conflict".into();
-    conflict_request["params"]["request_hash"] = format!("sha256:{}", "d".repeat(64)).into();
+    conflict_request["params"]["request"]["context"]["instruction"] =
+        "conflicting immutable request".into();
+    let mut conflict_params = conflict_request["params"].clone();
+    bind_worker_hashes(&mut conflict_params);
+    conflict_request["params"] = conflict_params;
     let conflict = send_request(&socket_path, &conflict_request.to_string());
     assert_eq!(conflict["error"]["code"], "worker_run_attempt_conflict");
 
@@ -404,17 +501,18 @@ fn worker_run_api_is_durable_idempotent_and_result_ref_addressable() {
     );
     assert_eq!(unknown["error"]["code"], "worker_run_not_found");
 
+    let mut deferred_params = serde_json::json!({
+        "attempt_id": "TASK-10.1:integration-cancel",
+        "request": worker_request("wait for explicit cancellation"),
+        "execution": {"kind": "deterministic"}
+    });
+    bind_worker_hashes(&mut deferred_params);
     let deferred = send_request(
         &socket_path,
         &serde_json::json!({
             "id": "worker_deferred",
             "method": "worker.run.submit",
-            "params": {
-                "attempt_id": "TASK-10.1:integration-cancel",
-                "request_hash": format!("sha256:{}", "e".repeat(64)),
-                "context_hash": format!("sha256:{}", "f".repeat(64)),
-                "execution": {"kind": "deterministic"}
-            }
+            "params": deferred_params
         })
         .to_string(),
     );
@@ -462,17 +560,18 @@ fn worker_run_api_is_durable_idempotent_and_result_ref_addressable() {
         "already-requested"
     );
 
+    let mut timeout_params = serde_json::json!({
+        "attempt_id": "TASK-10.1:integration-timeout",
+        "request": worker_request("wait for explicit timeout"),
+        "execution": {"kind": "deterministic"}
+    });
+    bind_worker_hashes(&mut timeout_params);
     let timeout = send_request(
         &socket_path,
         &serde_json::json!({
             "id": "worker_timeout_submit",
             "method": "worker.run.submit",
-            "params": {
-                "attempt_id": "TASK-10.1:integration-timeout",
-                "request_hash": format!("sha256:{}", "1".repeat(64)),
-                "context_hash": format!("sha256:{}", "2".repeat(64)),
-                "execution": {"kind": "deterministic"}
-            }
+            "params": timeout_params
         })
         .to_string(),
     );
@@ -490,6 +589,125 @@ fn worker_run_api_is_durable_idempotent_and_result_ref_addressable() {
         .to_string(),
     );
     assert_eq!(timed_out["result"]["run"]["state"], "timed-out");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
+fn worker_run_placement_api_fails_closed_without_launch_or_fallback() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let before = send_request(
+        &socket_path,
+        r#"{"id":"placement_before","method":"workspace.list","params":{}}"#,
+    );
+    let workspace_count = before["result"]["workspaces"].as_array().unwrap().len();
+    let candidate = serde_json::json!({
+        "target_tag": "herdr-target:local-macos-primary",
+        "kind": "local_pane",
+        "workspace_id": "workspace:1",
+        "cwd": base.to_string_lossy(),
+        "availability": {"status": "available"}
+    });
+
+    let mut unknown_params = serde_json::json!({
+        "attempt_id": "TASK-10.2:unknown-placement",
+        "request": worker_request("unknown placement must fail closed"),
+        "execution": {
+            "kind": "harness",
+            "harness": "codex",
+            "profile": "profile-under-test",
+            "model": "opaque-model-under-test",
+            "target_tag": "herdr-target:unknown",
+            "placement": "local_pane",
+            "candidates": [candidate.clone()]
+        }
+    });
+    bind_worker_hashes(&mut unknown_params);
+    let unknown = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "placement_unknown",
+            "method": "worker.run.submit",
+            "params": unknown_params
+        })
+        .to_string(),
+    );
+    assert_eq!(unknown["error"]["code"], "worker_placement_unknown");
+
+    let mut ambiguous_params = serde_json::json!({
+        "attempt_id": "TASK-10.2:ambiguous-placement",
+        "request": worker_request("ambiguous placement must fail closed"),
+        "execution": {
+            "kind": "harness",
+            "harness": "claude",
+            "profile": "profile-under-test",
+            "model": "opaque-model-under-test",
+            "target_tag": "herdr-target:local-macos-primary",
+            "placement": "local_pane",
+            "candidates": [candidate.clone(), candidate.clone()]
+        }
+    });
+    bind_worker_hashes(&mut ambiguous_params);
+    let ambiguous = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "placement_ambiguous",
+            "method": "worker.run.submit",
+            "params": ambiguous_params
+        })
+        .to_string(),
+    );
+    assert_eq!(ambiguous["error"]["code"], "worker_placement_ambiguous");
+
+    for (attempt, placement) in [
+        ("TASK-10.2:remote-unavailable", "remote_temporary"),
+        ("TASK-10.2:subspace-unavailable", "temporary_subspace"),
+    ] {
+        let mut unavailable_params = serde_json::json!({
+            "attempt_id": attempt,
+            "request": worker_request("remote placement must not use the local candidate"),
+            "execution": {
+                "kind": "harness",
+                "harness": "codex",
+                "profile": "profile-under-test",
+                "model": "opaque-model-under-test",
+                "target_tag": "herdr-target:local-macos-primary",
+                "placement": placement,
+                "candidates": [candidate.clone()]
+            }
+        });
+        bind_worker_hashes(&mut unavailable_params);
+        let unavailable = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": format!("placement_{placement}"),
+                "method": "worker.run.submit",
+                "params": unavailable_params
+            })
+            .to_string(),
+        );
+        assert_eq!(unavailable["error"]["code"], "worker_placement_unavailable");
+        assert!(unavailable["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no remote target is approved"));
+    }
+
+    let after = send_request(
+        &socket_path,
+        r#"{"id":"placement_after","method":"workspace.list","params":{}}"#,
+    );
+    assert_eq!(
+        after["result"]["workspaces"].as_array().unwrap().len(),
+        workspace_count
+    );
 
     cleanup_spawned_herdr(child, base);
 }
@@ -2716,6 +2934,171 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     assert_eq!(expiry_event["data"]["agent_status"], "working");
     assert_eq!(expiry_event["data"]["agent"], "pi");
     assert!(expiry_event["data"]["title"].is_null());
+
+    cleanup_spawned_herdr(child, base);
+}
+
+/// Real local smoke evidence for one approved harness, driven through the real
+/// product path: `worker.run.submit` initializes a real Codex or Claude worker
+/// in the approved local pane, and Herdr supervises it to an explicit terminal
+/// state. Ignored by default because it launches a real worker.
+///
+/// ```text
+/// HERDR_SMOKE_HARNESS=claude HERDR_SMOKE_MODEL=... HERDR_SMOKE_PROFILE=... \
+///   cargo nextest run --locked --run-ignored only -E 'test(real_local_worker_run_is_launched_and_supervised)'
+/// ```
+#[test]
+#[ignore = "launches a real local worker; run explicitly to capture smoke evidence"]
+fn real_local_worker_run_is_launched_and_supervised() {
+    fn required(variable: &str) -> String {
+        std::env::var(variable)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| panic!("{variable} must name the real local worker input"))
+    }
+
+    let _lock = test_lock();
+    let harness = required("HERDR_SMOKE_HARNESS");
+    assert!(
+        harness == "codex" || harness == "claude",
+        "HERDR_SMOKE_HARNESS must be codex or claude, not {harness:?}"
+    );
+    let model = required("HERDR_SMOKE_MODEL");
+    let profile = required("HERDR_SMOKE_PROFILE");
+
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    // The approved harnesses refuse to run outside a repository checkout, so the
+    // placement working directory is a real scratch repository.
+    let repository = base.join("worker-checkout");
+    fs::create_dir_all(&repository).unwrap();
+    let init = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repository)
+        .status()
+        .unwrap();
+    assert!(
+        init.success(),
+        "scratch worker checkout must be a repository"
+    );
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"smoke_workspace","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            repository.display()
+        ),
+    );
+    assert_eq!(created["result"]["type"], "workspace_created");
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let attempt_id = format!("TASK-10.2:real-local-{harness}");
+    let mut submit_params = serde_json::json!({
+        "attempt_id": attempt_id,
+        "request": worker_request("Reply with the single word ok. Change nothing and run no tools."),
+        "execution": {
+            "kind": "harness",
+            "harness": harness,
+            "profile": profile,
+            "model": model,
+            "target_tag": "herdr-target:local-macos-primary",
+            "placement": "local_pane",
+            "candidates": [{
+                "target_tag": "herdr-target:local-macos-primary",
+                "kind": "local_pane",
+                "workspace_id": workspace_id,
+                "cwd": repository.to_string_lossy(),
+                "availability": {"status": "available"}
+            }]
+        }
+    });
+    bind_worker_hashes(&mut submit_params);
+    let submitted = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "smoke_submit",
+            "method": "worker.run.submit",
+            "params": submit_params
+        })
+        .to_string(),
+    );
+    println!("submitted: {}", serde_json::to_string(&submitted).unwrap());
+    assert_eq!(submitted["result"]["type"], "worker_run_submitted");
+    let run = &submitted["result"]["run"];
+    assert_eq!(run["state"], "running");
+    assert_eq!(run["metadata"]["harness"], harness);
+    assert_eq!(run["metadata"]["model"], model);
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+    let pane_id = run["metadata"]["placement"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("local-pane:")
+        .unwrap()
+        .to_string();
+
+    // Herdr must supervise the launched worker to an explicit terminal state.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut terminal = serde_json::Value::Null;
+    let mut pane_text = String::new();
+    while Instant::now() < deadline {
+        let pane = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "smoke_pane_read",
+                "method": "pane.read",
+                "params": {"pane_id": pane_id, "source": "recent", "lines": 200, "strip_ansi": true}
+            })
+            .to_string(),
+        );
+        if let Some(text) = pane["result"]["read"]["text"].as_str() {
+            pane_text = text.to_string();
+        }
+        let observed = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "smoke_get",
+                "method": "worker.run.get",
+                "params": {"run_id": run_id}
+            })
+            .to_string(),
+        );
+        let state = observed["result"]["run"]["state"].as_str().unwrap_or("");
+        if state != "submitted" && state != "running" {
+            terminal = observed["result"]["run"].clone();
+            break;
+        }
+        assert!(
+            pane["error"].is_null(),
+            "reading the approved worker pane failed: {pane}"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "harness": harness,
+            "model": model,
+            "profile": profile,
+            "workspaceId": workspace_id,
+            "cwd": repository.to_string_lossy(),
+            "terminalRun": terminal,
+            "paneOutput": pane_text,
+        })
+    );
+    assert!(
+        !terminal.is_null(),
+        "the approved local worker run never reached a terminal state"
+    );
 
     cleanup_spawned_herdr(child, base);
 }

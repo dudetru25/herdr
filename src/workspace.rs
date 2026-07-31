@@ -572,6 +572,7 @@ impl Workspace {
             shell_config,
             None,
             extra_env,
+            false,
         )
     }
 
@@ -594,6 +595,30 @@ impl Workspace {
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             Some(argv),
             extra_env,
+            false,
+        )
+    }
+
+    pub fn create_tab_isolated_argv_command(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        cwd: PathBuf,
+        argv: &[String],
+        extra_env: Vec<(String, String)>,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+    ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
+        self.create_tab_with_runtime(
+            rows,
+            cols,
+            cwd,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
+            Some(argv),
+            extra_env,
+            true,
         )
     }
 
@@ -607,11 +632,16 @@ impl Workspace {
         shell_config: crate::pane::PaneShellConfig<'_>,
         argv: Option<&[String]>,
         extra_env: Vec<(String, String)>,
+        isolated_environment: bool,
     ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
         let number = self.next_public_tab_number;
         self.next_public_tab_number += 1;
         let pane_number = self.next_public_pane_number;
-        let launch_env = self.launch_env_for_new_pane(number, pane_number, extra_env);
+        let launch_env = if isolated_environment {
+            PaneLaunchEnv::isolated(extra_env)
+        } else {
+            self.launch_env_for_new_pane(number, pane_number, extra_env)
+        };
         let events = self
             .active_tab()
             .map(|tab| tab.events.clone())

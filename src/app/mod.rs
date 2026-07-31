@@ -101,6 +101,11 @@ impl PaneClickState {
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
+    /// Panes hosting an approved worker run. Herdr supervises each launched
+    /// harness so its termination drives one explicit terminal run state
+    /// instead of leaving the run Running forever.
+    pub(crate) supervised_worker_runs:
+        HashMap<crate::layout::PaneId, (crate::terminal::TerminalId, String)>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -749,6 +754,7 @@ impl App {
             last_api_notification_at: None,
             state,
             terminal_runtimes: restored_terminal_runtimes,
+            supervised_worker_runs: HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,

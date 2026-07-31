@@ -1329,17 +1329,44 @@ fn popup_close_request_round_trips() {
 
 #[test]
 fn worker_run_requests_round_trip_with_hash_bound_deterministic_execution() {
+    use sha2::{Digest, Sha256};
+
+    fn hash_json(value: &impl serde::Serialize) -> String {
+        let bytes = serde_json::to_vec(value).unwrap();
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    let worker_request = WorkerRunRequest {
+        schema: "skills-herdr-worker-request/v1".into(),
+        role: "implementation-worker".into(),
+        capabilities: vec!["read-repository".into()],
+        context: WorkerRunContext {
+            schema: "skills-herdr-worker-context/v1".into(),
+            instruction: "return the bounded fixture result".into(),
+            repository_ref: "github.com/example/project".into(),
+            revision: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .into(),
+            inputs: vec![WorkerRunContextInput {
+                reference: "skills-attempt://TASK-10.2/input".into(),
+                hash: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    .into(),
+            }],
+        },
+        lifecycle: WorkerRunLifecycle {
+            deadline_unix_ms: Some(1_900_000_000_000),
+        },
+        result_contract: WorkerRunResultContract {
+            schema: "skills-herdr-worker-result/v1".into(),
+            require_patch_for_code_changes: true,
+        },
+    };
     let request = Request {
         id: "worker-submit".into(),
         method: Method::WorkerRunSubmit(WorkerRunSubmitParams {
             attempt_id: "TASK-4.2:attempt-1".into(),
-            request_hash:
-                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    .into(),
-            context_hash:
-                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                    .into(),
-            deadline_unix_ms: Some(1_900_000_000_000),
+            request_hash: hash_json(&worker_request),
+            context_hash: hash_json(&worker_request.context),
+            request: worker_request,
             execution: WorkerRunExecution::Deterministic {
                 result: Some(WorkerRunResultTemplate {
                     summary: "deterministic worker completed".into(),
@@ -1355,6 +1382,7 @@ fn worker_run_requests_round_trip_with_hash_bound_deterministic_execution() {
                                 .into(),
                         media_type: "application/json".into(),
                     }],
+                    provenance: None,
                 }),
             },
         }),
@@ -1363,6 +1391,13 @@ fn worker_run_requests_round_trip_with_hash_bound_deterministic_execution() {
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["method"], "worker.run.submit");
     assert_eq!(json["params"]["attempt_id"], "TASK-4.2:attempt-1");
+    assert!(json["params"]["request"].get("model").is_none());
+    assert!(json["params"]["request"]["context"]
+        .get("chat_history")
+        .is_none());
+    assert!(json["params"]["request"]["context"]
+        .get("credentials")
+        .is_none());
     assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
 
     let result = Request {
@@ -1378,4 +1413,28 @@ fn worker_run_requests_round_trip_with_hash_bound_deterministic_execution() {
         "worker-run://worker-run:0123456789abcdef0123456789abcdef/result"
     );
     assert_eq!(serde_json::from_value::<Request>(json).unwrap(), result);
+}
+
+#[test]
+fn worker_context_rejects_history_credentials_and_unrelated_fields() {
+    for forbidden in [
+        "chat_history",
+        "messages",
+        "credentials",
+        "secrets",
+        "environment",
+    ] {
+        let mut context = serde_json::json!({
+            "schema": "skills-herdr-worker-context/v1",
+            "instruction": "bounded fixture",
+            "repository_ref": "github.com/example/project",
+            "revision": format!("sha256:{}", "a".repeat(64)),
+            "inputs": []
+        });
+        context[forbidden] = serde_json::json!(["must fail closed"]);
+        assert!(
+            serde_json::from_value::<WorkerRunContext>(context).is_err(),
+            "{forbidden} must not enter immutable worker context"
+        );
+    }
 }

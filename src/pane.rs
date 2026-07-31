@@ -66,6 +66,7 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
     identity: PaneLaunchIdentity,
+    isolated: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,6 +86,15 @@ impl PaneLaunchEnv {
         Self {
             extra,
             identity: PaneLaunchIdentity::Inherit,
+            isolated: false,
+        }
+    }
+
+    pub(crate) fn isolated(extra: Vec<(String, String)>) -> Self {
+        Self {
+            extra,
+            identity: PaneLaunchIdentity::Inherit,
+            isolated: true,
         }
     }
 
@@ -112,6 +122,9 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     for (key, value) in &launch_env.extra {
         cmd.env(key, value);
     }
+    if launch_env.isolated {
+        return;
+    }
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
     match &launch_env.identity {
@@ -129,6 +142,14 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
             cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
         }
     }
+}
+
+fn apply_argv_launch_environment(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
+    if launch_env.isolated {
+        cmd.env_clear();
+    }
+    apply_pane_terminal_env(cmd);
+    apply_pane_launch_env(cmd, launch_env);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -960,6 +981,14 @@ impl AgentDetectionPresence {
 // ---------------------------------------------------------------------------
 
 /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
+/// Exactly how a pane's child process terminated, captured by the child
+/// watcher so supervisors can reach an explicit terminal decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneExitObservation {
+    pub success: bool,
+    pub status: String,
+}
+
 /// Dropping this shuts down all background tasks and closes the PTY.
 pub struct PaneRuntime {
     pane_id: PaneId,
@@ -969,6 +998,7 @@ pub struct PaneRuntime {
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     child_wait_completed: Option<Arc<AtomicBool>>,
+    exit_observation: Arc<Mutex<Option<PaneExitObservation>>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
@@ -1739,8 +1769,7 @@ impl PaneRuntime {
             cmd.arg(arg);
         }
         cmd.cwd(cwd);
-        apply_pane_terminal_env(&mut cmd);
-        apply_pane_launch_env(&mut cmd, launch_env);
+        apply_argv_launch_environment(&mut cmd, launch_env);
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -1897,6 +1926,7 @@ impl PaneRuntime {
             child_pid,
             reported_cwd,
             child_wait_completed: None,
+            exit_observation: Arc::new(Mutex::new(None)),
             kitty_keyboard_flags,
             detection_content_seq,
             full_lifecycle_authority_active,
@@ -1953,9 +1983,11 @@ impl PaneRuntime {
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let exit_observation = Arc::new(Mutex::new(None));
         {
             let child_pid = child_pid.clone();
             let child_wait_completed = child_wait_completed.clone();
+            let exit_observation = exit_observation.clone();
             let events = events.clone();
             let rt = tokio::runtime::Handle::current();
             let mut child = spawned.child;
@@ -1964,12 +1996,25 @@ impl PaneRuntime {
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
             tokio::task::spawn_blocking(move || {
-                match child.wait() {
+                let observed = match child.wait() {
                     Ok(status) => {
                         let status_text = format!("{status:?}");
                         crate::logging::pane_exited(pane_id.raw(), &status_text);
+                        PaneExitObservation {
+                            success: status.success(),
+                            status: status_text,
+                        }
                     }
-                    Err(e) => crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string()),
+                    Err(e) => {
+                        crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string());
+                        PaneExitObservation {
+                            success: false,
+                            status: format!("waiting for the pane child failed: {e}"),
+                        }
+                    }
+                };
+                if let Ok(mut slot) = exit_observation.lock() {
+                    *slot = Some(observed);
                 }
                 child_wait_completed.store(true, Ordering::Release);
                 // Use blocking send — PaneDied is critical, must not be dropped
@@ -2411,6 +2456,7 @@ impl PaneRuntime {
             child_pid,
             reported_cwd,
             child_wait_completed: Some(child_wait_completed),
+            exit_observation,
             kitty_keyboard_flags,
             detection_content_seq,
             full_lifecycle_authority_active,
@@ -2419,6 +2465,12 @@ impl PaneRuntime {
             preserve_processes_on_drop: false,
             detect_handle,
         })
+    }
+
+    /// The observed termination of this pane's child process, once the child
+    /// watcher has recorded it.
+    pub fn exit_observation(&self) -> Option<PaneExitObservation> {
+        self.exit_observation.lock().ok()?.clone()
     }
 
     pub fn begin_graceful_release(&self, agent: Agent) {
@@ -2891,6 +2943,7 @@ impl PaneRuntime {
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
                 child_wait_completed: None,
+                exit_observation: Arc::new(Mutex::new(None)),
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
@@ -2907,6 +2960,33 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_argv_environment_clears_ambient_and_herdr_context() {
+        let mut command = CommandBuilder::new("worker-under-test");
+        command.env("OPENAI_API_KEY", "secret-under-test");
+        command.env(crate::integration::HERDR_PANE_ID_ENV_VAR, "pane:ambient");
+        let launch_env = PaneLaunchEnv::isolated(vec![
+            ("HOME".into(), "/explicit/home".into()),
+            ("PATH".into(), "/explicit/bin".into()),
+        ]);
+
+        apply_argv_launch_environment(&mut command, &launch_env);
+
+        assert!(command.get_env("OPENAI_API_KEY").is_none());
+        assert!(command
+            .get_env(crate::integration::HERDR_PANE_ID_ENV_VAR)
+            .is_none());
+        assert!(command.get_env(crate::api::SOCKET_PATH_ENV_VAR).is_none());
+        assert_eq!(
+            command.get_env("HOME"),
+            Some(std::ffi::OsStr::new("/explicit/home"))
+        );
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new(PANE_TERM))
+        );
+    }
 
     #[tokio::test]
     async fn cwd_returns_accepted_report_without_rechecking_filesystem() {
@@ -3413,6 +3493,7 @@ mod tests {
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
+            exit_observation: Arc::new(Mutex::new(None)),
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
@@ -3444,6 +3525,7 @@ mod tests {
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
+            exit_observation: Arc::new(Mutex::new(None)),
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),

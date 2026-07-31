@@ -4081,6 +4081,86 @@
           ],
           "type": "string"
         },
+        "WorkerHarness": {
+          "enum": [
+            "codex",
+            "claude"
+          ],
+          "type": "string"
+        },
+        "WorkerPlacementAvailability": {
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "available",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "type": "string"
+                },
+                "status": {
+                  "const": "unavailable",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "WorkerPlacementCandidate": {
+          "additionalProperties": false,
+          "properties": {
+            "availability": {
+              "$ref": "#/schemas/request/$defs/WorkerPlacementAvailability"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/WorkerPlacementKind"
+            },
+            "target_tag": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "target_tag",
+            "kind",
+            "availability"
+          ],
+          "type": "object"
+        },
+        "WorkerPlacementKind": {
+          "enum": [
+            "local_pane",
+            "remote",
+            "remote_temporary",
+            "temporary_subspace"
+          ],
+          "type": "string"
+        },
         "WorkerRunArtifact": {
           "properties": {
             "hash": {
@@ -4157,9 +4237,57 @@
           ],
           "type": "string"
         },
+        "WorkerRunContext": {
+          "additionalProperties": false,
+          "properties": {
+            "inputs": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/WorkerRunContextInput"
+              },
+              "type": "array"
+            },
+            "instruction": {
+              "type": "string"
+            },
+            "repository_ref": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "schema": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema",
+            "instruction",
+            "repository_ref",
+            "revision",
+            "inputs"
+          ],
+          "type": "object"
+        },
+        "WorkerRunContextInput": {
+          "additionalProperties": false,
+          "properties": {
+            "hash": {
+              "type": "string"
+            },
+            "ref": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ref",
+            "hash"
+          ],
+          "type": "object"
+        },
         "WorkerRunExecution": {
           "oneOf": [
             {
+              "additionalProperties": false,
               "properties": {
                 "kind": {
                   "const": "deterministic",
@@ -4180,8 +4308,144 @@
                 "kind"
               ],
               "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "candidates": {
+                  "items": {
+                    "$ref": "#/schemas/request/$defs/WorkerPlacementCandidate"
+                  },
+                  "type": "array"
+                },
+                "harness": {
+                  "$ref": "#/schemas/request/$defs/WorkerHarness"
+                },
+                "kind": {
+                  "const": "harness",
+                  "type": "string"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "placement": {
+                  "$ref": "#/schemas/request/$defs/WorkerPlacementKind"
+                },
+                "profile": {
+                  "type": "string"
+                },
+                "target_tag": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "harness",
+                "profile",
+                "model",
+                "target_tag",
+                "placement",
+                "candidates"
+              ],
+              "type": "object"
             }
           ]
+        },
+        "WorkerRunLifecycle": {
+          "additionalProperties": false,
+          "properties": {
+            "deadline_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "WorkerRunProvenance": {
+          "properties": {
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "commit": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "harness": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "placementRef": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "harness",
+            "model",
+            "placementRef"
+          ],
+          "type": "object"
+        },
+        "WorkerRunRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "capabilities": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "context": {
+              "$ref": "#/schemas/request/$defs/WorkerRunContext"
+            },
+            "lifecycle": {
+              "$ref": "#/schemas/request/$defs/WorkerRunLifecycle"
+            },
+            "result_contract": {
+              "$ref": "#/schemas/request/$defs/WorkerRunResultContract"
+            },
+            "role": {
+              "type": "string"
+            },
+            "schema": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema",
+            "role",
+            "capabilities",
+            "context",
+            "lifecycle",
+            "result_contract"
+          ],
+          "type": "object"
+        },
+        "WorkerRunResultContract": {
+          "additionalProperties": false,
+          "properties": {
+            "require_patch_for_code_changes": {
+              "type": "boolean"
+            },
+            "schema": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema",
+            "require_patch_for_code_changes"
+          ],
+          "type": "object"
         },
         "WorkerRunResultTarget": {
           "properties": {
@@ -4205,6 +4469,16 @@
             "change": {
               "$ref": "#/schemas/request/$defs/WorkerRunChange"
             },
+            "provenance": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/WorkerRunProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "summary": {
               "type": "string"
             }
@@ -4217,6 +4491,7 @@
           "type": "object"
         },
         "WorkerRunSubmitParams": {
+          "additionalProperties": false,
           "properties": {
             "attempt_id": {
               "type": "string"
@@ -4224,16 +4499,11 @@
             "context_hash": {
               "type": "string"
             },
-            "deadline_unix_ms": {
-              "format": "uint64",
-              "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
-            },
             "execution": {
               "$ref": "#/schemas/request/$defs/WorkerRunExecution"
+            },
+            "request": {
+              "$ref": "#/schemas/request/$defs/WorkerRunRequest"
             },
             "request_hash": {
               "type": "string"
@@ -4243,6 +4513,7 @@
             "attempt_id",
             "request_hash",
             "context_hash",
+            "request",
             "execution"
           ],
           "type": "object"
@@ -10224,6 +10495,13 @@
           ],
           "type": "object"
         },
+        "WorkerHarness": {
+          "enum": [
+            "codex",
+            "claude"
+          ],
+          "type": "string"
+        },
         "WorkerRunArtifact": {
           "properties": {
             "hash": {
@@ -10291,6 +10569,33 @@
           ],
           "type": "string"
         },
+        "WorkerRunMetadata": {
+          "properties": {
+            "harness": {
+              "$ref": "#/schemas/success_response/$defs/WorkerHarness"
+            },
+            "model": {
+              "type": "string"
+            },
+            "placement": {
+              "type": "string"
+            },
+            "profile": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "harness",
+            "profile",
+            "model",
+            "target",
+            "placement"
+          ],
+          "type": "object"
+        },
         "WorkerRunProvenance": {
           "properties": {
             "branch": {
@@ -10348,6 +10653,16 @@
               "type": [
                 "integer",
                 "null"
+              ]
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkerRunMetadata"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "request_hash": {

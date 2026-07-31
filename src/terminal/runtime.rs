@@ -15,6 +15,11 @@ use crate::layout::PaneId;
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
 impl TerminalRuntime {
+    /// The observed termination of this terminal's child process.
+    pub fn exit_observation(&self) -> Option<crate::pane::PaneExitObservation> {
+        self.0.exit_observation()
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }

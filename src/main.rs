@@ -98,6 +98,8 @@ mod terminal_notify;
 mod terminal_theme;
 mod ui;
 mod update;
+mod worker_adapters;
+mod worker_placements;
 mod worker_runs;
 mod workspace;
 mod worktree;

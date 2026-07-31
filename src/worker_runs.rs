@@ -9,14 +9,30 @@ use sha2::{Digest, Sha256};
 
 use crate::api::schema::{
     WorkerRunArtifact, WorkerRunArtifactKind, WorkerRunCancellationDisposition, WorkerRunChange,
-    WorkerRunChangeKind, WorkerRunExecution, WorkerRunRecord, WorkerRunResultManifest,
-    WorkerRunResultStatus, WorkerRunResultTemplate, WorkerRunState, WorkerRunSubmissionDisposition,
-    WorkerRunSubmitParams,
+    WorkerRunChangeKind, WorkerRunExecution, WorkerRunMetadata, WorkerRunRecord, WorkerRunRequest,
+    WorkerRunResultManifest, WorkerRunResultStatus, WorkerRunResultTemplate, WorkerRunState,
+    WorkerRunSubmissionDisposition, WorkerRunSubmitParams,
 };
+use crate::worker_adapters::{canonical_json_bytes, prepare_worker_launch, WorkerLaunchSpec};
+use crate::worker_placements::resolve_worker_placement;
 
 const STORE_SCHEMA: &str = "herdr-worker-run-store/v1";
 const RECORD_SCHEMA: &str = "herdr-worker-run/v1";
+const REQUEST_SCHEMA: &str = "skills-herdr-worker-request/v1";
+const CONTEXT_SCHEMA: &str = "skills-herdr-worker-context/v1";
 const RESULT_SCHEMA: &str = "skills-herdr-worker-result/v1";
+/// Directory that holds one artifact tree per worker attempt. Patch and diff
+/// artifacts are resolved and hash-verified against real bytes below this root,
+/// and a harness worker publishes its result manifest here.
+const ARTIFACT_DIRECTORY: &str = "worker-run-artifacts";
+const HARNESS_RESULT_FILE: &str = "result.json";
+
+/// The observed termination of a supervised harness process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerHarnessTermination {
+    pub success: bool,
+    pub status: String,
+}
 
 #[derive(Debug)]
 pub struct WorkerRunError {
@@ -25,7 +41,7 @@ pub struct WorkerRunError {
 }
 
 impl WorkerRunError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -76,18 +92,38 @@ impl WorkerRunStore {
         Self::open(crate::session::data_dir().join("worker-runs.json"))
     }
 
+    #[cfg(test)]
     pub fn submit(
         &self,
         params: WorkerRunSubmitParams,
+    ) -> Result<(WorkerRunRecord, WorkerRunSubmissionDisposition), WorkerRunError> {
+        self.submit_with_initializer(params, |_launch| {
+            Err(WorkerRunError::new(
+                "worker_placement_blocked",
+                "harness execution requires an initialized local pane",
+            ))
+        })
+    }
+
+    pub fn submit_with_initializer(
+        &self,
+        params: WorkerRunSubmitParams,
+        initialize: impl FnOnce(&WorkerLaunchSpec) -> Result<String, WorkerRunError>,
     ) -> Result<(WorkerRunRecord, WorkerRunSubmissionDisposition), WorkerRunError> {
         validate_submit(&params)?;
         let content_hash = hash_json(&(
             &params.request_hash,
             &params.context_hash,
-            params.deadline_unix_ms,
             &params.execution,
         ))?;
-        self.update(|state| {
+        let reserved_run_id = run_id(&params.attempt_id, &content_hash);
+        let artifact_root = self.artifact_root(&params.attempt_id);
+        let prepared_launch = prepare_harness_launch(&params, &reserved_run_id, &artifact_root)?;
+        if prepared_launch.is_some() {
+            std::fs::create_dir_all(&artifact_root)
+                .map_err(|error| WorkerRunError::io("create worker artifact directory", error))?;
+        }
+        let (record, disposition, launch) = self.update(|state| {
             if let Some(run_id) = state.attempts.get(&params.attempt_id) {
                 let existing = state.runs.get(run_id).ok_or_else(|| {
                     WorkerRunError::new(
@@ -110,11 +146,13 @@ impl WorkerRunStore {
                 return Ok((
                     existing.record.clone(),
                     WorkerRunSubmissionDisposition::DuplicateEquivalent,
+                    None,
                 ));
             }
 
             let now = unix_ms();
-            let run_id = run_id(&params.attempt_id, &content_hash);
+            let run_id = reserved_run_id.clone();
+            let is_harness = prepared_launch.is_some();
             let mut stored = StoredWorkerRun {
                 record: WorkerRunRecord {
                     schema: RECORD_SCHEMA.into(),
@@ -123,10 +161,15 @@ impl WorkerRunStore {
                     request_hash: params.request_hash,
                     context_hash: params.context_hash,
                     content_hash,
-                    state: WorkerRunState::Running,
+                    metadata: None,
+                    state: if is_harness {
+                        WorkerRunState::Submitted
+                    } else {
+                        WorkerRunState::Running
+                    },
                     created_unix_ms: now,
                     updated_unix_ms: now,
-                    deadline_unix_ms: params.deadline_unix_ms,
+                    deadline_unix_ms: params.request.lifecycle.deadline_unix_ms,
                     cancellation_requested: false,
                     terminal_reason: None,
                     result_ref: None,
@@ -134,11 +177,145 @@ impl WorkerRunStore {
                 execution: params.execution,
                 result: None,
             };
-            apply_deadline_or_deterministic_result(&mut stored, now)?;
+            apply_deadline_or_deterministic_result(&mut stored, now, &artifact_root)?;
             state.attempts.insert(params.attempt_id, run_id.clone());
             let record = stored.record.clone();
             state.runs.insert(run_id, stored);
-            Ok((record, WorkerRunSubmissionDisposition::Created))
+            Ok((
+                record,
+                WorkerRunSubmissionDisposition::Created,
+                prepared_launch,
+            ))
+        })?;
+
+        let Some(mut launch) = launch else {
+            return Ok((record, disposition));
+        };
+        let placement = match initialize(&launch) {
+            Ok(placement) => placement,
+            Err(error) => {
+                self.fail_reserved(&record.run_id, &error.message)?;
+                return Err(error);
+            }
+        };
+        validate_bounded_text("worker placement ref", &placement, 1_024)?;
+        launch.metadata.placement = placement;
+        let activated = self.activate_reserved(&record.run_id, launch.metadata)?;
+        Ok((activated, disposition))
+    }
+
+    /// Artifact tree owned by one worker attempt. Patch and diff bytes and a
+    /// harness result manifest are read from here and never from caller input.
+    pub fn artifact_root(&self, attempt_id: &str) -> PathBuf {
+        self.path
+            .with_file_name(ARTIFACT_DIRECTORY)
+            .join(attempt_id)
+    }
+
+    /// Drive a supervised harness run to exactly one explicit terminal state
+    /// from its observed process termination. A successful exit must publish a
+    /// validated result manifest; anything else fails loud.
+    pub fn complete_harness(
+        &self,
+        run_id: &str,
+        termination: &WorkerHarnessTermination,
+    ) -> Result<WorkerRunRecord, WorkerRunError> {
+        validate_run_id(run_id)?;
+        validate_bounded_text("harness termination status", &termination.status, 1_024)?;
+        self.update(|state| {
+            let stored = state.runs.get_mut(run_id).ok_or_else(|| {
+                WorkerRunError::new(
+                    "worker_run_not_found",
+                    format!("worker run {run_id} not found"),
+                )
+            })?;
+            if stored.record.state.is_terminal() {
+                return Ok(stored.record.clone());
+            }
+            if !matches!(stored.execution, WorkerRunExecution::Harness { .. }) {
+                return Err(WorkerRunError::new(
+                    "worker_run_invalid",
+                    format!("worker run {run_id} is not a supervised harness run"),
+                ));
+            }
+            let artifact_root = self.artifact_root(&stored.record.attempt_id);
+            match harness_result_template(termination, &artifact_root) {
+                Ok(template) => {
+                    let now = unix_ms();
+                    stored.result = Some(WorkerRunResultManifest {
+                        schema: RESULT_SCHEMA.into(),
+                        attempt_id: stored.record.attempt_id.clone(),
+                        run_ref: stored.record.run_id.clone(),
+                        status: WorkerRunResultStatus::Succeeded,
+                        summary: template.summary,
+                        change: template.change,
+                        artifacts: template.artifacts,
+                        provenance: template.provenance,
+                        completed_at: rfc3339_from_unix_ms(now),
+                    });
+                    stored.record.state = WorkerRunState::Succeeded;
+                    stored.record.updated_unix_ms = now;
+                    stored.record.result_ref = Some(result_ref(&stored.record.run_id));
+                }
+                Err(reason) => finish_terminal(
+                    stored,
+                    WorkerRunState::Failed,
+                    WorkerRunResultStatus::Failed,
+                    &reason,
+                )?,
+            }
+            Ok(stored.record.clone())
+        })
+    }
+
+    fn activate_reserved(
+        &self,
+        run_id: &str,
+        metadata: WorkerRunMetadata,
+    ) -> Result<WorkerRunRecord, WorkerRunError> {
+        self.update(|state| {
+            let stored = state.runs.get_mut(run_id).ok_or_else(|| {
+                WorkerRunError::new(
+                    "worker_run_store_corrupt",
+                    format!("reserved worker run {run_id} disappeared before activation"),
+                )
+            })?;
+            if stored.record.state != WorkerRunState::Submitted
+                || !matches!(stored.execution, WorkerRunExecution::Harness { .. })
+                || stored.record.metadata.is_some()
+            {
+                return Err(WorkerRunError::new(
+                    "worker_run_store_corrupt",
+                    format!("worker run {run_id} is not an inactive harness reservation"),
+                ));
+            }
+            stored.record.metadata = Some(metadata);
+            stored.record.state = WorkerRunState::Running;
+            stored.record.updated_unix_ms = unix_ms();
+            Ok(stored.record.clone())
+        })
+    }
+
+    fn fail_reserved(&self, run_id: &str, reason: &str) -> Result<(), WorkerRunError> {
+        self.update(|state| {
+            let stored = state.runs.get_mut(run_id).ok_or_else(|| {
+                WorkerRunError::new(
+                    "worker_run_store_corrupt",
+                    format!("reserved worker run {run_id} disappeared before failure recording"),
+                )
+            })?;
+            if stored.record.state != WorkerRunState::Submitted {
+                return Err(WorkerRunError::new(
+                    "worker_run_store_corrupt",
+                    format!("worker run {run_id} is not an inactive harness reservation"),
+                ));
+            }
+            finish_terminal(
+                stored,
+                WorkerRunState::Failed,
+                WorkerRunResultStatus::Failed,
+                reason,
+            )
         })
     }
 
@@ -346,9 +523,42 @@ impl WorkerRunStore {
     }
 }
 
+fn harness_result_template(
+    termination: &WorkerHarnessTermination,
+    artifact_root: &Path,
+) -> Result<WorkerRunResultTemplate, String> {
+    if !termination.success {
+        return Err(format!(
+            "approved local worker pane terminated without success: {}",
+            termination.status
+        ));
+    }
+    let manifest_path = artifact_root.join(HARNESS_RESULT_FILE);
+    let bytes = std::fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "approved local worker exited successfully without a readable result manifest at {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let template = serde_json::from_slice::<WorkerRunResultTemplate>(&bytes).map_err(|error| {
+        format!(
+            "approved local worker result manifest at {} is not a valid result template: {error}",
+            manifest_path.display()
+        )
+    })?;
+    validate_result_template(&template, artifact_root).map_err(|error| {
+        format!(
+            "approved local worker result manifest is invalid: {}",
+            error.message
+        )
+    })?;
+    Ok(template)
+}
+
 fn apply_deadline_or_deterministic_result(
     stored: &mut StoredWorkerRun,
     now: u64,
+    artifact_root: &Path,
 ) -> Result<(), WorkerRunError> {
     if stored
         .record
@@ -362,9 +572,12 @@ fn apply_deadline_or_deterministic_result(
             "approved worker deadline elapsed before execution",
         );
     }
-    let WorkerRunExecution::Deterministic { result } = &stored.execution;
+    let result = match &stored.execution {
+        WorkerRunExecution::Deterministic { result } => result,
+        WorkerRunExecution::Harness { .. } => return Ok(()),
+    };
     if let Some(template) = result.clone() {
-        validate_result_template(&template)?;
+        validate_result_template(&template, artifact_root)?;
         let completed_at = rfc3339_from_unix_ms(now);
         stored.result = Some(WorkerRunResultManifest {
             schema: RESULT_SCHEMA.into(),
@@ -374,7 +587,7 @@ fn apply_deadline_or_deterministic_result(
             summary: template.summary,
             change: template.change,
             artifacts: template.artifacts,
-            provenance: None,
+            provenance: template.provenance,
             completed_at,
         });
         stored.record.state = WorkerRunState::Succeeded;
@@ -408,12 +621,7 @@ fn finish_terminal(
     reason: &str,
 ) -> Result<(), WorkerRunError> {
     let reason = reason.trim();
-    if reason.is_empty() {
-        return Err(WorkerRunError::new(
-            "worker_run_invalid",
-            "terminal reason must not be empty",
-        ));
-    }
+    validate_bounded_text("terminal reason", reason, 65_536)?;
     let now = unix_ms();
     let run_id = stored.record.run_id.clone();
     stored.record.state = state;
@@ -446,6 +654,142 @@ fn validate_submit(params: &WorkerRunSubmitParams) -> Result<(), WorkerRunError>
     validate_identifier("attempt_id", &params.attempt_id)?;
     validate_hash("request_hash", &params.request_hash)?;
     validate_hash("context_hash", &params.context_hash)?;
+    validate_request(&params.request)?;
+    let request_hash = hash_json(&params.request)?;
+    if request_hash != params.request_hash {
+        return Err(WorkerRunError::new(
+            "worker_run_request_hash_mismatch",
+            format!(
+                "request_hash {} does not match immutable request {request_hash}",
+                params.request_hash
+            ),
+        ));
+    }
+    let context_hash = hash_json(&params.request.context)?;
+    if context_hash != params.context_hash {
+        return Err(WorkerRunError::new(
+            "worker_run_context_hash_mismatch",
+            format!(
+                "context_hash {} does not match immutable context {context_hash}",
+                params.context_hash
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_harness_launch(
+    params: &WorkerRunSubmitParams,
+    run_id: &str,
+    artifact_dir: &Path,
+) -> Result<Option<WorkerLaunchSpec>, WorkerRunError> {
+    let WorkerRunExecution::Harness {
+        harness,
+        profile,
+        model,
+        target_tag,
+        placement,
+        candidates,
+    } = &params.execution
+    else {
+        return Ok(None);
+    };
+    if candidates.len() > 64 {
+        return Err(WorkerRunError::new(
+            "worker_run_invalid",
+            "worker placement candidates must contain at most 64 entries",
+        ));
+    }
+    let resolved = resolve_worker_placement(target_tag, *placement, candidates)
+        .map_err(crate::worker_adapters::WorkerAdapterError::from)
+        .map_err(|error| WorkerRunError::new(error.code, error.message))?;
+    let metadata = WorkerRunMetadata {
+        harness: *harness,
+        profile: profile.clone(),
+        model: model.clone(),
+        target: resolved.target_tag.clone(),
+        placement: format!("local-pane:{}", resolved.workspace_id),
+    };
+    prepare_worker_launch(&params.request, &metadata, &resolved, run_id, artifact_dir)
+        .map(Some)
+        .map_err(|error| WorkerRunError::new(error.code, error.message))
+}
+
+fn validate_request(request: &WorkerRunRequest) -> Result<(), WorkerRunError> {
+    if request.schema != REQUEST_SCHEMA {
+        return Err(WorkerRunError::new(
+            "worker_run_invalid",
+            format!("unsupported worker request schema {}", request.schema),
+        ));
+    }
+    validate_bounded_text("worker role", &request.role, 200)?;
+    if request.capabilities.is_empty() || request.capabilities.len() > 32 {
+        return Err(WorkerRunError::new(
+            "worker_run_invalid",
+            "worker capabilities must contain between 1 and 32 entries",
+        ));
+    }
+    let mut capabilities = std::collections::BTreeSet::new();
+    for capability in &request.capabilities {
+        validate_identifier("worker capability", capability)?;
+        if !capabilities.insert(capability) {
+            return Err(WorkerRunError::new(
+                "worker_run_invalid",
+                "worker capabilities must be unique",
+            ));
+        }
+    }
+    if request.context.schema != CONTEXT_SCHEMA {
+        return Err(WorkerRunError::new(
+            "worker_run_invalid",
+            format!(
+                "unsupported worker context schema {}",
+                request.context.schema
+            ),
+        ));
+    }
+    validate_bounded_text("worker instruction", &request.context.instruction, 65_536)?;
+    validate_bounded_text(
+        "worker repository ref",
+        &request.context.repository_ref,
+        1_024,
+    )?;
+    validate_hash("worker revision", &request.context.revision)?;
+    if request.context.inputs.len() > 128 {
+        return Err(WorkerRunError::new(
+            "worker_run_invalid",
+            "worker context inputs must contain at most 128 entries",
+        ));
+    }
+    let mut input_refs = std::collections::BTreeSet::new();
+    for input in &request.context.inputs {
+        validate_bounded_text("worker context input ref", &input.reference, 1_024)?;
+        validate_hash("worker context input hash", &input.hash)?;
+        if !input_refs.insert(&input.reference) {
+            return Err(WorkerRunError::new(
+                "worker_run_invalid",
+                "worker context input refs must be unique",
+            ));
+        }
+    }
+    if request.result_contract.schema != RESULT_SCHEMA
+        || !request.result_contract.require_patch_for_code_changes
+    {
+        return Err(WorkerRunError::new(
+            "worker_run_invalid",
+            "worker result contract must require hash-bound patch or diff artifacts for code changes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(field: &str, value: &str, max_bytes: usize) -> Result<(), WorkerRunError> {
+    if value.trim().is_empty() || value.len() > max_bytes {
+        return Err(WorkerRunError::new(
+            "worker_run_invalid",
+            format!("{field} must be non-empty and at most {max_bytes} bytes"),
+        ));
+    }
     Ok(())
 }
 
@@ -503,30 +847,84 @@ fn validate_hash(field: &str, value: &str) -> Result<(), WorkerRunError> {
     }
 }
 
-fn validate_result_template(template: &WorkerRunResultTemplate) -> Result<(), WorkerRunError> {
-    if template.summary.trim().is_empty() {
+/// Bind a recorded patch or diff hash to the real artifact bytes published
+/// under the attempt's artifact root. A missing artifact or a hash that does
+/// not cover the produced bytes is a typed fail-closed error.
+fn verify_patch_artifact_bytes(
+    artifact: &WorkerRunArtifact,
+    artifact_root: &Path,
+) -> Result<(), WorkerRunError> {
+    let relative = Path::new(&artifact.reference);
+    let contained = relative.components().all(|component| {
+        matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    });
+    if !contained {
         return Err(WorkerRunError::new(
             "worker_run_invalid",
-            "result summary must not be empty",
+            format!(
+                "patch artifact reference {:?} must be a path inside the worker artifact root",
+                artifact.reference
+            ),
         ));
     }
-    if template.artifacts.is_empty() {
+    let path = artifact_root.join(relative);
+    let bytes = std::fs::read(&path).map_err(|error| {
+        WorkerRunError::new(
+            "worker_run_artifact_unavailable",
+            format!(
+                "patch artifact {:?} has no readable bytes at {}: {error}",
+                artifact.reference,
+                path.display()
+            ),
+        )
+    })?;
+    let observed = hash_bytes(&bytes);
+    if observed != artifact.hash {
+        return Err(WorkerRunError::new(
+            "worker_run_artifact_hash_mismatch",
+            format!(
+                "patch artifact {:?} records {} but its bytes hash to {observed}",
+                artifact.reference, artifact.hash
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_result_template(
+    template: &WorkerRunResultTemplate,
+    artifact_root: &Path,
+) -> Result<(), WorkerRunError> {
+    validate_bounded_text("result summary", &template.summary, 65_536)?;
+    if template.artifacts.is_empty() || template.artifacts.len() > 128 {
         return Err(WorkerRunError::new(
             "worker_run_invalid",
-            "result artifacts must not be empty",
+            "result artifacts must contain between 1 and 128 entries",
+        ));
+    }
+    if template.change.changed_files.len() > 128 {
+        return Err(WorkerRunError::new(
+            "worker_run_invalid",
+            "changed files must contain at most 128 entries",
         ));
     }
     for artifact in &template.artifacts {
-        if artifact.reference.trim().is_empty() || artifact.media_type.trim().is_empty() {
-            return Err(WorkerRunError::new(
-                "worker_run_invalid",
-                "result artifact reference and media type must not be empty",
-            ));
-        }
+        validate_bounded_text("result artifact reference", &artifact.reference, 4_096)?;
+        validate_bounded_text("result artifact media type", &artifact.media_type, 200)?;
         validate_hash("artifact hash", &artifact.hash)?;
+        if matches!(
+            artifact.kind,
+            WorkerRunArtifactKind::Patch | WorkerRunArtifactKind::Diff
+        ) {
+            verify_patch_artifact_bytes(artifact, artifact_root)?;
+        }
     }
     for path in &template.change.changed_files {
         if path.is_empty()
+            || path.len() > 4_096
             || Path::new(path).is_absolute()
             || Path::new(path)
                 .components()
@@ -561,6 +959,26 @@ fn validate_result_template(template: &WorkerRunResultTemplate) -> Result<(), Wo
             "worker_run_invalid",
             "result artifacts must be unique",
         ));
+    }
+    if let Some(provenance) = &template.provenance {
+        validate_bounded_text("provenance harness", &provenance.harness, 200)?;
+        validate_bounded_text("provenance model", &provenance.model, 200)?;
+        validate_bounded_text("provenance placement ref", &provenance.placement_ref, 1_024)?;
+        if let Some(branch) = provenance.branch.as_deref() {
+            validate_bounded_text("provenance branch", branch, 1_024)?;
+        }
+        if let Some(commit) = provenance.commit.as_deref() {
+            let valid = matches!(commit.len(), 40 | 64)
+                && commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            if !valid {
+                return Err(WorkerRunError::new(
+                    "worker_run_invalid",
+                    "provenance commit must be a lowercase 40- or 64-character Git object id",
+                ));
+            }
+        }
     }
     match template.change.kind {
         WorkerRunChangeKind::None if !template.change.changed_files.is_empty() => {
@@ -658,12 +1076,8 @@ fn result_ref(run_id: &str) -> String {
 }
 
 fn hash_json(value: &impl Serialize) -> Result<String, WorkerRunError> {
-    let bytes = serde_json::to_vec(value).map_err(|error| {
-        WorkerRunError::new(
-            "worker_run_invalid",
-            format!("serialize immutable worker request: {error}"),
-        )
-    })?;
+    let bytes = canonical_json_bytes(value)
+        .map_err(|error| WorkerRunError::new(error.code, error.message))?;
     Ok(hash_bytes(&bytes))
 }
 
@@ -711,6 +1125,9 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
 mod tests {
     use super::*;
 
+    const FIXTURE_PATCH: &[u8] =
+        b"diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
+
     fn hash(character: char) -> String {
         format!("sha256:{}", character.to_string().repeat(64))
     }
@@ -724,22 +1141,57 @@ mod tests {
         WorkerRunStore::open(std::env::temp_dir().join(unique).join("runs.json"))
     }
 
-    fn deferred(attempt_id: &str, request_hash: &str) -> WorkerRunSubmitParams {
+    fn provider_neutral_request(instruction_marker: &str) -> WorkerRunRequest {
+        WorkerRunRequest {
+            schema: REQUEST_SCHEMA.into(),
+            role: "implementation-worker".into(),
+            capabilities: vec!["read-repository".into(), "edit-repository".into()],
+            context: crate::api::schema::WorkerRunContext {
+                schema: CONTEXT_SCHEMA.into(),
+                instruction: format!("apply bounded fixture change {instruction_marker}"),
+                repository_ref: "github.com/example/project".into(),
+                revision: hash('e'),
+                inputs: vec![crate::api::schema::WorkerRunContextInput {
+                    reference: "skills-attempt://TASK-10.2/input".into(),
+                    hash: hash('f'),
+                }],
+            },
+            lifecycle: crate::api::schema::WorkerRunLifecycle {
+                deadline_unix_ms: None,
+            },
+            result_contract: crate::api::schema::WorkerRunResultContract {
+                schema: RESULT_SCHEMA.into(),
+                require_patch_for_code_changes: true,
+            },
+        }
+    }
+
+    fn deferred(attempt_id: &str, instruction_marker: &str) -> WorkerRunSubmitParams {
+        let request = provider_neutral_request(instruction_marker);
         WorkerRunSubmitParams {
             attempt_id: attempt_id.into(),
-            request_hash: request_hash.into(),
-            context_hash: hash('b'),
-            deadline_unix_ms: None,
+            request_hash: hash_json(&request).unwrap(),
+            context_hash: hash_json(&request.context).unwrap(),
+            request,
             execution: WorkerRunExecution::Deterministic { result: None },
         }
     }
 
-    fn successful(attempt_id: &str) -> WorkerRunSubmitParams {
+    /// Publish the real patch bytes the recorded artifact hash must cover.
+    fn seed_patch(store: &WorkerRunStore, attempt_id: &str, bytes: &[u8]) {
+        let root = store.artifact_root(attempt_id);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("change.patch"), bytes).unwrap();
+    }
+
+    fn successful(store: &WorkerRunStore, attempt_id: &str) -> WorkerRunSubmitParams {
+        seed_patch(store, attempt_id, FIXTURE_PATCH);
+        let request = provider_neutral_request("success");
         WorkerRunSubmitParams {
             attempt_id: attempt_id.into(),
-            request_hash: hash('a'),
-            context_hash: hash('b'),
-            deadline_unix_ms: None,
+            request_hash: hash_json(&request).unwrap(),
+            context_hash: hash_json(&request.context).unwrap(),
+            request,
             execution: WorkerRunExecution::Deterministic {
                 result: Some(WorkerRunResultTemplate {
                     summary: "deterministic worker completed".into(),
@@ -749,10 +1201,11 @@ mod tests {
                     },
                     artifacts: vec![WorkerRunArtifact {
                         kind: WorkerRunArtifactKind::Patch,
-                        reference: "artifact://worker/change.patch".into(),
-                        hash: hash('c'),
+                        reference: "change.patch".into(),
+                        hash: hash_bytes(FIXTURE_PATCH),
                         media_type: "text/x-diff".into(),
                     }],
+                    provenance: None,
                 }),
             },
         }
@@ -849,7 +1302,8 @@ mod tests {
     fn elapsed_deadline_becomes_one_durable_timeout_outcome() {
         let store = temp_store("timeout");
         let mut request = deferred("attempt-timeout", &hash('a'));
-        request.deadline_unix_ms = Some(1);
+        request.request.lifecycle.deadline_unix_ms = Some(1);
+        request.request_hash = hash_json(&request.request).unwrap();
         let (run, _) = store.submit(request).unwrap();
         assert_eq!(run.state, WorkerRunState::TimedOut);
         assert_eq!(store.get(&run.run_id).unwrap(), run);
@@ -865,7 +1319,9 @@ mod tests {
     #[test]
     fn result_reference_rejects_unknown_and_mismatched_bindings() {
         let store = temp_store("result-reference");
-        let (run, _) = store.submit(successful("attempt-result-ref")).unwrap();
+        let (run, _) = store
+            .submit(successful(&store, "attempt-result-ref"))
+            .unwrap();
         let published_ref = run.result_ref.clone().unwrap();
         assert_eq!(store.result(&published_ref).unwrap().run_ref, run.run_id);
 
@@ -916,7 +1372,7 @@ mod tests {
     #[test]
     fn deterministic_worker_returns_versioned_hash_bound_patch_manifest() {
         let store = temp_store("result");
-        let (run, _) = store.submit(successful("attempt-success")).unwrap();
+        let (run, _) = store.submit(successful(&store, "attempt-success")).unwrap();
         assert_eq!(run.state, WorkerRunState::Succeeded);
         let result = store.result(run.result_ref.as_deref().unwrap()).unwrap();
         assert_eq!(result.schema, RESULT_SCHEMA);
@@ -928,6 +1384,7 @@ mod tests {
             .artifacts
             .iter()
             .any(|artifact| artifact.kind == WorkerRunArtifactKind::Patch));
+        assert_eq!(result.artifacts[0].hash, hash_bytes(FIXTURE_PATCH));
         assert!(result.completed_at.ends_with('Z'));
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["schema"], RESULT_SCHEMA);
@@ -938,6 +1395,365 @@ mod tests {
         assert_eq!(json["change"]["changedFiles"][0], "src/lib.rs");
         assert_eq!(json["artifacts"][0]["kind"], "patch");
         assert_eq!(json["artifacts"][0]["mediaType"], "text/x-diff");
+    }
+
+    #[test]
+    fn code_change_result_binds_the_recorded_hash_to_real_patch_bytes() {
+        // The recorded hash must cover the produced bytes, not merely round-trip.
+        let bound = temp_store("patch-bound");
+        let (run, _) = bound.submit(successful(&bound, "attempt-bound")).unwrap();
+        let result = bound.result(run.result_ref.as_deref().unwrap()).unwrap();
+        assert_eq!(result.artifacts[0].hash, hash_bytes(FIXTURE_PATCH));
+        assert_eq!(
+            std::fs::read(bound.artifact_root("attempt-bound").join("change.patch")).unwrap(),
+            FIXTURE_PATCH
+        );
+
+        // Bytes that changed after the hash was recorded fail closed.
+        let tampered = temp_store("patch-tampered");
+        let params = successful(&tampered, "attempt-tampered");
+        seed_patch(
+            &tampered,
+            "attempt-tampered",
+            b"bytes a worker never produced",
+        );
+        let error = tampered.submit(params).unwrap_err();
+        assert_eq!(error.code, "worker_run_artifact_hash_mismatch");
+
+        // A recorded patch with no bytes at all fails closed.
+        let absent = temp_store("patch-absent");
+        let params = successful(&absent, "attempt-absent");
+        std::fs::remove_file(absent.artifact_root("attempt-absent").join("change.patch")).unwrap();
+        let error = absent.submit(params).unwrap_err();
+        assert_eq!(error.code, "worker_run_artifact_unavailable");
+    }
+
+    #[test]
+    fn immutable_request_and_context_hash_mismatches_fail_closed() {
+        let store = temp_store("hash-mismatch");
+        let mut request = deferred("attempt-request-mismatch", "request");
+        request.request_hash = hash('1');
+        let error = store.submit(request).unwrap_err();
+        assert_eq!(error.code, "worker_run_request_hash_mismatch");
+
+        let mut context = deferred("attempt-context-mismatch", "context");
+        context.context_hash = hash('2');
+        let error = store.submit(context).unwrap_err();
+        assert_eq!(error.code, "worker_run_context_hash_mismatch");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn harness_params(attempt_id: &str) -> WorkerRunSubmitParams {
+        let request = provider_neutral_request("supervision");
+        WorkerRunSubmitParams {
+            attempt_id: attempt_id.into(),
+            request_hash: hash_json(&request).unwrap(),
+            context_hash: hash_json(&request.context).unwrap(),
+            request,
+            execution: WorkerRunExecution::Harness {
+                harness: crate::api::schema::WorkerHarness::Codex,
+                profile: "profile-under-test".into(),
+                model: "opaque-model-under-test".into(),
+                target_tag: crate::worker_placements::APPROVED_LOCAL_PLACEMENT
+                    .target_tag
+                    .into(),
+                placement: crate::worker_placements::WorkerPlacementKind::LocalPane,
+                candidates: vec![crate::worker_placements::WorkerPlacementCandidate {
+                    target_tag: crate::worker_placements::APPROVED_LOCAL_PLACEMENT
+                        .target_tag
+                        .into(),
+                    kind: crate::worker_placements::WorkerPlacementKind::LocalPane,
+                    workspace_id: Some("workspace:1".into()),
+                    cwd: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+                    availability: crate::worker_placements::WorkerPlacementAvailability::Available,
+                }],
+            },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn running_harness_run(store: &WorkerRunStore, attempt_id: &str) -> WorkerRunRecord {
+        let (run, _) = store
+            .submit_with_initializer(harness_params(attempt_id), |_launch| {
+                Ok("local-pane:pane:1".into())
+            })
+            .unwrap();
+        assert_eq!(run.state, WorkerRunState::Running);
+        run
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn supervised_harness_exit_drives_one_explicit_terminal_state() {
+        let store = temp_store("harness-supervision-exit");
+        let run = running_harness_run(&store, "attempt-nonzero-exit");
+        let terminal = store
+            .complete_harness(
+                &run.run_id,
+                &WorkerHarnessTermination {
+                    success: false,
+                    status: "ExitStatus { code: 1, signal: None }".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(terminal.state, WorkerRunState::Failed);
+        assert!(terminal
+            .terminal_reason
+            .as_deref()
+            .unwrap()
+            .contains("code: 1"));
+        assert_eq!(
+            store
+                .result(terminal.result_ref.as_deref().unwrap())
+                .unwrap()
+                .status,
+            WorkerRunResultStatus::Failed
+        );
+        // Supervision is idempotent and never reopens a terminal run.
+        assert_eq!(
+            store
+                .complete_harness(
+                    &run.run_id,
+                    &WorkerHarnessTermination {
+                        success: true,
+                        status: "ExitStatus { code: 0, signal: None }".into(),
+                    },
+                )
+                .unwrap(),
+            terminal
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn supervised_harness_success_publishes_a_validated_result_manifest() {
+        let store = temp_store("harness-supervision-manifest");
+        let run = running_harness_run(&store, "attempt-harness-result");
+        let root = store.artifact_root("attempt-harness-result");
+        std::fs::write(root.join("change.patch"), FIXTURE_PATCH).unwrap();
+        let template = WorkerRunResultTemplate {
+            summary: "approved local worker completed".into(),
+            change: WorkerRunChange {
+                kind: WorkerRunChangeKind::Code,
+                changed_files: vec!["src/lib.rs".into()],
+            },
+            artifacts: vec![WorkerRunArtifact {
+                kind: WorkerRunArtifactKind::Patch,
+                reference: "change.patch".into(),
+                hash: hash_bytes(FIXTURE_PATCH),
+                media_type: "text/x-diff".into(),
+            }],
+            provenance: None,
+        };
+        std::fs::write(
+            root.join(HARNESS_RESULT_FILE),
+            serde_json::to_vec(&template).unwrap(),
+        )
+        .unwrap();
+
+        let terminal = store
+            .complete_harness(
+                &run.run_id,
+                &WorkerHarnessTermination {
+                    success: true,
+                    status: "ExitStatus { code: 0, signal: None }".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(terminal.state, WorkerRunState::Succeeded);
+        let result = store
+            .result(terminal.result_ref.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(result.schema, RESULT_SCHEMA);
+        assert_eq!(result.status, WorkerRunResultStatus::Succeeded);
+        assert_eq!(result.change.kind, WorkerRunChangeKind::Code);
+        assert_eq!(result.artifacts[0].hash, hash_bytes(FIXTURE_PATCH));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn supervised_harness_without_a_valid_manifest_fails_loud() {
+        let missing = temp_store("harness-supervision-missing");
+        let run = running_harness_run(&missing, "attempt-harness-missing");
+        let terminal = missing
+            .complete_harness(
+                &run.run_id,
+                &WorkerHarnessTermination {
+                    success: true,
+                    status: "ExitStatus { code: 0, signal: None }".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(terminal.state, WorkerRunState::Failed);
+        assert!(terminal
+            .terminal_reason
+            .as_deref()
+            .unwrap()
+            .contains("without a readable result manifest"));
+
+        let tampered = temp_store("harness-supervision-tampered");
+        let run = running_harness_run(&tampered, "attempt-harness-tampered");
+        let root = tampered.artifact_root("attempt-harness-tampered");
+        std::fs::write(root.join("change.patch"), b"bytes a worker never produced").unwrap();
+        let template = WorkerRunResultTemplate {
+            summary: "approved local worker completed".into(),
+            change: WorkerRunChange {
+                kind: WorkerRunChangeKind::Code,
+                changed_files: vec!["src/lib.rs".into()],
+            },
+            artifacts: vec![WorkerRunArtifact {
+                kind: WorkerRunArtifactKind::Patch,
+                reference: "change.patch".into(),
+                hash: hash_bytes(FIXTURE_PATCH),
+                media_type: "text/x-diff".into(),
+            }],
+            provenance: None,
+        };
+        std::fs::write(
+            root.join(HARNESS_RESULT_FILE),
+            serde_json::to_vec(&template).unwrap(),
+        )
+        .unwrap();
+        let terminal = tampered
+            .complete_harness(
+                &run.run_id,
+                &WorkerHarnessTermination {
+                    success: true,
+                    status: "ExitStatus { code: 0, signal: None }".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(terminal.state, WorkerRunState::Failed);
+        assert!(terminal
+            .terminal_reason
+            .as_deref()
+            .unwrap()
+            .contains("bytes hash to"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn harness_reserves_durably_before_one_idempotent_initialization() {
+        use std::cell::Cell;
+
+        let store = temp_store("harness-metadata");
+        let store_path = store.path.clone();
+        let request = provider_neutral_request("adapter");
+        let request_hash = hash_json(&request).unwrap();
+        let context_hash = hash_json(&request.context).unwrap();
+        let params = WorkerRunSubmitParams {
+            attempt_id: "attempt-harness".into(),
+            request_hash: request_hash.clone(),
+            context_hash,
+            request,
+            execution: WorkerRunExecution::Harness {
+                harness: crate::api::schema::WorkerHarness::Codex,
+                profile: "profile-under-test".into(),
+                model: "opaque-model-under-test".into(),
+                target_tag: crate::worker_placements::APPROVED_LOCAL_PLACEMENT
+                    .target_tag
+                    .into(),
+                placement: crate::worker_placements::WorkerPlacementKind::LocalPane,
+                candidates: vec![crate::worker_placements::WorkerPlacementCandidate {
+                    target_tag: crate::worker_placements::APPROVED_LOCAL_PLACEMENT
+                        .target_tag
+                        .into(),
+                    kind: crate::worker_placements::WorkerPlacementKind::LocalPane,
+                    workspace_id: Some("workspace:1".into()),
+                    cwd: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+                    availability: crate::worker_placements::WorkerPlacementAvailability::Available,
+                }],
+            },
+        };
+        let duplicate_params = params.clone();
+        let initialize_count = Cell::new(0);
+        let (run, disposition) = store
+            .submit_with_initializer(params, |_launch| {
+                initialize_count.set(initialize_count.get() + 1);
+                let reserved = WorkerRunStore::open(store_path).load().unwrap();
+                let reserved_run = reserved.runs.values().next().unwrap();
+                assert_eq!(reserved_run.record.state, WorkerRunState::Submitted);
+                assert!(reserved_run.record.metadata.is_none());
+                Ok("local-pane:pane:9".into())
+            })
+            .unwrap();
+        assert_eq!(disposition, WorkerRunSubmissionDisposition::Created);
+        assert_eq!(initialize_count.get(), 1);
+        assert_eq!(run.request_hash, request_hash);
+        assert_eq!(
+            run.metadata,
+            Some(WorkerRunMetadata {
+                harness: crate::api::schema::WorkerHarness::Codex,
+                profile: "profile-under-test".into(),
+                model: "opaque-model-under-test".into(),
+                target: crate::worker_placements::APPROVED_LOCAL_PLACEMENT
+                    .target_tag
+                    .into(),
+                placement: "local-pane:pane:9".into(),
+            })
+        );
+        let (duplicate, disposition) = store
+            .submit_with_initializer(duplicate_params, |_launch| {
+                initialize_count.set(initialize_count.get() + 1);
+                Ok("local-pane:pane:10".into())
+            })
+            .unwrap();
+        assert_eq!(
+            disposition,
+            WorkerRunSubmissionDisposition::DuplicateEquivalent
+        );
+        assert_eq!(duplicate, run);
+        assert_eq!(initialize_count.get(), 1);
+    }
+
+    #[test]
+    fn patch_manifest_accepts_optional_branch_and_commit_provenance() {
+        let store = temp_store("patch-provenance");
+        let mut params = successful(&store, "attempt-provenance");
+        let WorkerRunExecution::Deterministic {
+            result: Some(result),
+        } = &mut params.execution
+        else {
+            panic!("successful fixture must be deterministic");
+        };
+        result.provenance = Some(crate::api::schema::WorkerRunProvenance {
+            harness: "fixture-harness".into(),
+            model: "opaque-model-under-test".into(),
+            placement_ref: "local-pane:pane:fixture".into(),
+            branch: Some("w/fixture".into()),
+            commit: Some("a".repeat(40)),
+        });
+        let (run, _) = store.submit(params).unwrap();
+        let result = store.result(run.result_ref.as_deref().unwrap()).unwrap();
+        let provenance = result.provenance.unwrap();
+        assert_eq!(provenance.branch.as_deref(), Some("w/fixture"));
+        assert_eq!(
+            provenance.commit.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn result_manifest_rejects_unbounded_fixture_output() {
+        let store = temp_store("result-bounds");
+        let mut params = successful(&store, "attempt-unbounded");
+        let WorkerRunExecution::Deterministic {
+            result: Some(result),
+        } = &mut params.execution
+        else {
+            panic!("successful fixture must be deterministic");
+        };
+        result.artifacts = (0..129)
+            .map(|index| WorkerRunArtifact {
+                kind: WorkerRunArtifactKind::Log,
+                reference: format!("artifact://worker/log-{index}"),
+                hash: hash('d'),
+                media_type: "text/plain".into(),
+            })
+            .collect();
+        let error = store.submit(params).unwrap_err();
+        assert_eq!(error.code, "worker_run_invalid");
+        assert!(error.message.contains("between 1 and 128"));
     }
 
     #[test]

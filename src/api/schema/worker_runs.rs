@@ -1,22 +1,80 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerRunSubmitParams {
     pub attempt_id: String,
     pub request_hash: String,
     pub context_hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deadline_unix_ms: Option<u64>,
+    pub request: WorkerRunRequest,
     pub execution: WorkerRunExecution,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRunRequest {
+    pub schema: String,
+    pub role: String,
+    pub capabilities: Vec<String>,
+    pub context: WorkerRunContext,
+    pub lifecycle: WorkerRunLifecycle,
+    pub result_contract: WorkerRunResultContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRunContext {
+    pub schema: String,
+    pub instruction: String,
+    pub repository_ref: String,
+    pub revision: String,
+    pub inputs: Vec<WorkerRunContextInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRunContextInput {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRunLifecycle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRunResultContract {
+    pub schema: String,
+    pub require_patch_for_code_changes: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerRunExecution {
     Deterministic {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<WorkerRunResultTemplate>,
     },
+    Harness {
+        harness: WorkerHarness,
+        profile: String,
+        model: String,
+        target_tag: String,
+        placement: crate::worker_placements::WorkerPlacementKind,
+        candidates: Vec<crate::worker_placements::WorkerPlacementCandidate>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerHarness {
+    Codex,
+    Claude,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -86,6 +144,8 @@ pub struct WorkerRunRecord {
     pub request_hash: String,
     pub context_hash: String,
     pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<WorkerRunMetadata>,
     pub state: WorkerRunState,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
@@ -104,6 +164,8 @@ pub struct WorkerRunResultTemplate {
     pub summary: String,
     pub change: WorkerRunChange,
     pub artifacts: Vec<WorkerRunArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<WorkerRunProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -176,4 +238,14 @@ pub struct WorkerRunProvenance {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerRunMetadata {
+    pub harness: WorkerHarness,
+    pub profile: String,
+    pub model: String,
+    pub target: String,
+    pub placement: String,
 }
