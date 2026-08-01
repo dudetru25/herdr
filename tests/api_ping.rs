@@ -3001,10 +3001,14 @@ fn real_local_worker_run_is_launched_and_supervised() {
         .unwrap()
         .to_string();
 
-    let attempt_id = format!("TASK-10.2:real-local-{harness}");
+    let attempt_id = format!("TASK-10.3:real-local-{harness}");
     let mut submit_params = serde_json::json!({
         "attempt_id": attempt_id,
-        "request": worker_request("Reply with the single word ok. Change nothing and run no tools."),
+        "request": worker_request(
+            "Create fixture.txt in the repository at your working directory containing exactly the \
+             single line ok, then publish your result manifest exactly as resultPublication \
+             instructs, with the patch bytes for that change written into the publication directory."
+        ),
         "execution": {
             "kind": "harness",
             "harness": harness,
@@ -3099,6 +3103,32 @@ fn real_local_worker_run_is_launched_and_supervised() {
         !terminal.is_null(),
         "the approved local worker run never reached a terminal state"
     );
+
+    // A worker that followed the stated publication contract succeeds with a
+    // hash-bound result; anything else is reported as the real outcome, never
+    // relaxed into a pass.
+    assert_eq!(
+        terminal["state"], "succeeded",
+        "the approved local worker did not publish an accepted result manifest: {terminal}"
+    );
+    let published = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "smoke_result",
+            "method": "worker.run.result",
+            "params": {"result_ref": terminal["result_ref"].as_str().unwrap()}
+        })
+        .to_string(),
+    );
+    println!("published: {}", serde_json::to_string(&published).unwrap());
+    let result = &published["result"]["result"];
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["runRef"], run_id);
+    let artifacts = result["artifacts"].as_array().unwrap();
+    assert!(!artifacts.is_empty());
+    for artifact in artifacts {
+        assert!(artifact["hash"].as_str().unwrap().starts_with("sha256:"));
+    }
 
     cleanup_spawned_herdr(child, base);
 }

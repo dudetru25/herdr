@@ -25,7 +25,7 @@ const RESULT_SCHEMA: &str = "skills-herdr-worker-result/v1";
 /// artifacts are resolved and hash-verified against real bytes below this root,
 /// and a harness worker publishes its result manifest here.
 const ARTIFACT_DIRECTORY: &str = "worker-run-artifacts";
-const HARNESS_RESULT_FILE: &str = "result.json";
+use crate::worker_adapters::WORKER_RESULT_MANIFEST_FILE as HARNESS_RESULT_FILE;
 
 /// The observed termination of a supervised harness process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1568,6 +1568,62 @@ mod tests {
         assert_eq!(result.status, WorkerRunResultStatus::Succeeded);
         assert_eq!(result.change.kind, WorkerRunChangeKind::Code);
         assert_eq!(result.artifacts[0].hash, hash_bytes(FIXTURE_PATCH));
+    }
+
+    /// A worker that ignores the publication location stated in its assignment
+    /// is a failed run: Herdr reads the manifest only from the artifact root it
+    /// owns, never from the worker's own choice of path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn manifest_published_outside_the_stated_location_fails_loud() {
+        let store = temp_store("harness-supervision-elsewhere");
+        let run = running_harness_run(&store, "attempt-harness-elsewhere");
+        let root = store.artifact_root("attempt-harness-elsewhere");
+        let elsewhere = root.parent().unwrap().join("worker-chosen-location");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("change.patch"), FIXTURE_PATCH).unwrap();
+        let template = WorkerRunResultTemplate {
+            summary: "approved local worker completed".into(),
+            change: WorkerRunChange {
+                kind: WorkerRunChangeKind::Code,
+                changed_files: vec!["src/lib.rs".into()],
+            },
+            artifacts: vec![WorkerRunArtifact {
+                kind: WorkerRunArtifactKind::Patch,
+                reference: "change.patch".into(),
+                hash: hash_bytes(FIXTURE_PATCH),
+                media_type: "text/x-diff".into(),
+            }],
+            provenance: None,
+        };
+        std::fs::write(
+            elsewhere.join(HARNESS_RESULT_FILE),
+            serde_json::to_vec(&template).unwrap(),
+        )
+        .unwrap();
+
+        let terminal = store
+            .complete_harness(
+                &run.run_id,
+                &WorkerHarnessTermination {
+                    success: true,
+                    status: "ExitStatus { code: 0, signal: None }".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(terminal.state, WorkerRunState::Failed);
+        assert!(terminal
+            .terminal_reason
+            .as_deref()
+            .unwrap()
+            .contains("without a readable result manifest"));
+        assert!(
+            store
+                .result(terminal.result_ref.as_deref().unwrap())
+                .unwrap()
+                .status
+                == WorkerRunResultStatus::Failed
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -28,6 +28,35 @@ impl WorkerAdapterError {
 /// provider-neutral request.
 pub const WORKER_ARTIFACT_DIR_ENV_VAR: &str = "HERDR_WORKER_ARTIFACT_DIR";
 
+/// Manifest file every approved worker publishes into its artifact directory.
+pub const WORKER_RESULT_MANIFEST_FILE: &str = "result.json";
+
+const ASSIGNMENT_SCHEMA: &str = "herdr-worker-assignment/v1";
+const PUBLICATION_SCHEMA: &str = "herdr-worker-result-publication/v1";
+
+/// Where and how the worker publishes its result manifest. Herdr owns every
+/// value here; none of it is read from the ambient environment or from the
+/// immutable provider-neutral request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerResultPublication {
+    schema: &'static str,
+    directory: String,
+    manifest_path: String,
+    manifest_schema: String,
+    instruction: String,
+}
+
+/// The exact payload one approved worker receives: the immutable Skills request
+/// plus the Herdr-owned location it must publish its result manifest into.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerAssignment<'a> {
+    schema: &'static str,
+    request: &'a WorkerRunRequest,
+    result_publication: WorkerResultPublication,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerLaunchSpec {
     pub run_id: String,
@@ -67,6 +96,21 @@ pub fn prepare_worker_launch(
     }
 
     let request_bytes = canonical_json_bytes(request)?;
+    let artifact_dir_value = artifact_dir.to_str().ok_or_else(|| {
+        WorkerAdapterError::new(
+            "worker_adapter_invalid",
+            "worker artifact directory is not valid utf-8",
+        )
+    })?;
+    let publication = result_publication(request, artifact_dir_value);
+    let assignment_bytes = canonical_json_bytes(&WorkerAssignment {
+        schema: ASSIGNMENT_SCHEMA,
+        request,
+        result_publication: publication,
+    })?;
+
+    // Each harness receives exactly the write authority its worker needs to
+    // publish into the Herdr-owned artifact directory, and nothing wider.
     let mut argv = match metadata.harness {
         WorkerHarness::Codex => vec![
             "codex".into(),
@@ -79,6 +123,18 @@ pub fn prepare_worker_launch(
             metadata.model.clone(),
             "--profile".into(),
             metadata.profile.clone(),
+            "--sandbox".into(),
+            "workspace-write".into(),
+            "--config".into(),
+            format!(
+                "sandbox_workspace_write.writable_roots=[{}]",
+                serde_json::to_string(artifact_dir_value).map_err(|error| {
+                    WorkerAdapterError::new(
+                        "worker_adapter_invalid",
+                        format!("serialize worker artifact directory: {error}"),
+                    )
+                })?
+            ),
         ],
         WorkerHarness::Claude => vec![
             "claude".into(),
@@ -91,22 +147,22 @@ pub fn prepare_worker_launch(
             metadata.model.clone(),
             "--agent".into(),
             metadata.profile.clone(),
+            // `--add-dir` is variadic, so it must never be the last flag before
+            // the payload or the payload is swallowed as another directory.
+            "--add-dir".into(),
+            artifact_dir_value.into(),
+            "--permission-mode".into(),
+            "auto".into(),
         ],
     };
-    argv.push(String::from_utf8(request_bytes.clone()).map_err(|error| {
+    argv.push(String::from_utf8(assignment_bytes).map_err(|error| {
         WorkerAdapterError::new(
             "worker_adapter_invalid",
-            format!("provider-neutral worker request is not utf-8: {error}"),
+            format!("worker assignment payload is not utf-8: {error}"),
         )
     })?);
 
     let mut environment = isolated_worker_environment()?;
-    let artifact_dir_value = artifact_dir.to_str().ok_or_else(|| {
-        WorkerAdapterError::new(
-            "worker_adapter_invalid",
-            "worker artifact directory is not valid utf-8",
-        )
-    })?;
     environment.push((
         WORKER_ARTIFACT_DIR_ENV_VAR.to_string(),
         artifact_dir_value.to_string(),
@@ -121,6 +177,32 @@ pub fn prepare_worker_launch(
         artifact_dir: artifact_dir.to_path_buf(),
         metadata: metadata.clone(),
     })
+}
+
+fn result_publication(request: &WorkerRunRequest, artifact_dir: &str) -> WorkerResultPublication {
+    let manifest_path = format!(
+        "{}/{WORKER_RESULT_MANIFEST_FILE}",
+        artifact_dir.trim_end_matches('/')
+    );
+    let patch_rule = if request.result_contract.require_patch_for_code_changes {
+        " A run that changes code must include one patch or diff artifact."
+    } else {
+        ""
+    };
+    WorkerResultPublication {
+        schema: PUBLICATION_SCHEMA,
+        directory: artifact_dir.to_string(),
+        manifest_path: manifest_path.clone(),
+        manifest_schema: request.result_contract.schema.clone(),
+        instruction: format!(
+            "Before exiting, write your result manifest as JSON to {manifest_path}. \
+             It must contain summary, change {{kind: none|code, changedFiles: [repository-relative paths]}}, \
+             and a non-empty artifacts list of {{kind, ref, hash, mediaType}} entries, where every patch or \
+             diff ref is a path relative to {artifact_dir} whose bytes you also write there and hash is \
+             sha256:<hex> of exactly those bytes.{patch_rule} \
+             Exiting successfully without a valid manifest at that path is recorded as a failed run."
+        ),
+    }
 }
 
 const WORKER_ENVIRONMENT_ALLOWLIST: [&str; 6] = [
@@ -358,7 +440,12 @@ mod tests {
             )
             .unwrap();
             assert_eq!(launch.request_bytes, request_before);
-            assert_eq!(launch.argv.last().unwrap().as_bytes(), request_before);
+            let payload: serde_json::Value =
+                serde_json::from_slice(launch.argv.last().unwrap().as_bytes()).unwrap();
+            assert_eq!(
+                canonical_json_bytes(&payload["request"]).unwrap(),
+                request_before
+            );
             assert_eq!(launch.metadata, metadata);
             assert_eq!(launch.cwd, placement().cwd);
             assert!(launch.environment.iter().all(|(key, _)| {
@@ -382,6 +469,92 @@ mod tests {
                 .any(|arg| arg == "opaque-model-under-test"));
             assert_eq!(canonical_json_bytes(&request).unwrap(), request_before);
         }
+    }
+
+    #[test]
+    fn worker_payload_states_the_herdr_owned_result_publication_location() {
+        let request = request();
+        for harness in [WorkerHarness::Codex, WorkerHarness::Claude] {
+            let metadata = WorkerRunMetadata {
+                harness,
+                profile: "profile-under-test".into(),
+                model: "opaque-model-under-test".into(),
+                target: "herdr-target:local-macos-primary".into(),
+                placement: "local-pane:workspace:1".into(),
+            };
+            let launch = prepare_worker_launch(
+                &request,
+                &metadata,
+                &placement(),
+                "worker-run:0123456789abcdef0123456789abcdef",
+                Path::new("/explicit/request/artifacts"),
+            )
+            .unwrap();
+            let payload: serde_json::Value =
+                serde_json::from_slice(launch.argv.last().unwrap().as_bytes()).unwrap();
+
+            // The worker learns the publication location from the payload itself.
+            let publication = &payload["resultPublication"];
+            assert_eq!(publication["directory"], "/explicit/request/artifacts");
+            assert_eq!(
+                publication["manifestPath"],
+                "/explicit/request/artifacts/result.json"
+            );
+            assert_eq!(
+                publication["manifestSchema"],
+                request.result_contract.schema.as_str()
+            );
+            assert!(publication["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("result.json"));
+
+            // The immutable hash-bound Skills request is carried unchanged.
+            assert_eq!(
+                launch.request_bytes,
+                canonical_json_bytes(&request).unwrap()
+            );
+            assert_eq!(
+                canonical_json_bytes(&payload["request"]).unwrap(),
+                launch.request_bytes
+            );
+
+            // The approved harness may write into exactly that directory.
+            assert!(launch
+                .argv
+                .iter()
+                .any(|argument| argument.contains("/explicit/request/artifacts")));
+
+            // A variadic flag directly before the payload would swallow it.
+            assert_ne!(launch.argv[launch.argv.len() - 2], "--add-dir");
+        }
+    }
+
+    #[test]
+    fn result_publication_location_is_never_inherited_from_the_ambient_environment() {
+        assert!(!WORKER_ENVIRONMENT_ALLOWLIST.contains(&WORKER_ARTIFACT_DIR_ENV_VAR));
+        let metadata = WorkerRunMetadata {
+            harness: WorkerHarness::Claude,
+            profile: "profile-under-test".into(),
+            model: "opaque-model-under-test".into(),
+            target: "herdr-target:local-macos-primary".into(),
+            placement: "local-pane:workspace:1".into(),
+        };
+        let launch = prepare_worker_launch(
+            &request(),
+            &metadata,
+            &placement(),
+            "worker-run:0123456789abcdef0123456789abcdef",
+            Path::new("/explicit/request/artifacts"),
+        )
+        .unwrap();
+        let published = launch
+            .environment
+            .iter()
+            .filter(|(key, _)| key == WORKER_ARTIFACT_DIR_ENV_VAR)
+            .collect::<Vec<_>>();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].1, "/explicit/request/artifacts");
     }
 
     #[test]
