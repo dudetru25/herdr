@@ -7,6 +7,7 @@ mod sidebar;
 mod sound;
 mod theme;
 
+#[allow(unused_imports)]
 pub use self::{
     io::{
         config_diagnostic_summary, config_dir, config_path, load_live_config,
@@ -23,7 +24,8 @@ pub use self::{
         ConfigReloadReport, ConfigReloadStatus, HostCursorModeConfig, MachineConfig,
         MachineLookupError, NewTerminalCwdConfig, ShellModeConfig, SidebarCollapsedModeConfig,
         ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
-        UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
+        UpdateChannelConfig, WorkerPlacementApprovalConfig, WorkerPlacementConfig,
+        WorkerPlacementKindConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,

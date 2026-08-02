@@ -13,6 +13,7 @@ use crate::api::schema::{
     WorkerRunResultManifest, WorkerRunResultStatus, WorkerRunResultTemplate, WorkerRunState,
     WorkerRunSubmissionDisposition, WorkerRunSubmitParams,
 };
+use crate::config::WorkerPlacementConfig;
 use crate::worker_adapters::{canonical_json_bytes, prepare_worker_launch, WorkerLaunchSpec};
 use crate::worker_placements::resolve_worker_placement;
 
@@ -105,9 +106,23 @@ impl WorkerRunStore {
         })
     }
 
+    #[allow(dead_code)]
     pub fn submit_with_initializer(
         &self,
         params: WorkerRunSubmitParams,
+        initialize: impl FnOnce(&WorkerLaunchSpec) -> Result<String, WorkerRunError>,
+    ) -> Result<(WorkerRunRecord, WorkerRunSubmissionDisposition), WorkerRunError> {
+        #[cfg(test)]
+        let approvals = test_approved_worker_placements();
+        #[cfg(not(test))]
+        let approvals = Vec::new();
+        self.submit_with_initializer_and_placements(params, &approvals, initialize)
+    }
+
+    pub fn submit_with_initializer_and_placements(
+        &self,
+        params: WorkerRunSubmitParams,
+        approved_placements: &[WorkerPlacementConfig],
         initialize: impl FnOnce(&WorkerLaunchSpec) -> Result<String, WorkerRunError>,
     ) -> Result<(WorkerRunRecord, WorkerRunSubmissionDisposition), WorkerRunError> {
         validate_submit(&params)?;
@@ -118,7 +133,12 @@ impl WorkerRunStore {
         ))?;
         let reserved_run_id = run_id(&params.attempt_id, &content_hash);
         let artifact_root = self.artifact_root(&params.attempt_id);
-        let prepared_launch = prepare_harness_launch(&params, &reserved_run_id, &artifact_root)?;
+        let prepared_launch = prepare_harness_launch(
+            &params,
+            &reserved_run_id,
+            &artifact_root,
+            approved_placements,
+        )?;
         if prepared_launch.is_some() {
             std::fs::create_dir_all(&artifact_root)
                 .map_err(|error| WorkerRunError::io("create worker artifact directory", error))?;
@@ -682,6 +702,7 @@ fn prepare_harness_launch(
     params: &WorkerRunSubmitParams,
     run_id: &str,
     artifact_dir: &Path,
+    approved_placements: &[WorkerPlacementConfig],
 ) -> Result<Option<WorkerLaunchSpec>, WorkerRunError> {
     let WorkerRunExecution::Harness {
         harness,
@@ -700,15 +721,25 @@ fn prepare_harness_launch(
             "worker placement candidates must contain at most 64 entries",
         ));
     }
-    let resolved = resolve_worker_placement(target_tag, *placement, candidates)
-        .map_err(crate::worker_adapters::WorkerAdapterError::from)
-        .map_err(|error| WorkerRunError::new(error.code, error.message))?;
+    let resolved = resolve_worker_placement(
+        target_tag,
+        *harness,
+        *placement,
+        candidates,
+        approved_placements,
+    )
+    .map_err(crate::worker_adapters::WorkerAdapterError::from)
+    .map_err(|error| WorkerRunError::new(error.code, error.message))?;
     let metadata = WorkerRunMetadata {
         harness: *harness,
         profile: profile.clone(),
         model: model.clone(),
         target: resolved.target_tag.clone(),
-        placement: format!("local-pane:{}", resolved.workspace_id),
+        placement: if resolved.kind.is_remote() {
+            format!("remote-pane:{}", resolved.workspace_id)
+        } else {
+            format!("local-pane:{}", resolved.workspace_id)
+        },
     };
     prepare_worker_launch(&params.request, &metadata, &resolved, run_id, artifact_dir)
         .map(Some)
@@ -1119,6 +1150,21 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
     (year, month, day)
+}
+
+#[cfg(test)]
+fn test_approved_worker_placements() -> Vec<WorkerPlacementConfig> {
+    vec![WorkerPlacementConfig {
+        target_tag: "herdr-target:local-macos-primary".into(),
+        kind: crate::config::WorkerPlacementKindConfig::LocalPane,
+        machine: None,
+        cwd: Some(env!("CARGO_MANIFEST_DIR").into()),
+        harnesses: vec!["codex".into(), "claude".into()],
+        approval: crate::config::WorkerPlacementApprovalConfig {
+            reference: "test:local-placement".into(),
+            approved_at: "2026-08-01T00:00:00Z".into(),
+        },
+    }]
 }
 
 #[cfg(test)]

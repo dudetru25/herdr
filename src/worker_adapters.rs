@@ -66,7 +66,10 @@ pub struct WorkerLaunchSpec {
     pub cwd: PathBuf,
     pub artifact_dir: PathBuf,
     pub metadata: WorkerRunMetadata,
+    pub resolved_placement: ResolvedWorkerPlacement,
 }
+
+pub(crate) const REMOTE_WORKER_ARTIFACT_MARKER: &str = "__HERDR_REMOTE_ARTIFACT_DIR__";
 
 pub fn prepare_worker_launch(
     request: &WorkerRunRequest,
@@ -176,7 +179,39 @@ pub fn prepare_worker_launch(
         cwd: placement.cwd.clone(),
         artifact_dir: artifact_dir.to_path_buf(),
         metadata: metadata.clone(),
+        resolved_placement: placement.clone(),
     })
+}
+
+/// Replace only Herdr-owned artifact paths in a prepared launch. The marker is
+/// expanded by the remote PowerShell bootstrap after it resolves the remote
+/// temp directory; request bytes and client environment values are unchanged.
+pub(crate) fn rewrite_worker_argv_for_remote(
+    launch: &WorkerLaunchSpec,
+) -> Result<Vec<String>, WorkerAdapterError> {
+    let local_artifact_dir = launch.artifact_dir.to_str().ok_or_else(|| {
+        WorkerAdapterError::new(
+            "worker_adapter_invalid",
+            "worker artifact directory is not valid utf-8",
+        )
+    })?;
+    let mut replaced = false;
+    let argv = launch
+        .argv
+        .iter()
+        .map(|argument| {
+            let updated = argument.replace(local_artifact_dir, REMOTE_WORKER_ARTIFACT_MARKER);
+            replaced |= updated != *argument;
+            updated
+        })
+        .collect::<Vec<_>>();
+    if !replaced {
+        return Err(WorkerAdapterError::new(
+            "worker_adapter_invalid",
+            "remote worker launch did not contain the Herdr artifact directory",
+        ));
+    }
+    Ok(argv)
 }
 
 fn result_publication(request: &WorkerRunRequest, artifact_dir: &str) -> WorkerResultPublication {
@@ -319,6 +354,14 @@ pub fn smoke_prerequisite(
     harness: WorkerHarness,
     placement: WorkerPlacementKind,
 ) -> WorkerSmokePrerequisite {
+    if placement.is_remote() {
+        return WorkerSmokePrerequisite {
+            harness,
+            placement,
+            status: WorkerSmokeStatus::Available,
+            reason: None,
+        };
+    }
     if placement != WorkerPlacementKind::LocalPane {
         return WorkerSmokePrerequisite {
             harness,
@@ -414,8 +457,11 @@ mod tests {
     fn placement() -> ResolvedWorkerPlacement {
         ResolvedWorkerPlacement {
             target_tag: "herdr-target:local-macos-primary".into(),
+            kind: WorkerPlacementKind::LocalPane,
             workspace_id: "workspace:1".into(),
             cwd: PathBuf::from("/explicit/request/worktree"),
+            machine: None,
+            approval_ref: "test:placement".into(),
         }
     }
 
@@ -609,19 +655,15 @@ mod tests {
     }
 
     #[test]
-    fn remote_smoke_is_an_explicit_unavailable_result_for_both_harnesses() {
+    fn remote_smoke_defers_harness_resolution_to_the_approved_remote_device() {
         for harness in [WorkerHarness::Codex, WorkerHarness::Claude] {
             let result = smoke_prerequisite(harness, WorkerPlacementKind::RemoteTemporary);
             assert_eq!(result.harness, harness);
-            assert_eq!(result.status, WorkerSmokeStatus::Unavailable);
-            assert!(!result.is_available());
-            assert!(result
-                .reason
-                .as_deref()
-                .unwrap()
-                .contains("no remote target is approved"));
+            assert_eq!(result.status, WorkerSmokeStatus::Available);
+            assert!(result.is_available());
+            assert!(result.reason.is_none());
             let json = serde_json::to_value(result).unwrap();
-            assert_eq!(json["status"], "unavailable");
+            assert_eq!(json["status"], "available");
             println!("{json}");
         }
     }
