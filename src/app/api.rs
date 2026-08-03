@@ -15,12 +15,29 @@ mod tabs;
 mod workspaces;
 mod worktrees;
 
-use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};
+use super::{
+    api_helpers::pane_agent_status, App, Mode, OverlayPaneState, SupervisedWorkerRun, ToastKind,
+};
 use crate::events::AppEvent;
 
 const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const WINDOWS_POWERSHELL_AGENT_EXIT_RESPAWN_GRACE: Duration = Duration::from_secs(2);
+
+fn remote_ssh_client_environment() -> Vec<(String, String)> {
+    // The remote worker itself receives a cleared environment and resolves its
+    // allowlisted values on the target. These are only the local SSH client's
+    // bootstrap values, needed to find `ssh` and its local authentication.
+    ["HOME", "PATH", "SSH_AUTH_SOCK", "USER", "LOGNAME"]
+        .into_iter()
+        .filter_map(|key| {
+            std::env::var_os(key)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| value.into_string().ok())
+                .map(|value| (key.to_string(), value))
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeExitAction {
@@ -34,9 +51,11 @@ impl App {
         id: String,
         params: crate::api::schema::WorkerRunSubmitParams,
     ) -> String {
+        let approved_placements = self.state.worker_placements.clone();
         match crate::worker_runs::WorkerRunStore::persistent()
-            .submit_with_initializer(params, |launch| self.initialize_worker_launch(launch))
-        {
+            .submit_with_initializer_and_placements(params, &approved_placements, |launch| {
+                self.initialize_worker_launch(launch)
+            }) {
             Ok((run, disposition)) => responses::encode_success(
                 id,
                 crate::api::schema::ResponseResult::WorkerRunSubmitted { run, disposition },
@@ -51,7 +70,7 @@ impl App {
     ) -> Result<String, crate::worker_runs::WorkerRunError> {
         let prerequisite = crate::worker_adapters::smoke_prerequisite(
             launch.metadata.harness,
-            crate::worker_placements::WorkerPlacementKind::LocalPane,
+            launch.resolved_placement.kind,
         );
         if !prerequisite.is_available() {
             return Err(crate::worker_runs::WorkerRunError::new(
@@ -61,36 +80,96 @@ impl App {
                     .unwrap_or_else(|| "selected worker harness is unavailable".into()),
             ));
         }
-        let workspace_id = launch
-            .metadata
-            .placement
-            .strip_prefix("local-pane:")
-            .ok_or_else(|| {
-                crate::worker_runs::WorkerRunError::new(
-                    "worker_placement_blocked",
-                    "resolved placement does not identify a local workspace",
-                )
-            })?;
+        let workspace_id = launch.resolved_placement.workspace_id.as_str();
         let ws_idx = self.parse_workspace_id(workspace_id).ok_or_else(|| {
             crate::worker_runs::WorkerRunError::new(
                 "worker_placement_unavailable",
-                format!("local workspace {workspace_id:?} is unavailable"),
+                format!("worker workspace {workspace_id:?} is unavailable"),
             )
         })?;
-        if self.state.workspaces[ws_idx].is_machine() {
+        let is_remote = launch.resolved_placement.kind.is_remote();
+        if is_remote != self.state.workspaces[ws_idx].is_machine() {
             return Err(crate::worker_runs::WorkerRunError::new(
                 "worker_placement_unavailable",
-                "remote machine workspaces are unavailable for worker placement",
+                if is_remote {
+                    "approved remote worker placement requires a machine workspace"
+                } else {
+                    "approved local worker placement cannot use a machine workspace"
+                },
             ));
         }
 
         let (rows, cols) = self.state.estimate_pane_size();
+        let (argv, cwd, environment, remote_target) = if is_remote {
+            let machine_name = launch
+                .resolved_placement
+                .machine
+                .as_deref()
+                .ok_or_else(|| {
+                    crate::worker_runs::WorkerRunError::new(
+                        "worker_placement_blocked",
+                        "approved remote placement has no machine binding",
+                    )
+                })?;
+            if self.state.workspaces[ws_idx].machine_name() != Some(machine_name) {
+                return Err(crate::worker_runs::WorkerRunError::new(
+                    "worker_placement_blocked",
+                    "worker workspace machine does not match the approved placement",
+                ));
+            }
+            let machine = self
+                .state
+                .machines
+                .iter()
+                .find(|machine| machine.name == machine_name)
+                .ok_or_else(|| {
+                    crate::worker_runs::WorkerRunError::new(
+                        "worker_placement_unavailable",
+                        format!("machine {machine_name:?} is not configured"),
+                    )
+                })?;
+            crate::remote::verify_remote_worker_prerequisites(
+                &machine.target,
+                &launch.resolved_placement.cwd,
+                launch.metadata.harness,
+            )
+            .map_err(|error| crate::worker_runs::WorkerRunError::new(error.code, error.message))?;
+            let remote_argv = crate::worker_adapters::rewrite_worker_argv_for_remote(launch)
+                .map_err(|error| {
+                    crate::worker_runs::WorkerRunError::new(error.code, error.message)
+                })?;
+            let ssh_argv = crate::remote::remote_worker_argv(
+                &machine.target,
+                &launch.resolved_placement.cwd,
+                &remote_argv,
+                &launch.run_id,
+            )
+            .map_err(|error| {
+                crate::worker_runs::WorkerRunError::new(
+                    "worker_placement_blocked",
+                    format!("failed to prepare remote worker command: {error}"),
+                )
+            })?;
+            (
+                ssh_argv,
+                self.state.workspaces[ws_idx].identity_cwd.clone(),
+                remote_ssh_client_environment(),
+                Some(machine.target.clone()),
+            )
+        } else {
+            (
+                launch.argv.clone(),
+                launch.cwd.clone(),
+                launch.environment.clone(),
+                None,
+            )
+        };
         let result = self.state.workspaces[ws_idx].create_tab_isolated_argv_command(
             rows.max(4),
             cols.max(10),
-            launch.cwd.clone(),
-            &launch.argv,
-            launch.environment.clone(),
+            cwd,
+            &argv,
+            environment,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
             self.state.host_terminal_appearance,
@@ -99,7 +178,7 @@ impl App {
             crate::worker_runs::WorkerRunError::new(
                 "worker_harness_unavailable",
                 format!(
-                    "{} worker failed to initialize in the approved local pane: {error}",
+                    "{} worker failed to initialize in the approved pane: {error}",
                     match launch.metadata.harness {
                         crate::api::schema::WorkerHarness::Codex => "codex",
                         crate::api::schema::WorkerHarness::Claude => "claude",
@@ -111,8 +190,14 @@ impl App {
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.terminals.insert(terminal.id.clone(), terminal);
         let pane_id = self.state.workspaces[ws_idx].tabs[tab_idx].root_pane;
-        self.supervised_worker_runs
-            .insert(pane_id, (terminal_id, launch.run_id.clone()));
+        self.supervised_worker_runs.insert(
+            pane_id,
+            SupervisedWorkerRun {
+                terminal_id,
+                run_id: launch.run_id.clone(),
+                remote_target,
+            },
+        );
         self.state.remove_alias_shadowed_by_new_pane(pane_id);
         let public_pane_id = self.public_pane_id(ws_idx, pane_id).ok_or_else(|| {
             crate::worker_runs::WorkerRunError::new(
@@ -120,19 +205,23 @@ impl App {
                 "initialized worker pane has no public identity",
             )
         })?;
-        Ok(format!("local-pane:{public_pane_id}"))
+        Ok(if is_remote {
+            format!("remote-pane:{public_pane_id}")
+        } else {
+            format!("local-pane:{public_pane_id}")
+        })
     }
 
     /// Supervise one approved worker pane: its observed termination drives the
     /// run to an explicit terminal state. A pane that died without an observed
     /// exit status is reported as an unsuccessful termination, never ignored.
     fn complete_supervised_worker_run(&mut self, pane_id: crate::layout::PaneId) {
-        let Some((terminal_id, run_id)) = self.supervised_worker_runs.remove(&pane_id) else {
+        let Some(supervised) = self.supervised_worker_runs.remove(&pane_id) else {
             return;
         };
-        let termination = self
+        let mut termination = self
             .terminal_runtimes
-            .get(&terminal_id)
+            .get(&supervised.terminal_id)
             .and_then(|runtime| runtime.exit_observation())
             .map(|observation| crate::worker_runs::WorkerHarnessTermination {
                 success: observation.success,
@@ -142,11 +231,37 @@ impl App {
                 success: false,
                 status: "the approved worker pane died without an observed exit status".into(),
             });
-        if let Err(error) =
-            crate::worker_runs::WorkerRunStore::persistent().complete_harness(&run_id, &termination)
+        if let Some(target) = supervised.remote_target {
+            let store = crate::worker_runs::WorkerRunStore::persistent();
+            match store.get(&supervised.run_id) {
+                Ok(run) => {
+                    if let Err(error) = crate::remote::fetch_remote_worker_artifacts(
+                        &target,
+                        &supervised.run_id,
+                        &store.artifact_root(&run.attempt_id),
+                    ) {
+                        termination = crate::worker_runs::WorkerHarnessTermination {
+                            success: false,
+                            status: format!("remote worker artifact fetch failed: {error}"),
+                        };
+                    }
+                }
+                Err(error) => {
+                    termination = crate::worker_runs::WorkerHarnessTermination {
+                        success: false,
+                        status: format!(
+                            "remote worker run could not be read before artifact fetch: {}",
+                            error.message
+                        ),
+                    };
+                }
+            }
+        }
+        if let Err(error) = crate::worker_runs::WorkerRunStore::persistent()
+            .complete_harness(&supervised.run_id, &termination)
         {
             tracing::error!(
-                run = %run_id,
+                run = %supervised.run_id,
                 code = error.code,
                 err = %error.message,
                 "failed to record the supervised worker run terminal state"

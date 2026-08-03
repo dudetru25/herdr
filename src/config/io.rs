@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use super::{
-    model::{validate_machines, LoadedConfig, MachineConfigValidationError},
-    Config, MachineConfig, CONFIG_PATH_ENV_VAR,
+    model::{
+        validate_machines, validate_worker_placements, LoadedConfig, MachineConfigValidationError,
+    },
+    Config, MachineConfig, WorkerPlacementConfig, CONFIG_PATH_ENV_VAR,
 };
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
@@ -12,6 +14,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "experimental",
     "keys",
     "machines",
+    "worker_placements",
     "onboarding",
     "remote",
     "session",
@@ -326,6 +329,12 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     load_live_machine_section(table, &mut diagnostics, &mut invalid_sections, |machines| {
         config.machines = machines
     });
+    load_live_worker_placement_section(
+        table,
+        &mut diagnostics,
+        &mut invalid_sections,
+        |placements| config.worker_placements = placements,
+    );
     load_live_section(
         table,
         "session",
@@ -605,6 +614,43 @@ fn load_live_machine_section(
                 "invalid machine config: {err}; keeping current machines settings"
             ));
             invalid_sections.push("machines".to_string());
+        }
+    }
+}
+
+fn load_live_worker_placement_section(
+    table: &toml::map::Map<String, toml::Value>,
+    diagnostics: &mut Vec<String>,
+    invalid_sections: &mut Vec<String>,
+    apply: impl FnOnce(Vec<WorkerPlacementConfig>),
+) {
+    let Some(value) = table.get("worker_placements") else {
+        return;
+    };
+    let parsed: Result<(Vec<WorkerPlacementConfig>, Vec<Vec<ConfigKeyPathSegment>>), _> =
+        deserialize_with_ignored(value.clone());
+
+    match parsed {
+        Ok((placements, ignored_keys)) => match validate_worker_placements(&placements) {
+            Ok(()) => {
+                diagnostics.extend(unknown_config_key_diagnostics(
+                    ignored_keys,
+                    Some("worker_placements"),
+                ));
+                apply(placements);
+            }
+            Err(err) => {
+                diagnostics.push(format!(
+                    "invalid worker placement config: {err}; keeping current worker placements"
+                ));
+                invalid_sections.push("worker_placements".to_string());
+            }
+        },
+        Err(err) => {
+            diagnostics.push(format!(
+                "invalid worker placement config: {err}; keeping current worker placements"
+            ));
+            invalid_sections.push("worker_placements".to_string());
         }
     }
 }

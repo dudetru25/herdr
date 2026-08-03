@@ -101,8 +101,7 @@ pub struct App {
     /// Panes hosting an approved worker run. Herdr supervises each launched
     /// harness so its termination drives one explicit terminal run state
     /// instead of leaving the run Running forever.
-    pub(crate) supervised_worker_runs:
-        HashMap<crate::layout::PaneId, (crate::terminal::TerminalId, String)>,
+    pub(crate) supervised_worker_runs: HashMap<crate::layout::PaneId, SupervisedWorkerRun>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -155,6 +154,13 @@ pub struct App {
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SupervisedWorkerRun {
+    pub(crate) terminal_id: crate::terminal::TerminalId,
+    pub(crate) run_id: String,
+    pub(crate) remote_target: Option<String>,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -658,6 +664,7 @@ impl App {
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
             machines: config.machines.clone(),
+            worker_placements: config.worker_placements.clone(),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -1601,6 +1608,10 @@ impl App {
                         .min(machines.len() + 1 + usize::from(machines.is_empty()));
                 }
             }
+        }
+
+        if !invalid_section("worker_placements") {
+            self.state.worker_placements = config.worker_placements.clone();
         }
 
         if !invalid_section("worktrees") {

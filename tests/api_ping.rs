@@ -88,6 +88,22 @@ fn spawn_herdr(config_home: &Path, runtime_dir: &Path, socket_path: &Path) -> Sp
     spawn_herdr_with_options(config_home, runtime_dir, socket_path, None, "/bin/sh")
 }
 
+fn spawn_herdr_with_worker_config(
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_path: &Path,
+    worker_config: &str,
+) -> SpawnedHerdr {
+    spawn_herdr_with_options_and_config(
+        config_home,
+        runtime_dir,
+        socket_path,
+        None,
+        "/bin/sh",
+        worker_config,
+    )
+}
+
 fn spawn_herdr_with_path(
     config_home: &Path,
     runtime_dir: &Path,
@@ -120,12 +136,30 @@ fn spawn_herdr_with_options(
     path_override: Option<&Path>,
     shell: &str,
 ) -> SpawnedHerdr {
+    spawn_herdr_with_options_and_config(
+        config_home,
+        runtime_dir,
+        socket_path,
+        path_override,
+        shell,
+        "",
+    )
+}
+
+fn spawn_herdr_with_options_and_config(
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_path: &Path,
+    path_override: Option<&Path>,
+    shell: &str,
+    worker_config: &str,
+) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join("herdr")).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
         config_home.join("herdr/config.toml"),
-        "onboarding = false\n",
+        format!("onboarding = false\n{worker_config}"),
     )
     .unwrap();
 
@@ -142,6 +176,7 @@ fn spawn_herdr_with_options(
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    cmd.env("HERDR_CONFIG_PATH", config_home.join("herdr/config.toml"));
     cmd.env("HERDR_SOCKET_PATH", socket_path);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", shell);
@@ -2985,7 +3020,22 @@ fn real_local_worker_run_is_launched_and_supervised() {
         "scratch worker checkout must be a repository"
     );
 
-    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    let worker_config = format!(
+        r#"
+[[worker_placements]]
+target_tag = "herdr-target:local-macos-primary"
+kind = "local_pane"
+cwd = {cwd:?}
+harnesses = ["codex", "claude"]
+
+[worker_placements.approval]
+reference = "TASK-10:approved-local-smoke"
+approved_at = "2026-08-02"
+"#,
+        cwd = repository.to_string_lossy()
+    );
+    let child =
+        spawn_herdr_with_worker_config(&config_home, &runtime_dir, &socket_path, &worker_config);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
@@ -3115,6 +3165,224 @@ fn real_local_worker_run_is_launched_and_supervised() {
         &socket_path,
         &serde_json::json!({
             "id": "smoke_result",
+            "method": "worker.run.result",
+            "params": {"result_ref": terminal["result_ref"].as_str().unwrap()}
+        })
+        .to_string(),
+    );
+    println!("published: {}", serde_json::to_string(&published).unwrap());
+    let result = &published["result"]["result"];
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["runRef"], run_id);
+    let artifacts = result["artifacts"].as_array().unwrap();
+    assert!(!artifacts.is_empty());
+    for artifact in artifacts {
+        assert!(artifact["hash"].as_str().unwrap().starts_with("sha256:"));
+    }
+
+    cleanup_spawned_herdr(child, base);
+}
+
+/// Real approved-remote smoke evidence. The target, machine binding, and
+/// Windows checkout are supplied by the governed TASK-10 approval at execution
+/// time rather than compiled into Herdr. This test is intentionally ignored:
+/// it launches a real Claude or Codex worker over SSH and consumes harness
+/// credentials and model quota.
+///
+/// ```text
+/// HERDR_REMOTE_SMOKE_HARNESS=claude HERDR_REMOTE_SMOKE_MODEL=claude-opus-5 \
+/// HERDR_REMOTE_SMOKE_PROFILE=claude \
+/// HERDR_REMOTE_SMOKE_TARGET=RUG-DEV-3-WIN \
+/// HERDR_REMOTE_SMOKE_MACHINE=rug-dev-3 \
+/// HERDR_REMOTE_SMOKE_TARGET_TAG=herdr-target:rug-dev-3-win \
+/// HERDR_REMOTE_SMOKE_CWD='G:\\GithubProjects\\agent-ide-lab' \
+///   cargo nextest run --locked --run-ignored only \
+///   -E 'test(real_approved_remote_worker_run_is_launched_and_supervised)'
+/// ```
+#[test]
+#[ignore = "launches a real approved remote worker; run explicitly to capture smoke evidence"]
+fn real_approved_remote_worker_run_is_launched_and_supervised() {
+    fn required(variable: &str) -> String {
+        std::env::var(variable)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| panic!("{variable} must name the approved remote worker input"))
+    }
+
+    let _lock = test_lock();
+    let harness = required("HERDR_REMOTE_SMOKE_HARNESS");
+    assert!(
+        harness == "codex" || harness == "claude",
+        "HERDR_REMOTE_SMOKE_HARNESS must be codex or claude, not {harness:?}"
+    );
+    let model = required("HERDR_REMOTE_SMOKE_MODEL");
+    let profile = required("HERDR_REMOTE_SMOKE_PROFILE");
+    let target = required("HERDR_REMOTE_SMOKE_TARGET");
+    let machine = required("HERDR_REMOTE_SMOKE_MACHINE");
+    let target_tag = required("HERDR_REMOTE_SMOKE_TARGET_TAG");
+    let remote_cwd = required("HERDR_REMOTE_SMOKE_CWD");
+
+    let worker_config = format!(
+        r#"
+[[machines]]
+name = {machine:?}
+target = {target:?}
+
+[[worker_placements]]
+target_tag = {target_tag:?}
+kind = "remote"
+machine = {machine:?}
+cwd = {remote_cwd:?}
+harnesses = ["codex", "claude"]
+
+[worker_placements.approval]
+reference = "TASK-10:approved-remote-rug-dev-3-win"
+approved_at = "2026-08-02"
+"#,
+        machine = machine,
+        target = target,
+        target_tag = target_tag,
+        remote_cwd = remote_cwd,
+    );
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let child =
+        spawn_herdr_with_worker_config(&config_home, &runtime_dir, &socket_path, &worker_config);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "remote_smoke_workspace",
+            "method": "workspace.create",
+            "params": {"machine": machine, "focus": true}
+        })
+        .to_string(),
+    );
+    assert_eq!(created["result"]["type"], "workspace_created");
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let attempt_id = format!(
+        "TASK-10.4:real-remote-{harness}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    );
+    let mut submit_params = serde_json::json!({
+        "attempt_id": attempt_id,
+        "request": worker_request(
+            "Create fixture.txt in the approved remote repository at your working directory containing exactly the single line ok, then publish your result manifest exactly as resultPublication instructs, with the patch bytes for that change written into the publication directory."
+        ),
+        "execution": {
+            "kind": "harness",
+            "harness": harness,
+            "profile": profile,
+            "model": model,
+            "target_tag": target_tag,
+            "placement": "remote",
+            "candidates": [{
+                "target_tag": target_tag,
+                "kind": "remote",
+                "workspace_id": workspace_id,
+                "cwd": remote_cwd,
+                "availability": {"status": "available"}
+            }]
+        }
+    });
+    bind_worker_hashes(&mut submit_params);
+    let submitted = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "remote_smoke_submit",
+            "method": "worker.run.submit",
+            "params": submit_params
+        })
+        .to_string(),
+    );
+    println!("submitted: {}", serde_json::to_string(&submitted).unwrap());
+    assert_eq!(submitted["result"]["type"], "worker_run_submitted");
+    let run = &submitted["result"]["run"];
+    assert_eq!(run["state"], "running");
+    assert_eq!(run["metadata"]["harness"], harness);
+    assert_eq!(run["metadata"]["model"], model);
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+    let pane_id = run["metadata"]["placement"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("remote-pane:")
+        .expect("remote run must expose a remote-pane identity")
+        .to_string();
+
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut terminal = serde_json::Value::Null;
+    let mut pane_text = String::new();
+    while Instant::now() < deadline {
+        let pane = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "remote_smoke_pane_read",
+                "method": "pane.read",
+                "params": {"pane_id": pane_id, "source": "recent", "lines": 200, "strip_ansi": true}
+            })
+            .to_string(),
+        );
+        if let Some(text) = pane["result"]["read"]["text"].as_str() {
+            pane_text = text.to_string();
+        }
+        let observed = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "remote_smoke_get",
+                "method": "worker.run.get",
+                "params": {"run_id": run_id}
+            })
+            .to_string(),
+        );
+        let state = observed["result"]["run"]["state"].as_str().unwrap_or("");
+        if state != "submitted" && state != "running" {
+            terminal = observed["result"]["run"].clone();
+            break;
+        }
+        assert!(
+            pane["error"].is_null(),
+            "reading the approved remote worker pane failed: {pane}"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "harness": harness,
+            "model": model,
+            "profile": profile,
+            "target": target,
+            "machine": machine,
+            "targetTag": target_tag,
+            "remoteCwd": remote_cwd,
+            "workspaceId": workspace_id,
+            "terminalRun": terminal,
+            "paneOutput": pane_text,
+        })
+    );
+    assert!(
+        !terminal.is_null(),
+        "the approved remote worker run never reached a terminal state"
+    );
+    assert_eq!(
+        terminal["state"], "succeeded",
+        "the approved remote worker did not publish an accepted result manifest: {terminal}"
+    );
+    let published = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "remote_smoke_result",
             "method": "worker.run.result",
             "params": {"result_ref": terminal["result_ref"].as_str().unwrap()}
         })

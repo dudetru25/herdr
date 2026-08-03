@@ -102,6 +102,35 @@ Use the picker, `herdr workspace create --machine build`, or `workspace.create` 
 
 `herdr server reload-config` replaces the live machine registry for future pane launches. Existing SSH panes are unchanged. Removing or renaming a machine causes subsequent pane, tab, and restore launches bound to its old name to fail instead of falling back to a local shell.
 
+## Approved worker placements
+
+Worker placements are an explicit approval registry for worker runs. Each entry binds a stable target tag to a placement kind, working directory, authorized harnesses, and an approval record. The registry is intentionally an open-ended array, so the individual entries are documented here instead of as flat rows in the [Config reference](/docs/config-reference/).
+
+```toml
+[[worker_placements]]
+target_tag = "herdr-target:local-macos-primary"
+kind = "local_pane"
+cwd = "/Users/you/src/herdr"
+harnesses = ["codex", "claude"]
+
+[worker_placements.approval]
+reference = "TASK-10:local"
+approved_at = "2026-08-02"
+
+[[worker_placements]]
+target_tag = "herdr-target:remote-build"
+kind = "remote"
+machine = "build"
+cwd = "/home/you/src/herdr"
+harnesses = ["codex"]
+
+[worker_placements.approval]
+reference = "TASK-10:remote-build"
+approved_at = "2026-08-02"
+```
+
+`target_tag` must be unique and non-empty. `kind` may be `local_pane`, `remote`, `remote_temporary`, or `temporary_subspace`. Remote kinds require a configured `machine`; all entries require a non-empty `cwd`, at least one of the supported harnesses (`codex` or `claude`), and a non-empty approval `reference` and `approved_at` value. Herdr validates the registry before using it and rejects duplicate targets, unsupported harnesses, or mismatched local and remote fields.
+
 ## Worktrees
 
 Set the root directory Herdr uses for Git worktree checkouts created from the sidebar:

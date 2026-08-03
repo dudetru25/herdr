@@ -250,6 +250,129 @@ pub struct MachineConfig {
     pub cwd: Option<String>,
 }
 
+/// The placement kinds that may be explicitly approved in config.toml.
+/// Runtime worker placement uses the API schema enum; keeping the config enum
+/// here avoids making the config parser depend on request parsing details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerPlacementKindConfig {
+    LocalPane,
+    Remote,
+    RemoteTemporary,
+    TemporarySubspace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerPlacementApprovalConfig {
+    pub reference: String,
+    pub approved_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerPlacementConfig {
+    pub target_tag: String,
+    pub kind: WorkerPlacementKindConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub harnesses: Vec<String>,
+    pub approval: WorkerPlacementApprovalConfig,
+}
+
+pub(super) fn validate_worker_placements(
+    placements: &[WorkerPlacementConfig],
+) -> Result<(), String> {
+    let mut target_tags = BTreeSet::new();
+    for (index, placement) in placements.iter().enumerate() {
+        let target_tag = placement.target_tag.trim();
+        if target_tag.is_empty() {
+            return Err(format!(
+                "worker_placements[{index}].target_tag must not be empty"
+            ));
+        }
+        if !target_tags.insert(target_tag) {
+            return Err(format!(
+                "worker placement target tag {target_tag:?} must be unique"
+            ));
+        }
+        if placement.harnesses.is_empty() {
+            return Err(format!(
+                "worker placement {target_tag:?} must authorize at least one harness"
+            ));
+        }
+        let mut harnesses = BTreeSet::new();
+        for harness in &placement.harnesses {
+            let harness = harness.trim();
+            if !matches!(harness, "codex" | "claude") {
+                return Err(format!(
+                    "worker placement {target_tag:?} authorizes unsupported harness {harness:?}"
+                ));
+            }
+            if !harnesses.insert(harness) {
+                return Err(format!(
+                    "worker placement {target_tag:?} lists harness {harness:?} more than once"
+                ));
+            }
+        }
+        if placement.approval.reference.trim().is_empty() {
+            return Err(format!(
+                "worker placement {target_tag:?} approval.reference must not be empty"
+            ));
+        }
+        if placement.approval.approved_at.trim().is_empty() {
+            return Err(format!(
+                "worker placement {target_tag:?} approval.approved_at must not be empty"
+            ));
+        }
+
+        let remote = matches!(
+            placement.kind,
+            WorkerPlacementKindConfig::Remote
+                | WorkerPlacementKindConfig::RemoteTemporary
+                | WorkerPlacementKindConfig::TemporarySubspace
+        );
+        if remote
+            && placement
+                .machine
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(format!(
+                "worker placement {target_tag:?} requires a non-empty machine"
+            ));
+        }
+        if !remote && placement.machine.is_some() {
+            return Err(format!(
+                "local worker placement {target_tag:?} must not name a machine"
+            ));
+        }
+        if placement
+            .cwd
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(format!(
+                "worker placement {target_tag:?} requires a non-empty cwd"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn deserialize_worker_placements<'de, D>(
+    deserializer: D,
+) -> Result<Vec<WorkerPlacementConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let placements = Vec::<WorkerPlacementConfig>::deserialize(deserializer)?;
+    validate_worker_placements(&placements).map_err(de::Error::custom)?;
+    Ok(placements)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineConfigValidationError {
     EmptyName { index: usize },
@@ -434,6 +557,8 @@ pub struct Config {
     pub terminal: TerminalConfig,
     #[serde(deserialize_with = "deserialize_machines")]
     pub machines: Vec<MachineConfig>,
+    #[serde(deserialize_with = "deserialize_worker_placements")]
+    pub worker_placements: Vec<WorkerPlacementConfig>,
     pub session: SessionConfig,
     pub update: UpdateConfig,
     pub keys: KeysConfig,
@@ -1351,6 +1476,95 @@ target = "two"
         for (toml, expected) in cases {
             let error = toml::from_str::<Config>(toml).expect_err("invalid machine registry");
             assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn worker_placement_registry_parses_explicit_local_and_remote_approvals() {
+        let config: Config = toml::from_str(
+            r#"
+[[worker_placements]]
+target_tag = "herdr-target:local-macos-primary"
+kind = "local_pane"
+cwd = "/tmp/checkout"
+harnesses = ["codex", "claude"]
+
+[worker_placements.approval]
+reference = "TASK-10:local"
+approved_at = "2026-08-02"
+
+[[worker_placements]]
+target_tag = "herdr-target:rug-dev-3-win"
+kind = "remote"
+machine = "rug-dev-3"
+cwd = "G:\\GithubProjects\\agent-ide-lab"
+harnesses = ["claude", "codex"]
+
+[worker_placements.approval]
+reference = "TASK-10:remote-rug-dev-3-win"
+approved_at = "2026-08-02"
+"#,
+        )
+        .expect("explicit worker placements should parse");
+
+        assert_eq!(config.worker_placements.len(), 2);
+        assert_eq!(
+            config.worker_placements[0].kind,
+            WorkerPlacementKindConfig::LocalPane
+        );
+        assert_eq!(
+            config.worker_placements[1].machine.as_deref(),
+            Some("rug-dev-3")
+        );
+        assert_eq!(
+            config.worker_placements[1].cwd.as_deref(),
+            Some(r"G:\GithubProjects\agent-ide-lab")
+        );
+    }
+
+    #[test]
+    fn worker_placement_registry_rejects_unsafe_entries() {
+        let cases = [
+            (
+                r#"[[worker_placements]]
+target_tag = "duplicate"
+kind = "local_pane"
+cwd = "/tmp/one"
+harnesses = ["codex"]
+[worker_placements.approval]
+reference = "one"
+approved_at = "today"
+
+[[worker_placements]]
+target_tag = "duplicate"
+kind = "local_pane"
+cwd = "/tmp/two"
+harnesses = ["claude"]
+[worker_placements.approval]
+reference = "two"
+approved_at = "today"
+"#,
+                "must be unique",
+            ),
+            (
+                r#"[[worker_placements]]
+target_tag = "remote"
+kind = "remote"
+cwd = "G:\\checkout"
+harnesses = ["unknown"]
+[worker_placements.approval]
+reference = "remote"
+approved_at = "today"
+"#,
+                "unsupported harness",
+            ),
+        ];
+
+        for (document, expected) in cases {
+            let error = toml::from_str::<Config>(document)
+                .expect_err("unsafe worker placement should be rejected")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
         }
     }
 
