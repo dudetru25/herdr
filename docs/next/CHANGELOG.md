@@ -5,6 +5,7 @@
 ### Added
 - Added `ui.pane_scrollbars = false` to hide terminal pane scrollbars and reclaim their reserved column.
 - Added `ui.tab_bar_position = "bottom"` to place the desktop tab row below terminal panes.
+- Added configured SSH machine spaces with `[[machines]]`, `herdr machine list`, the neutral `machine.add` socket API, `workspace.create` machine selection, and `herdr workspace create --machine NAME`. Right-clicking New offers Local, configured machines, and an Add remote machine form that validates and saves a name, SSH target, and optional remote working directory before opening the machine, without probing connectivity first; left-clicking creates a Local workspace immediately.
 
 ### Changed
 - Experimental options are no longer exposed in the Settings TUI and remain available through the config file.
@@ -26,6 +27,8 @@
 - Agent prompts now wait briefly after sending text before pressing Enter, preventing prompts from remaining in agent composers without starting a turn. (#1878)
 - Empty clipboard writes from pane applications no longer erase existing clipboard contents or show a copied confirmation. (#1893)
 - Plain mouse movement no longer triggers continuous full renders while preserving Herdr menu hover and pane application mouse tracking. (#1865)
+- macOS `Cmd+V` now uses one paste path for text and image-only clipboards in supported terminals, including direct terminal attach, while preserving each child application's bracketed-paste mode.
+- Local reloads now install a fresh executable inode before live handoff, preventing macOS from killing later launches after a running binary was overwritten in place.
 - `ui.copy_on_select = false` now retains drag and double-click word selections without copying; `Ctrl+C`, or `Cmd+C` when the host terminal forwards it, copies and clears the selection.
 - Pane and agent read responses now report `truncated: true` when older terminal rows were omitted. (#1717)
 - Pane applications that query OSC 4 palette colors now inherit the host terminal palette. (#1752)

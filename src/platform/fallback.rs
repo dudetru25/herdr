@@ -1,10 +1,14 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{ClipboardImage, ForegroundJob, Signal};
 
 /// Unsupported platform stub.
 pub fn raise_server_nofile_limit() {}
+
+pub(crate) fn replace_file_platform(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
+}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false

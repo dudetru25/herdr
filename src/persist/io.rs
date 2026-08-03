@@ -20,13 +20,23 @@ fn session_history_path() -> PathBuf {
 // excludes the dangling-symlink case stow users hit on the very first save.
 fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
     let mut current = path.to_path_buf();
-    for _ in 0..16 {
+    for followed in 0..=16 {
         let meta = match std::fs::symlink_metadata(&current) {
             Ok(meta) => meta,
-            Err(_) => return Ok(current),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(err) => return Err(err),
         };
         if !meta.file_type().is_symlink() {
             return Ok(current);
+        }
+        if followed == 16 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "session symlink resolution exceeded 16 links at {}",
+                    current.display()
+                ),
+            ));
         }
         let link = std::fs::read_link(&current)?;
         current = if link.is_absolute() {
@@ -38,7 +48,7 @@ fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
                 .join(link)
         };
     }
-    Ok(current)
+    unreachable!("bounded session symlink resolution always returns")
 }
 
 pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
@@ -336,5 +346,50 @@ mod tests {
             .file_type()
             .is_symlink());
         assert!(target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_path_refuses_symlink_chain_beyond_limit() {
+        let session = temp_session_path("overlong-symlink");
+        let dir = session.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        let target = dir.join("real.json");
+        let link = dir.join("link-0.json");
+        for index in 0..=16 {
+            let current = dir.join(format!("link-{index}.json"));
+            let next = if index == 16 {
+                target.clone()
+            } else {
+                dir.join(format!("link-{}.json", index + 1))
+            };
+            std::os::unix::fs::symlink(next, current).unwrap();
+        }
+
+        let err = save_to_path(&link, &empty_snapshot()).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(std::fs::symlink_metadata(dir.join("link-16.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_write_target_propagates_metadata_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let session = temp_session_path("metadata-error");
+        let blocked_dir = session.parent().unwrap();
+        std::fs::create_dir_all(blocked_dir).unwrap();
+        std::fs::set_permissions(blocked_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = resolve_write_target(&session);
+
+        std::fs::set_permissions(blocked_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

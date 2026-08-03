@@ -6,7 +6,8 @@ use ratatui::layout::Rect;
 use crate::{
     app::{
         state::{
-            AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode, NavigatorStateFilter,
+            AppState, ContextMenuKind, ContextMenuState, MachineCreateField, MachineCreateState,
+            MenuListState, Mode, NavigatorStateFilter,
         },
         App,
     },
@@ -456,6 +457,47 @@ pub(super) fn leave_modal(state: &mut AppState) {
     }
 }
 
+pub(super) fn open_add_remote_machine(state: &mut AppState) {
+    state.context_menu = None;
+    state.machine_create = Some(MachineCreateState::default());
+    state.mode = Mode::AddRemoteMachine;
+}
+
+fn cancel_add_remote_machine(state: &mut AppState) {
+    state.machine_create = None;
+    leave_modal(state);
+}
+
+fn machine_create_input_mut(create: &mut MachineCreateState) -> &mut String {
+    match create.focused {
+        MachineCreateField::Name => &mut create.name,
+        MachineCreateField::Target => &mut create.target,
+        MachineCreateField::Cwd => &mut create.cwd,
+    }
+}
+
+fn insert_machine_create_text(state: &mut AppState, text: &str) -> bool {
+    let Some(create) = state.machine_create.as_mut() else {
+        return false;
+    };
+    machine_create_input_mut(create).push_str(text);
+    create.error = None;
+    true
+}
+
+fn machine_add_response(response: &str) -> Result<String, String> {
+    if let Ok(success) = serde_json::from_str::<crate::api::schema::SuccessResponse>(response) {
+        return match success.result {
+            crate::api::schema::ResponseResult::MachineAdded { machine } => Ok(machine.name),
+            _ => Err("Herdr returned an unexpected response while adding the machine.".into()),
+        };
+    }
+    if let Ok(error) = serde_json::from_str::<crate::api::schema::ErrorResponse>(response) {
+        return Err(error.error.message);
+    }
+    Err("Herdr could not read the response while adding the machine.".into())
+}
+
 pub(super) const ONBOARDING_WELCOME_ACTIONS: &[ModalActionSpec<ModalAction>] = &[ModalActionSpec {
     action: ModalAction::Continue,
     bindings: &[ModalKeyBinding::Enter],
@@ -766,8 +808,20 @@ pub(super) fn apply_context_menu_action(
     menu: ContextMenuState,
     idx: usize,
 ) {
-    let item = menu.items().get(idx).copied();
-    match (menu.kind, item) {
+    if let ContextMenuKind::WorkspaceCreateTarget { machines } = &menu.kind {
+        if idx == 0 {
+            state.request_new_workspace = true;
+        } else if let Some(machine) = machines.get(idx - 1) {
+            state.request_new_workspace_machine = Some(machine.clone());
+        } else if idx == machines.len() + 1 + usize::from(machines.is_empty()) {
+            open_add_remote_machine(state);
+            return;
+        }
+        leave_modal(state);
+        return;
+    }
+    let item = menu.items().get(idx).map(|item| (*item).to_string());
+    match (menu.kind, item.as_deref()) {
         (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
             state.request_new_linked_worktree = Some(ws_idx);
             leave_modal(state);
@@ -1024,6 +1078,67 @@ pub(crate) fn handle_context_menu_key(
 }
 
 impl App {
+    pub(crate) fn handle_add_remote_machine_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => cancel_add_remote_machine(&mut self.state),
+            KeyCode::Enter => self.submit_add_remote_machine(),
+            KeyCode::Tab | KeyCode::Down => {
+                if let Some(create) = self.state.machine_create.as_mut() {
+                    create.focused = create.focused.next();
+                }
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Some(create) = self.state.machine_create.as_mut() {
+                    create.focused = create.focused.previous();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(create) = self.state.machine_create.as_mut() {
+                    machine_create_input_mut(create).pop();
+                    create.error = None;
+                }
+            }
+            KeyCode::Char(character)
+                if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() =>
+            {
+                insert_machine_create_text(&mut self.state, &character.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn submit_add_remote_machine(&mut self) {
+        let Some(create) = self.state.machine_create.as_ref() else {
+            return;
+        };
+        let params = crate::api::schema::MachineAddParams {
+            name: create.name.trim().to_string(),
+            target: create.target.trim().to_string(),
+            cwd: (!create.cwd.trim().is_empty()).then(|| create.cwd.trim().to_string()),
+        };
+        let response = self.runtime_machine_add("tui.machine.add", params);
+        self.apply_machine_add_response(&response);
+    }
+
+    fn apply_machine_add_response(&mut self, response: &str) {
+        match machine_add_response(response) {
+            Ok(machine_name) => {
+                self.state.machine_create = None;
+                self.state.request_new_workspace_machine = Some(machine_name);
+                leave_modal(&mut self.state);
+            }
+            Err(message) => {
+                if let Some(create) = self.state.machine_create.as_mut() {
+                    create.error = Some(message);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn insert_add_remote_machine_text(&mut self, text: &str) -> bool {
+        insert_machine_create_text(&mut self.state, text)
+    }
+
     pub(crate) fn handle_rename_key_via_api(&mut self, key: KeyEvent) {
         if let Some(action) = modal_action_from_key(&key, RENAME_ACTIONS) {
             self.apply_rename_mouse_action_via_api(action);
@@ -1045,15 +1160,17 @@ impl App {
                 if let Some(cwd) = self.state.pending_workspace_create_cwd.take() {
                     let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
                     let label = workspace_create_label(&new_name, &suggested_name);
-                    self.runtime_workspace_create(
+                    let response = self.runtime_workspace_create(
                         "tui.workspace.create_named",
                         crate::api::schema::WorkspaceCreateParams {
                             cwd: Some(cwd.display().to_string()),
+                            machine: None,
                             focus: true,
                             label,
                             env: Default::default(),
                         },
                     );
+                    self.apply_workspace_create_response(&response);
                 } else if !self.state.workspaces.is_empty() && !new_name.is_empty() {
                     let workspace_id = self.public_workspace_id(self.state.selected);
                     self.runtime_workspace_rename(
@@ -1224,8 +1341,21 @@ impl App {
     }
 
     pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
-        let item = menu.items().get(idx).copied();
-        match (menu.kind, item) {
+        if let ContextMenuKind::WorkspaceCreateTarget { machines } = &menu.kind {
+            if idx == 0 {
+                self.begin_tui_local_workspace_create("tui.workspace.create_local");
+            } else if let Some(machine) = machines.get(idx - 1) {
+                self.state.request_new_workspace_machine = Some(machine.clone());
+                leave_modal(&mut self.state);
+            } else if idx == machines.len() + 1 + usize::from(machines.is_empty()) {
+                open_add_remote_machine(&mut self.state);
+            } else {
+                leave_modal(&mut self.state);
+            }
+            return;
+        }
+        let item = menu.items().get(idx).map(|item| (*item).to_string());
+        match (menu.kind, item.as_deref()) {
             (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
                 self.state.request_new_linked_worktree = Some(ws_idx);
                 leave_modal(&mut self.state);
@@ -1485,6 +1615,32 @@ mod tests {
         app
     }
 
+    #[cfg(unix)]
+    fn with_missing_current_dir(test: impl FnOnce()) {
+        struct RestoreCurrentDir(std::path::PathBuf);
+
+        impl Drop for RestoreCurrentDir {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).unwrap();
+            }
+        }
+
+        let _guard = config_env_lock().lock().unwrap();
+        let original = std::env::current_dir().unwrap();
+        let missing = temp_config_path("missing-interactive-cwd")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(&missing).unwrap();
+        std::env::set_current_dir(&missing).unwrap();
+        let restore = RestoreCurrentDir(original);
+        std::fs::remove_dir(&missing).unwrap();
+
+        test();
+
+        drop(restore);
+    }
+
     #[test]
     fn workspace_create_label_preserves_auto_name_for_suggestion_or_blank() {
         assert_eq!(workspace_create_label("project", "project"), None);
@@ -1494,6 +1650,169 @@ mod tests {
             workspace_create_label("  logs  ", "project").as_deref(),
             Some("logs")
         );
+    }
+
+    #[tokio::test]
+    async fn named_local_workspace_creation_error_is_visible() {
+        let mut app = app_with_test_workspaces(&[]);
+        let missing_shell =
+            std::env::temp_dir().join(format!("herdr-missing-named-shell-{}", std::process::id()));
+        let _ = std::fs::remove_file(&missing_shell);
+        app.state.prompt_new_workspace_name = true;
+        app.state.default_shell = missing_shell.display().to_string();
+
+        app.begin_tui_workspace_create("test.workspace.create");
+        let menu = app.state.context_menu.take().unwrap();
+        app.apply_context_menu_action_via_api(menu, 0);
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert!(app.state.workspaces.is_empty());
+        let toast = app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "workspace creation failed");
+        assert!(!toast.context.is_empty());
+        assert!(app.toast_deadline.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_named_tab_cwd_resolution_error_is_visible() {
+        let mut app = app_with_test_workspaces(&["test"]);
+        app.state.new_terminal_cwd = crate::config::NewTerminalCwdConfig::Current;
+        open_new_tab_dialog(&mut app.state);
+        app.state.name_input = "logs".into();
+
+        with_missing_current_dir(|| {
+            app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        });
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        let toast = app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "tab creation failed");
+        assert!(toast.context.contains("tab_create_failed"));
+        assert!(app.toast_deadline.is_some());
+    }
+
+    #[test]
+    fn machine_workspace_picker_selection_queues_registry_name() {
+        let mut state = AppState::test_new();
+        state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::WorkspaceCreateTarget {
+                machines: vec!["build".into(), "prod".into()],
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(2),
+        };
+        let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut runtimes, menu, 2);
+
+        assert_eq!(state.request_new_workspace_machine.as_deref(), Some("prod"));
+        assert_eq!(state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn machine_workspace_picker_add_selection_opens_form() {
+        let mut state = AppState::test_new();
+        state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::WorkspaceCreateTarget {
+                machines: vec!["build".into()],
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(2),
+        };
+        let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut runtimes, menu, 2);
+
+        assert_eq!(state.mode, Mode::AddRemoteMachine);
+        assert_eq!(state.machine_create, Some(MachineCreateState::default()));
+        assert!(state.request_new_workspace_machine.is_none());
+    }
+
+    #[test]
+    fn add_remote_machine_form_edits_navigates_and_cancels() {
+        let mut app = app_with_test_workspaces(&[]);
+        open_add_remote_machine(&mut app.state);
+
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        app.insert_add_remote_machine_text("dev@example.com");
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        app.insert_add_remote_machine_text("~/src");
+
+        let create = app.state.machine_create.as_ref().unwrap();
+        assert_eq!(create.name, "d");
+        assert_eq!(create.target, "dev@example.com");
+        assert_eq!(create.cwd, "~/src");
+        assert_eq!(create.focused, MachineCreateField::Cwd);
+
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(
+            app.state.machine_create.as_ref().unwrap().focused,
+            MachineCreateField::Target
+        );
+
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert!(app.state.machine_create.is_none());
+    }
+
+    #[test]
+    fn successful_machine_add_response_queues_workspace_once_and_closes_form() {
+        let mut app = app_with_test_workspaces(&[]);
+        open_add_remote_machine(&mut app.state);
+        let response = serde_json::to_string(&crate::api::schema::SuccessResponse {
+            id: "tui.machine.add".into(),
+            result: crate::api::schema::ResponseResult::MachineAdded {
+                machine: crate::api::schema::MachineInfo {
+                    name: "dev".into(),
+                    target: "dev@example.com".into(),
+                    cwd: None,
+                },
+            },
+        })
+        .unwrap();
+
+        app.apply_machine_add_response(&response);
+
+        assert_eq!(
+            app.state.request_new_workspace_machine.as_deref(),
+            Some("dev")
+        );
+        assert!(app.state.machine_create.is_none());
+        assert_eq!(app.state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn failed_machine_add_response_preserves_form_and_shows_message() {
+        let mut app = app_with_test_workspaces(&[]);
+        open_add_remote_machine(&mut app.state);
+        app.state.machine_create.as_mut().unwrap().name = "dev".into();
+        let response = serde_json::to_string(&crate::api::schema::ErrorResponse {
+            id: "tui.machine.add".into(),
+            error: crate::api::schema::ErrorBody {
+                code: "machine_already_exists".into(),
+                message: "machine name \"dev\" must be unique".into(),
+            },
+        })
+        .unwrap();
+
+        app.apply_machine_add_response(&response);
+
+        let create = app.state.machine_create.as_ref().unwrap();
+        assert_eq!(create.name, "dev");
+        assert_eq!(
+            create.error.as_deref(),
+            Some("machine name \"dev\" must be unique")
+        );
+        assert!(app.state.request_new_workspace_machine.is_none());
+        assert_eq!(app.state.mode, Mode::AddRemoteMachine);
     }
 
     fn mark_worktree_space_member(state: &mut AppState, ws_idx: usize, key: &str) {

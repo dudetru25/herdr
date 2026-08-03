@@ -1,13 +1,21 @@
 use crate::api::schema::{EventData, PluginInvocationContext};
 use crate::app::App;
 
+#[derive(Debug)]
+pub(super) struct PluginContextError {
+    pub(super) code: &'static str,
+    pub(super) message: String,
+}
+
+type PluginContextResult<T> = Result<T, PluginContextError>;
+
 impl App {
     pub(super) fn merge_plugin_context(
         &self,
         provided: Option<PluginInvocationContext>,
         correlation_id: &str,
-    ) -> PluginInvocationContext {
-        let mut context = self.current_plugin_context(correlation_id);
+    ) -> PluginContextResult<PluginInvocationContext> {
+        let mut context = self.current_plugin_context(correlation_id)?;
         if let Some(provided) = provided {
             context.workspace_id = provided.workspace_id.or(context.workspace_id);
             context.workspace_label = provided.workspace_label.or(context.workspace_label);
@@ -26,12 +34,15 @@ impl App {
             context.clicked_url = provided.clicked_url.or(context.clicked_url);
             context.link_handler_id = provided.link_handler_id.or(context.link_handler_id);
         }
-        context
+        Ok(context)
     }
 
-    pub(super) fn current_plugin_context(&self, correlation_id: &str) -> PluginInvocationContext {
+    pub(super) fn current_plugin_context(
+        &self,
+        correlation_id: &str,
+    ) -> PluginContextResult<PluginInvocationContext> {
         let Some(ws_idx) = self.state.active else {
-            return empty_plugin_context(correlation_id);
+            return Ok(empty_plugin_context(correlation_id));
         };
         self.plugin_context_for_workspace(ws_idx, correlation_id)
     }
@@ -40,7 +51,7 @@ impl App {
         &self,
         event: &crate::api::schema::EventEnvelope,
         correlation_id: &str,
-    ) -> PluginInvocationContext {
+    ) -> PluginContextResult<PluginInvocationContext> {
         match &event.data {
             EventData::WorkspaceCreated { workspace }
             | EventData::WorkspaceUpdated { workspace }
@@ -52,50 +63,65 @@ impl App {
             EventData::WorkspaceClosed {
                 workspace_id,
                 workspace,
-            } => workspace
-                .as_ref()
-                .map(|workspace| self.plugin_context_for_workspace_info(workspace, correlation_id))
-                .unwrap_or_else(|| {
-                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)
-                        .unwrap_or_else(|| {
-                            let mut context = empty_plugin_context(correlation_id);
-                            context.workspace_id = Some(workspace_id.clone());
-                            context
-                        })
-                }),
-            EventData::WorkspaceReordered { workspace_ids, .. } => workspace_ids
-                .first()
-                .and_then(|workspace_id| {
-                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)
-                })
-                .unwrap_or_else(|| empty_plugin_context(correlation_id)),
-            EventData::WorkspaceRenamed { workspace_id, .. }
-            | EventData::WorkspaceMoved { workspace_id, .. }
-            | EventData::WorkspaceFocused { workspace_id } => self
-                .plugin_context_for_workspace_id(workspace_id, correlation_id)
-                .unwrap_or_else(|| {
+            } => {
+                if let Some(workspace) = workspace.as_ref() {
+                    self.plugin_context_for_workspace_info(workspace, correlation_id)
+                } else if let Some(context) =
+                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)?
+                {
+                    Ok(context)
+                } else {
                     let mut context = empty_plugin_context(correlation_id);
                     context.workspace_id = Some(workspace_id.clone());
-                    context
-                }),
+                    Ok(context)
+                }
+            }
+            EventData::WorkspaceReordered { workspace_ids, .. } => {
+                if let Some(workspace_id) = workspace_ids.first() {
+                    if let Some(context) =
+                        self.plugin_context_for_workspace_id(workspace_id, correlation_id)?
+                    {
+                        Ok(context)
+                    } else {
+                        Ok(empty_plugin_context(correlation_id))
+                    }
+                } else {
+                    Ok(empty_plugin_context(correlation_id))
+                }
+            }
+            EventData::WorkspaceRenamed { workspace_id, .. }
+            | EventData::WorkspaceMoved { workspace_id, .. }
+            | EventData::WorkspaceFocused { workspace_id } => {
+                if let Some(context) =
+                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)?
+                {
+                    Ok(context)
+                } else {
+                    let mut context = empty_plugin_context(correlation_id);
+                    context.workspace_id = Some(workspace_id.clone());
+                    Ok(context)
+                }
+            }
             EventData::WorktreeRemoved {
                 workspace_id,
                 workspace,
                 worktree,
                 ..
-            } => workspace
-                .as_ref()
-                .map(|workspace| {
-                    self.plugin_context_for_workspace_snapshot(workspace, correlation_id)
-                })
-                .or_else(|| self.plugin_context_for_workspace_id(workspace_id, correlation_id))
-                .unwrap_or_else(|| {
+            } => {
+                if let Some(workspace) = workspace.as_ref() {
+                    Ok(self.plugin_context_for_workspace_snapshot(workspace, correlation_id))
+                } else if let Some(context) =
+                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)?
+                {
+                    Ok(context)
+                } else {
                     let mut context = empty_plugin_context(correlation_id);
                     context.workspace_id = Some(workspace_id.clone());
                     context.workspace_label = Some(worktree.label.clone());
                     context.workspace_cwd = Some(worktree.path.clone());
-                    context
-                }),
+                    Ok(context)
+                }
+            }
             EventData::TabCreated { tab } => self.plugin_context_for_tab_info(tab, correlation_id),
             EventData::TabClosed {
                 tab_id,
@@ -104,7 +130,7 @@ impl App {
                 let mut context = empty_plugin_context(correlation_id);
                 context.workspace_id = Some(workspace_id.clone());
                 context.tab_id = Some(tab_id.clone());
-                context
+                Ok(context)
             }
             EventData::TabRenamed {
                 tab_id,
@@ -119,26 +145,36 @@ impl App {
             | EventData::TabFocused {
                 tab_id,
                 workspace_id,
-            } => self
-                .plugin_context_for_tab_id(tab_id, correlation_id)
-                .or_else(|| self.plugin_context_for_workspace_id(workspace_id, correlation_id))
-                .unwrap_or_else(|| {
+            } => {
+                if let Some(context) = self.plugin_context_for_tab_id(tab_id, correlation_id)? {
+                    Ok(context)
+                } else if let Some(context) =
+                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)?
+                {
+                    Ok(context)
+                } else {
                     let mut context = empty_plugin_context(correlation_id);
                     context.workspace_id = Some(workspace_id.clone());
                     context.tab_id = Some(tab_id.clone());
-                    context
-                }),
-            EventData::LayoutUpdated { layout } => self
-                .plugin_context_for_tab_id(&layout.tab_id, correlation_id)
-                .or_else(|| {
-                    self.plugin_context_for_workspace_id(&layout.workspace_id, correlation_id)
-                })
-                .unwrap_or_else(|| {
+                    Ok(context)
+                }
+            }
+            EventData::LayoutUpdated { layout } => {
+                if let Some(context) =
+                    self.plugin_context_for_tab_id(&layout.tab_id, correlation_id)?
+                {
+                    Ok(context)
+                } else if let Some(context) =
+                    self.plugin_context_for_workspace_id(&layout.workspace_id, correlation_id)?
+                {
+                    Ok(context)
+                } else {
                     let mut context = empty_plugin_context(correlation_id);
                     context.workspace_id = Some(layout.workspace_id.clone());
                     context.tab_id = Some(layout.tab_id.clone());
-                    context
-                }),
+                    Ok(context)
+                }
+            }
             EventData::PaneCreated { pane } | EventData::PaneUpdated { pane } => {
                 self.plugin_context_for_pane_info(pane, correlation_id)
             }
@@ -152,7 +188,7 @@ impl App {
                 let mut context = empty_plugin_context(correlation_id);
                 context.workspace_id = Some(workspace_id.clone());
                 context.focused_pane_id = Some(pane_id.clone());
-                context
+                Ok(context)
             }
             EventData::PaneFocused {
                 pane_id,
@@ -176,15 +212,22 @@ impl App {
                 pane_id,
                 workspace_id,
                 ..
-            } => self
-                .plugin_context_for_public_pane_id(pane_id, correlation_id)
-                .or_else(|| self.plugin_context_for_workspace_id(workspace_id, correlation_id))
-                .unwrap_or_else(|| {
+            } => {
+                if let Some(context) =
+                    self.plugin_context_for_public_pane_id(pane_id, correlation_id)?
+                {
+                    Ok(context)
+                } else if let Some(context) =
+                    self.plugin_context_for_workspace_id(workspace_id, correlation_id)?
+                {
+                    Ok(context)
+                } else {
                     let mut context = empty_plugin_context(correlation_id);
                     context.workspace_id = Some(workspace_id.clone());
                     context.focused_pane_id = Some(pane_id.clone());
-                    context
-                }),
+                    Ok(context)
+                }
+            }
         }
     }
 
@@ -192,25 +235,32 @@ impl App {
         &self,
         workspace_id: &str,
         correlation_id: &str,
-    ) -> Option<PluginInvocationContext> {
-        let ws_idx = self
+    ) -> PluginContextResult<Option<PluginInvocationContext>> {
+        let Some(ws_idx) = self
             .state
             .workspaces
             .iter()
             .enumerate()
-            .find_map(|(idx, _)| (self.public_workspace_id(idx) == workspace_id).then_some(idx))?;
-        Some(self.plugin_context_for_workspace(ws_idx, correlation_id))
+            .find_map(|(idx, _)| (self.public_workspace_id(idx) == workspace_id).then_some(idx))
+        else {
+            return Ok(None);
+        };
+        self.plugin_context_for_workspace(ws_idx, correlation_id)
+            .map(Some)
     }
 
     fn plugin_context_for_workspace_info(
         &self,
         workspace: &crate::api::schema::WorkspaceInfo,
         correlation_id: &str,
-    ) -> PluginInvocationContext {
-        self.plugin_context_for_workspace_id(&workspace.workspace_id, correlation_id)
-            .unwrap_or_else(|| {
-                self.plugin_context_for_workspace_snapshot(workspace, correlation_id)
-            })
+    ) -> PluginContextResult<PluginInvocationContext> {
+        if let Some(context) =
+            self.plugin_context_for_workspace_id(&workspace.workspace_id, correlation_id)?
+        {
+            Ok(context)
+        } else {
+            Ok(self.plugin_context_for_workspace_snapshot(workspace, correlation_id))
+        }
     }
 
     fn plugin_context_for_workspace_snapshot(
@@ -234,74 +284,94 @@ impl App {
         &self,
         tab_id: &str,
         correlation_id: &str,
-    ) -> Option<PluginInvocationContext> {
-        let (ws_idx, tab_idx) = self.parse_tab_id(tab_id)?;
-        let ws = self.state.workspaces.get(ws_idx)?;
+    ) -> PluginContextResult<Option<PluginInvocationContext>> {
+        let Some((ws_idx, tab_idx)) = self.parse_tab_id(tab_id) else {
+            return Ok(None);
+        };
+        let Some(ws) = self.state.workspaces.get(ws_idx) else {
+            return Ok(None);
+        };
         let workspace = self.workspace_info(ws_idx);
-        let tab = ws.tabs.get(tab_idx)?;
+        let Some(tab) = ws.tabs.get(tab_idx) else {
+            return Ok(None);
+        };
         let pane_id = tab.layout.focused();
         let focused_pane = self.pane_info(ws_idx, pane_id);
-        Some(self.plugin_context_from_parts(
+        self.plugin_context_from_parts(
             ws_idx,
             workspace,
             self.public_tab_id(ws_idx, tab_idx),
             ws.tab_display_name(tab_idx),
             focused_pane,
             correlation_id,
-        ))
+        )
+        .map(Some)
     }
 
     fn plugin_context_for_tab_info(
         &self,
         tab: &crate::api::schema::TabInfo,
         correlation_id: &str,
-    ) -> PluginInvocationContext {
-        self.plugin_context_for_tab_id(&tab.tab_id, correlation_id)
-            .or_else(|| self.plugin_context_for_workspace_id(&tab.workspace_id, correlation_id))
-            .unwrap_or_else(|| {
-                let mut context = empty_plugin_context(correlation_id);
-                context.workspace_id = Some(tab.workspace_id.clone());
-                context.tab_id = Some(tab.tab_id.clone());
-                context.tab_label = Some(tab.label.clone());
-                context
-            })
+    ) -> PluginContextResult<PluginInvocationContext> {
+        if let Some(context) = self.plugin_context_for_tab_id(&tab.tab_id, correlation_id)? {
+            Ok(context)
+        } else if let Some(context) =
+            self.plugin_context_for_workspace_id(&tab.workspace_id, correlation_id)?
+        {
+            Ok(context)
+        } else {
+            let mut context = empty_plugin_context(correlation_id);
+            context.workspace_id = Some(tab.workspace_id.clone());
+            context.tab_id = Some(tab.tab_id.clone());
+            context.tab_label = Some(tab.label.clone());
+            Ok(context)
+        }
     }
 
     fn plugin_context_for_public_pane_id(
         &self,
         pane_id: &str,
         correlation_id: &str,
-    ) -> Option<PluginInvocationContext> {
-        let (ws_idx, pane_id) = self.parse_pane_id(pane_id)?;
-        Some(self.plugin_context_for_pane(ws_idx, pane_id, correlation_id))
+    ) -> PluginContextResult<Option<PluginInvocationContext>> {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(pane_id) else {
+            return Ok(None);
+        };
+        self.plugin_context_for_pane(ws_idx, pane_id, correlation_id)
+            .map(Some)
     }
 
     fn plugin_context_for_pane_info(
         &self,
         pane: &crate::api::schema::PaneInfo,
         correlation_id: &str,
-    ) -> PluginInvocationContext {
-        self.plugin_context_for_public_pane_id(&pane.pane_id, correlation_id)
-            .or_else(|| self.plugin_context_for_workspace_id(&pane.workspace_id, correlation_id))
-            .unwrap_or_else(|| {
-                let mut context = empty_plugin_context(correlation_id);
-                context.workspace_id = Some(pane.workspace_id.clone());
-                context.tab_id = Some(pane.tab_id.clone());
-                context.focused_pane_id = Some(pane.pane_id.clone());
-                context.focused_pane_cwd = pane.cwd.clone();
-                context.focused_pane_agent = pane.agent.clone();
-                context.focused_pane_status = Some(pane.agent_status);
-                context
-            })
+    ) -> PluginContextResult<PluginInvocationContext> {
+        if let Some(context) =
+            self.plugin_context_for_public_pane_id(&pane.pane_id, correlation_id)?
+        {
+            Ok(context)
+        } else if let Some(context) =
+            self.plugin_context_for_workspace_id(&pane.workspace_id, correlation_id)?
+        {
+            Ok(context)
+        } else {
+            let mut context = empty_plugin_context(correlation_id);
+            context.workspace_id = Some(pane.workspace_id.clone());
+            context.tab_id = Some(pane.tab_id.clone());
+            context.focused_pane_id = Some(pane.pane_id.clone());
+            context.focused_pane_cwd = pane.cwd.clone();
+            context.focused_pane_agent = pane.agent.clone();
+            context.focused_pane_status = Some(pane.agent_status);
+            Ok(context)
+        }
     }
 
     pub(super) fn plugin_context_for_workspace(
         &self,
         ws_idx: usize,
         correlation_id: &str,
-    ) -> PluginInvocationContext {
+    ) -> PluginContextResult<PluginInvocationContext> {
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
-            return empty_plugin_context(correlation_id);
+            return Ok(empty_plugin_context(correlation_id));
         };
         let workspace = self.workspace_info(ws_idx);
         let tab_idx = ws.active_tab_index();
@@ -325,7 +395,7 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         correlation_id: &str,
-    ) -> PluginInvocationContext {
+    ) -> PluginContextResult<PluginInvocationContext> {
         let ws = &self.state.workspaces[ws_idx];
         let workspace = self.workspace_info(ws_idx);
         let tab_idx = ws
@@ -352,16 +422,21 @@ impl App {
         tab_label: Option<String>,
         focused_pane: Option<crate::api::schema::PaneInfo>,
         correlation_id: &str,
-    ) -> PluginInvocationContext {
+    ) -> PluginContextResult<PluginInvocationContext> {
         let workspace_cwd = focused_pane
             .as_ref()
             .and_then(|pane| pane.cwd.clone())
-            .or_else(|| Some(self.default_cwd_for_workspace(ws_idx).display().to_string()));
+            .map(Ok)
+            .unwrap_or_else(|| {
+                self.default_cwd_for_workspace(ws_idx)
+                    .map(|cwd| cwd.display().to_string())
+            })
+            .map(Some)?;
         let selected_text = focused_pane
             .as_ref()
             .and_then(|pane| self.parse_pane_id(&pane.pane_id))
             .and_then(|(_, pane_id)| self.selected_text_for_pane(pane_id));
-        PluginInvocationContext {
+        Ok(PluginInvocationContext {
             workspace_id: Some(workspace.workspace_id),
             workspace_label: Some(workspace.label),
             workspace_cwd,
@@ -377,7 +452,7 @@ impl App {
             correlation_id: Some(correlation_id.to_string()),
             clicked_url: None,
             link_handler_id: None,
-        }
+        })
     }
 
     fn selected_text_for_pane(&self, pane_id: crate::layout::PaneId) -> Option<String> {
@@ -396,14 +471,28 @@ impl App {
             .filter(|text| !text.is_empty())
     }
 
-    fn default_cwd_for_workspace(&self, ws_idx: usize) -> std::path::PathBuf {
-        self.state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| {
-                ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-            })
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()))
+    fn default_cwd_for_workspace(&self, ws_idx: usize) -> PluginContextResult<std::path::PathBuf> {
+        if let Some(cwd) = self.state.workspaces.get(ws_idx).and_then(|ws| {
+            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+        }) {
+            return Ok(cwd);
+        }
+        std::env::current_dir().map_err(|err| PluginContextError {
+            code: "plugin_context_cwd_resolution_failed",
+            message: format!("failed to resolve plugin context cwd: {err}"),
+        })
+    }
+
+    pub(super) fn show_plugin_context_error(&mut self, err: &PluginContextError) {
+        let previous_toast = self.state.toast.clone();
+        self.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::NeedsAttention,
+            title: "plugin command failed".to_string(),
+            context: format!("{}: {}", err.code, err.message),
+            position: None,
+            target: None,
+        });
+        self.sync_toast_deadline(previous_toast);
     }
 }
 

@@ -43,8 +43,8 @@ use crate::ipc::{
     SocketFileIdentity,
 };
 use crate::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE,
+    self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage,
+    LIVE_HANDOFF_RECONNECT_REASON, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE,
 };
 #[cfg(unix)]
 use crate::server::client_accept::{
@@ -78,6 +78,8 @@ use crate::server::client_transport::ClientWriter;
 use std::fs;
 
 const LIVE_HANDOFF_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(6);
+#[cfg(unix)]
+const LIVE_HANDOFF_CLIENT_NOTICE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn wait_for_live_handoff_response_write(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
@@ -860,16 +862,33 @@ impl HeadlessServer {
 
         if self.app.state.request_new_workspace {
             self.app.state.request_new_workspace = false;
-            let response = self.headless_workspace_create("headless.workspace.create", None, None);
+            self.app
+                .begin_tui_workspace_create("headless.workspace.create");
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_new_workspace");
+        }
+
+        if let Some(machine) = self.app.state.request_new_workspace_machine.take() {
+            let response = self.dispatch_headless_runtime_mutation(
+                "headless.workspace.create_machine",
+                api::schema::Method::WorkspaceCreate(api::schema::WorkspaceCreateParams {
+                    cwd: None,
+                    machine: Some(machine),
+                    focus: true,
+                    label: None,
+                    env: Default::default(),
+                }),
+            );
             if let Err(error) = response {
                 error!(
                     code = %error.code,
                     message = %error.message,
-                    "failed to create workspace"
+                    "failed to create machine workspace"
                 );
+                self.app.show_workspace_create_error(error.message);
             }
             needs_render = true;
-            crate::render_prof::event("full_render_cause.deferred_new_workspace");
+            crate::render_prof::event("full_render_cause.deferred_new_machine_workspace");
         }
 
         if self.app.state.request_new_tab {
@@ -906,6 +925,7 @@ impl HeadlessServer {
                     message = %err.message,
                     "parent-space action failed"
                 );
+                self.app.show_parent_space_error(&err);
             }
             needs_render = true;
             crate::render_prof::event("full_render_cause.deferred_parent_space_action");
@@ -923,6 +943,7 @@ impl HeadlessServer {
                     message = %error.message,
                     "failed to create workspace at requested cwd"
                 );
+                self.app.show_workspace_create_error(error.message);
                 self.app.state.mode = app::Mode::Navigate;
             }
             needs_render = true;
@@ -976,6 +997,7 @@ impl HeadlessServer {
             id,
             api::schema::Method::WorkspaceCreate(api::schema::WorkspaceCreateParams {
                 cwd,
+                machine: None,
                 focus: true,
                 label,
                 env: Default::default(),
@@ -1507,6 +1529,9 @@ impl HeadlessServer {
         self.send_client_graphics_cleanup(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
+            if let Some(writer) = removed.writer.as_ref() {
+                writer.close_transport();
+            }
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
             if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
                 self.terminal_attach_owners.remove(&terminal_id);
@@ -2555,19 +2580,42 @@ impl HeadlessServer {
     #[cfg(unix)]
     fn disconnect_all_clients_for_handoff(&mut self) {
         let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
-        for client_id in client_ids {
+        let mut notice_receipts = Vec::new();
+        for &client_id in &client_ids {
             self.send_client_graphics_cleanup(client_id);
-            self.send_to_client(
-                client_id,
-                ServerMessage::ServerShutdown {
-                    reason: Some(
-                        "live update in progress; reconnect after handoff completes".to_owned(),
-                    ),
-                },
-            );
-            if let Some(client) = self.clients.get_mut(&client_id) {
-                client.writer = None;
+            let Some(control) = self
+                .clients
+                .get(&client_id)
+                .and_then(|client| client.writer.as_ref())
+                .map(|writer| writer.control.clone())
+            else {
+                continue;
+            };
+            let Ok(message) = Self::frame_server_message(&ServerMessage::ServerShutdown {
+                reason: Some(LIVE_HANDOFF_RECONNECT_REASON.to_owned()),
+            }) else {
+                warn!(client_id, "failed to frame live handoff client notice");
+                continue;
+            };
+            match control.send_with_receipt(message) {
+                Ok(receipt) => notice_receipts.push((client_id, receipt)),
+                Err(_) => warn!(client_id, "failed to queue live handoff client notice"),
             }
+        }
+
+        let notice_deadline = Instant::now() + LIVE_HANDOFF_CLIENT_NOTICE_WRITE_TIMEOUT;
+        for (client_id, receipt) in notice_receipts {
+            let remaining = notice_deadline.saturating_duration_since(Instant::now());
+            match receipt.recv_timeout(remaining) {
+                Ok(true) => {}
+                Ok(false) => warn!(client_id, "failed to write live handoff client notice"),
+                Err(err) => {
+                    warn!(client_id, %err, "timed out writing live handoff client notice")
+                }
+            }
+        }
+
+        for client_id in client_ids {
             let _ = self.remove_client(client_id);
         }
         self.foreground_client_id = None;
@@ -2756,10 +2804,7 @@ impl HeadlessServer {
                     reason: Some("detached".to_owned()),
                 },
             );
-
-            if let Some(client) = self.clients.get_mut(&client_id) {
-                client.writer = None;
-            }
+            self.remove_client_and_resize_if_needed(client_id);
 
             false
         } else {
@@ -2787,14 +2832,12 @@ impl HeadlessServer {
                 if self.handoff_in_progress {
                     if let Ok(message) =
                         Self::frame_server_message(&ServerMessage::ServerShutdown {
-                            reason: Some(
-                                "live update in progress; reconnect after handoff completes"
-                                    .to_owned(),
-                            ),
+                            reason: Some(LIVE_HANDOFF_RECONNECT_REASON.to_owned()),
                         })
                     {
                         let _ = writer.control.send(message);
                     }
+                    writer.close_transport();
                     return false;
                 }
                 let first_app_client = !direct_attach_requested && self.app_client_count() == 0;
@@ -2915,6 +2958,38 @@ impl HeadlessServer {
                     len = events.len(),
                     "client input events received"
                 );
+                if let Some(ClientConnection {
+                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
+                    ..
+                }) = self.clients.get(&client_id)
+                {
+                    let mut handled_paste = false;
+                    if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+                        for event in events {
+                            let crate::protocol::ClientInputEvent::Paste { text } = event else {
+                                warn!(
+                                    client_id,
+                                    terminal_id = %terminal_id,
+                                    "ignored non-paste structured input from terminal attach client"
+                                );
+                                continue;
+                            };
+                            handled_paste = true;
+                            let payload = paste_payload_for_runtime(runtime, &text);
+                            if let Err(err) =
+                                apply_terminal_attach_input(runtime, payload.into_bytes())
+                            {
+                                warn!(
+                                    client_id,
+                                    terminal_id = %terminal_id,
+                                    err = %err,
+                                    "terminal attach paste failed"
+                                );
+                            }
+                        }
+                    }
+                    return handled_paste;
+                }
                 if matches!(
                     self.clients.get(&client_id).map(|client| &client.mode),
                     Some(ClientConnectionMode::TerminalObserve { .. })
@@ -4774,6 +4849,7 @@ fn seed_startup_workspace_if_empty(app: &mut app::App) {
         }
         Err(err) => {
             warn!(cwd = %cwd.display(), err = %err, "failed to create startup workspace");
+            app.show_workspace_create_error(err.to_string());
             app.state.mode = app::Mode::Navigate;
         }
     }
@@ -5193,6 +5269,13 @@ mod tests {
 
         assert!(server.handle_deferred_requests_headless());
         assert!(!server.app.state.request_new_workspace);
+        assert_eq!(server.app.state.mode, crate::app::Mode::ContextMenu);
+        server
+            .app
+            .handle_context_menu_key_via_api(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::empty(),
+            ));
         assert_eq!(
             event_hub
                 .events_after(0)
@@ -5207,6 +5290,82 @@ mod tests {
             ]
         );
         shutdown_test_runtimes(&mut server);
+    }
+
+    #[tokio::test]
+    async fn headless_deferred_machine_workspace_creation_error_is_visible() {
+        let mut server = test_headless_server();
+        server.app.state.request_new_workspace_machine = Some("removed".into());
+
+        assert!(server.handle_deferred_requests_headless());
+
+        assert!(server.app.state.workspaces.is_empty());
+        let toast = server.app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "workspace creation failed");
+        assert_eq!(toast.context, "machine \"removed\" is not configured");
+        assert!(server.app.toast_deadline.is_some());
+    }
+
+    #[tokio::test]
+    async fn headless_deferred_workspace_cwd_creation_error_is_visible() {
+        let mut server = test_headless_server();
+        let cwd =
+            std::env::temp_dir().join(format!("herdr-headless-cwd-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        server.app.state.default_shell = cwd.join("missing-shell").display().to_string();
+        server.app.state.request_new_workspace_cwd = Some(cwd.clone());
+
+        assert!(server.handle_deferred_requests_headless());
+
+        assert!(server.app.state.request_new_workspace_cwd.is_none());
+        assert!(server.app.state.workspaces.is_empty());
+        let toast = server.app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "workspace creation failed");
+        assert!(!toast.context.is_empty());
+        assert!(server.app.toast_deadline.is_some());
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn headless_deferred_parent_space_child_creation_error_is_visible_and_atomic() {
+        let mut server = test_headless_server();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-headless-parent-failure-{}",
+            std::process::id()
+        ));
+        let adopted_path = root.join("adopted");
+        let missing_path = root.join("missing");
+        std::fs::create_dir_all(&adopted_path).unwrap();
+        std::fs::create_dir(&missing_path).unwrap();
+        let mut parent = crate::workspace::Workspace::test_new("parent");
+        parent.identity_cwd = root.clone();
+        let mut adopted = crate::workspace::Workspace::test_new("adopted");
+        adopted.identity_cwd = adopted_path.canonicalize().unwrap();
+        server.app.state.workspaces = vec![parent, adopted];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.default_shell = root.join("missing-shell").display().to_string();
+        server.app.state.request_parent_space_action =
+            Some((0, crate::app::state::ParentSpaceAction::Become));
+
+        assert!(server.handle_deferred_requests_headless());
+
+        assert!(server.app.state.request_parent_space_action.is_none());
+        assert_eq!(server.app.state.workspaces.len(), 2);
+        assert!(server
+            .app
+            .state
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.parent_space().is_none()));
+        let toast = server.app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "parent-space action failed");
+        assert!(toast.context.contains("parent_space_child_create_failed"));
+        assert!(server.app.toast_deadline.is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -6380,6 +6539,66 @@ next_tab = ""
         drop(runtime);
         drop(_runtime_guard);
         rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    fn assert_terminal_attach_structured_paste(initial_terminal_bytes: &[u8], expected: &[u8]) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("paste");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).expect("terminal id").clone();
+        let terminal_id_string = terminal_id.to_string();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                4096,
+                initial_terminal_bytes,
+                4,
+            );
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+
+        connect_pending_terminal_client(&mut server, 7);
+        assert!(
+            server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                client_id: 7,
+                terminal_id: terminal_id_string,
+                takeover: false,
+            })
+        );
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 7,
+            events: vec![crate::protocol::ClientInputEvent::Paste {
+                text: "hello\nworld".to_owned(),
+            }],
+        }));
+        assert_eq!(
+            input_rx.try_recv().expect("forwarded structured paste"),
+            Bytes::copy_from_slice(expected)
+        );
+
+        drop(server);
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_attach_structured_paste_is_plain_for_plain_shell() {
+        assert_terminal_attach_structured_paste(b"", b"hello\nworld");
+    }
+
+    #[test]
+    fn terminal_attach_structured_paste_preserves_child_bracketed_paste_mode() {
+        assert_terminal_attach_structured_paste(b"\x1b[?2004h", b"\x1b[200~hello\nworld\x1b[201~");
     }
 
     fn with_terminal_attach_page_key_runtime(

@@ -194,8 +194,10 @@ pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static 
 }
 
 fn suppress_grouped_git_details(ws: &crate::workspace::Workspace) -> bool {
-    ws.worktree_space()
-        .is_some_and(|space| space.is_linked_worktree)
+    ws.is_machine()
+        || ws
+            .worktree_space()
+            .is_some_and(|space| space.is_linked_worktree)
 }
 
 fn worktree_member_is_folder_placed(ws: &crate::workspace::Workspace) -> bool {
@@ -228,6 +230,7 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, _inden
             ahead_behind: ws.git_ahead_behind(),
             tokens: &token_values,
             suppress_git_details,
+            machine: ws.is_machine(),
         },
     )
     .len()
@@ -1298,6 +1301,7 @@ fn resolved_token_spans(
                     + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
                     + usize::from(*ahead > 0 && *behind > 0)
             }
+            ResolvedTokenKind::MachineBadge => display_width(" ssh "),
             _ => 0,
         })
         .collect::<Vec<_>>();
@@ -1443,6 +1447,15 @@ fn resolved_token_spans(
                         apply_token_style(Style::default().fg(p.red), token.style),
                     ));
                 }
+            }
+            ResolvedTokenKind::MachineBadge => {
+                spans.push(Span::styled(
+                    " ssh ",
+                    Style::default()
+                        .fg(p.panel_bg)
+                        .bg(p.mauve)
+                        .add_modifier(Modifier::BOLD),
+                ));
             }
             ResolvedTokenKind::TerminalTitle(text) | ResolvedTokenKind::Custom(text) => {
                 spans.push(Span::styled(
@@ -1595,6 +1608,7 @@ fn render_workspace_list(
                 ahead_behind: ws.git_ahead_behind(),
                 tokens: &token_values,
                 suppress_git_details,
+                machine: ws.is_machine(),
             },
         );
 

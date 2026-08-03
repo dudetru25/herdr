@@ -27,6 +27,14 @@ pub const MAX_GRAPHICS_FRAME_SIZE: usize = 32 * 1024 * 1024;
 /// Maximum clipboard image payload size for remote paste bridging.
 pub const MAX_CLIPBOARD_IMAGE_PAYLOAD: usize = 16 * 1024 * 1024;
 
+/// Maximum input or structured paste payload accepted from one client message.
+pub const MAX_INPUT_PAYLOAD: usize = 1024 * 1024;
+
+/// Graceful shutdown reason that tells a local full-app client to reconnect
+/// while the server replaces itself during a live handoff.
+pub const LIVE_HANDOFF_RECONNECT_REASON: &str =
+    "live update in progress; reconnect after handoff completes";
+
 /// Length of the u32 little-endian length prefix in bytes.
 const LENGTH_PREFIX_BYTES: usize = 4;
 

@@ -58,6 +58,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::events::AppEvent;
 
+pub(crate) use creation::machine_identity_cwd;
 pub use state::{AppState, Mode, ToastKind, ViewState};
 
 pub(crate) fn load_plugin_manifest(
@@ -97,6 +98,11 @@ impl PaneClickState {
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
+    /// Panes hosting an approved worker run. Herdr supervises each launched
+    /// harness so its termination drives one explicit terminal run state
+    /// instead of leaving the run Running forever.
+    pub(crate) supervised_worker_runs:
+        HashMap<crate::layout::PaneId, (crate::terminal::TerminalId, String)>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -410,7 +416,10 @@ impl App {
                 config.advanced.scrollback_limit_bytes,
                 &config.terminal.default_shell,
                 config.terminal.shell_mode,
-                config.session.resume_agents_on_restore,
+                crate::persist::RestorePolicy::new(
+                    config.session.resume_agents_on_restore,
+                    &config.machines,
+                ),
                 event_tx.clone(),
                 render_notify.clone(),
                 render_dirty.clone(),
@@ -531,6 +540,7 @@ impl App {
             detach_exits: no_session,
             detach_requested: false,
             request_new_workspace: false,
+            request_new_workspace_machine: None,
             request_new_tab: false,
             request_new_linked_worktree: None,
             request_open_existing_worktree: None,
@@ -547,6 +557,7 @@ impl App {
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
             rename_pane_target: None,
+            machine_create: None,
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
@@ -646,6 +657,7 @@ impl App {
                 .experimental
                 .switch_ascii_input_source_in_prefix,
             kitty_graphics_enabled: config.experimental.kitty_graphics,
+            machines: config.machines.clone(),
             default_shell: config.terminal.default_shell.clone(),
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
@@ -689,6 +701,9 @@ impl App {
         state.terminals = restored_terminals;
 
         for ws_idx in 0..state.workspaces.len() {
+            if state.workspaces[ws_idx].is_machine() {
+                continue;
+            }
             let cwd = state.workspaces[ws_idx]
                 .resolved_identity_cwd_from(&state.terminals, &restored_terminal_runtimes);
             state.workspaces[ws_idx].cached_git_branch =
@@ -727,6 +742,7 @@ impl App {
             last_api_notification_at: None,
             state,
             terminal_runtimes: restored_terminal_runtimes,
+            supervised_worker_runs: HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -795,6 +811,7 @@ impl App {
             config.advanced.scrollback_limit_bytes,
             &config.terminal.default_shell,
             config.terminal.shell_mode,
+            &config.machines,
             imports,
             app.event_tx.clone(),
             app.render_notify.clone(),
@@ -901,6 +918,39 @@ impl App {
         self.prefix_input_source = source;
     }
 
+    fn handle_deferred_parent_space_action(&mut self) -> bool {
+        let Some((ws_idx, action)) = self.state.request_parent_space_action.take() else {
+            return false;
+        };
+        if let Err(err) = self.apply_parent_space_action(ws_idx, action) {
+            tracing::warn!(
+                code = err.code,
+                message = %err.message,
+                "parent-space action failed"
+            );
+            self.show_parent_space_error(&err);
+        }
+        true
+    }
+
+    fn handle_deferred_workspace_cwd_create(&mut self) -> bool {
+        let Some(cwd) = self.state.request_new_workspace_cwd.take() else {
+            return false;
+        };
+        let response = self.runtime_workspace_create(
+            "tui.workspace.create_cwd",
+            crate::api::schema::WorkspaceCreateParams {
+                cwd: Some(cwd.display().to_string()),
+                machine: None,
+                focus: true,
+                label: None,
+                env: Default::default(),
+            },
+        );
+        self.apply_workspace_create_response(&response);
+        true
+    }
+
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         if self.input_rx.is_none() {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
@@ -949,15 +999,12 @@ impl App {
 
             if self.state.request_new_workspace {
                 self.state.request_new_workspace = false;
-                self.runtime_workspace_create(
-                    "tui.workspace.create",
-                    crate::api::schema::WorkspaceCreateParams {
-                        cwd: None,
-                        focus: true,
-                        label: None,
-                        env: Default::default(),
-                    },
-                );
+                self.begin_tui_workspace_create("tui.workspace.create");
+                needs_render = true;
+            }
+
+            if let Some(machine) = self.state.request_new_workspace_machine.take() {
+                self.begin_tui_machine_workspace_create("tui.workspace.create_machine", machine);
                 needs_render = true;
             }
 
@@ -987,27 +1034,11 @@ impl App {
                 needs_render = true;
             }
 
-            if let Some((ws_idx, action)) = self.state.request_parent_space_action.take() {
-                if let Err(err) = self.apply_parent_space_action(ws_idx, action) {
-                    tracing::warn!(
-                        code = err.code,
-                        message = %err.message,
-                        "parent-space action failed"
-                    );
-                }
+            if self.handle_deferred_parent_space_action() {
                 needs_render = true;
             }
 
-            if let Some(cwd) = self.state.request_new_workspace_cwd.take() {
-                self.runtime_workspace_create(
-                    "tui.workspace.create_cwd",
-                    crate::api::schema::WorkspaceCreateParams {
-                        cwd: Some(cwd.display().to_string()),
-                        focus: true,
-                        label: None,
-                        env: Default::default(),
-                    },
-                );
+            if self.handle_deferred_workspace_cwd_create() {
                 needs_render = true;
             }
 
@@ -1192,9 +1223,17 @@ impl App {
     }
 
     pub(crate) fn ensure_default_workspace(&mut self) -> bool {
+        let workspace_picker_open = self.state.context_menu.as_ref().is_some_and(|menu| {
+            matches!(
+                menu.kind,
+                state::ContextMenuKind::WorkspaceCreateTarget { .. }
+            )
+        });
         if !self.state.workspaces.is_empty()
             || self.state.mode == Mode::Onboarding
             || self.state.pending_workspace_create_cwd.is_some()
+            || workspace_picker_open
+            || self.state.mode == Mode::AddRemoteMachine
         {
             return false;
         }
@@ -1204,7 +1243,15 @@ impl App {
             previous_mode,
             Mode::ReleaseNotes | Mode::ProductAnnouncement | Mode::Settings
         );
-        let cwd = self.resolve_new_terminal_cwd(None);
+        let cwd = match self.resolve_new_terminal_cwd(None) {
+            Ok(cwd) => cwd,
+            Err(err) => {
+                tracing::error!(err = %err, "failed to resolve default workspace cwd");
+                self.show_workspace_create_error(err.to_string());
+                self.state.mode = Mode::Navigate;
+                return false;
+            }
+        };
 
         match self.create_workspace_with_options(cwd, true) {
             Ok(_) => {
@@ -1215,6 +1262,7 @@ impl App {
             }
             Err(err) => {
                 tracing::error!(err = %err, "failed to create default workspace");
+                self.show_workspace_create_error(err.to_string());
                 self.state.mode = Mode::Navigate;
                 false
             }
@@ -1538,6 +1586,23 @@ impl App {
             self.state.new_terminal_cwd = config.terminal.new_cwd.clone();
         }
 
+        if !invalid_section("machines") {
+            self.state.machines = config.machines.clone();
+            if let Some(menu) = self.state.context_menu.as_mut() {
+                if let state::ContextMenuKind::WorkspaceCreateTarget { machines } = &mut menu.kind {
+                    *machines = config
+                        .machines
+                        .iter()
+                        .map(|machine| machine.name.clone())
+                        .collect();
+                    menu.list.highlighted = menu
+                        .list
+                        .highlighted
+                        .min(machines.len() + 1 + usize::from(machines.is_empty()));
+                }
+            }
+        }
+
         if !invalid_section("worktrees") {
             self.state.worktree_directory =
                 crate::worktree::expand_tilde_absolute_path(&config.worktrees.directory);
@@ -1827,6 +1892,9 @@ impl App {
             }
             Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                 self.handle_rename_key_via_api(key_event);
+            }
+            Mode::AddRemoteMachine => {
+                self.handle_add_remote_machine_key(key_event);
             }
             Mode::NewLinkedWorktree => {
                 self.handle_worktree_create_key(key_event);
@@ -2142,6 +2210,7 @@ mod tests {
             Mode::RenameWorkspace,
             Mode::RenameTab,
             Mode::RenamePane,
+            Mode::AddRemoteMachine,
             Mode::NewLinkedWorktree,
             Mode::OpenExistingWorktree,
             Mode::Settings,
@@ -2671,6 +2740,8 @@ mod tests {
         app.state.prompt_new_workspace_name = true;
 
         app.begin_tui_workspace_create("test.workspace.create");
+        let menu = app.state.context_menu.take().unwrap();
+        app.apply_context_menu_action_via_api(menu, 0);
 
         assert_eq!(app.state.mode, Mode::RenameWorkspace);
         assert!(app.state.pending_workspace_create_cwd.is_some());
@@ -2680,6 +2751,149 @@ mod tests {
         app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         assert!(app.state.workspaces.is_empty());
         assert!(app.state.pending_workspace_create_cwd.is_none());
+    }
+
+    #[test]
+    fn new_workspace_picker_lists_local_then_live_machines() {
+        let mut app = test_app();
+        app.state.machines = vec![
+            crate::config::MachineConfig {
+                name: "build".into(),
+                target: "builder@example.com".into(),
+                cwd: None,
+            },
+            crate::config::MachineConfig {
+                name: "prod".into(),
+                target: "prod@example.com".into(),
+                cwd: Some("/srv/app".into()),
+            },
+        ];
+
+        app.begin_tui_workspace_create("test.workspace.create");
+
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let menu = app.state.context_menu.as_ref().unwrap();
+        assert_eq!(
+            menu.items(),
+            vec!["Local", "build", "prod", "Add remote machine…"]
+        );
+        assert_eq!(menu.list.highlighted, 0);
+    }
+
+    #[test]
+    fn new_workspace_picker_opens_when_machine_registry_is_empty() {
+        let mut app = test_app();
+
+        app.begin_tui_workspace_create("test.workspace.create");
+
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let menu = app.state.context_menu.as_ref().unwrap();
+        assert_eq!(
+            menu.items(),
+            vec!["Local", "No machines registered", "Add remote machine…"]
+        );
+        assert_eq!(menu.list.highlighted, 0);
+        assert!(app.state.workspaces.is_empty());
+        assert!(!app.ensure_default_workspace());
+
+        let menu = app.state.context_menu.take().unwrap();
+        app.apply_context_menu_action_via_api(menu, 2);
+        assert_eq!(app.state.mode, Mode::AddRemoteMachine);
+        assert!(!app.ensure_default_workspace());
+    }
+
+    #[test]
+    fn stale_machine_workspace_creation_error_is_visible() {
+        let mut app = test_app();
+
+        app.begin_tui_machine_workspace_create(
+            "test.workspace.create_machine",
+            "removed".to_string(),
+        );
+
+        assert!(app.state.workspaces.is_empty());
+        let toast = app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "workspace creation failed");
+        assert_eq!(toast.context, "machine \"removed\" is not configured");
+        assert!(app.toast_deadline.is_some());
+    }
+
+    #[tokio::test]
+    async fn local_workspace_picker_creation_error_is_visible_without_name_prompt() {
+        let mut app = test_app();
+        let missing_shell =
+            std::env::temp_dir().join(format!("herdr-missing-local-shell-{}", std::process::id()));
+        let _ = std::fs::remove_file(&missing_shell);
+        app.state.default_shell = missing_shell.display().to_string();
+
+        app.begin_tui_workspace_create("test.workspace.create");
+        let menu = app.state.context_menu.take().unwrap();
+        app.apply_context_menu_action_via_api(menu, 0);
+
+        assert!(app.state.workspaces.is_empty());
+        let toast = app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "workspace creation failed");
+        assert!(!toast.context.is_empty());
+        assert!(app.toast_deadline.is_some());
+    }
+
+    #[tokio::test]
+    async fn deferred_workspace_cwd_creation_error_is_visible() {
+        let mut app = test_app();
+        let cwd =
+            std::env::temp_dir().join(format!("herdr-tui-cwd-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        app.state.default_shell = cwd.join("missing-shell").display().to_string();
+        app.state.request_new_workspace_cwd = Some(cwd.clone());
+
+        assert!(app.handle_deferred_workspace_cwd_create());
+
+        assert!(app.state.request_new_workspace_cwd.is_none());
+        assert!(app.state.workspaces.is_empty());
+        let toast = app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "workspace creation failed");
+        assert!(!toast.context.is_empty());
+        assert!(app.toast_deadline.is_some());
+        let _ = std::fs::remove_dir_all(cwd);
+    }
+
+    #[tokio::test]
+    async fn deferred_parent_space_child_creation_error_is_visible_and_atomic() {
+        let mut app = test_app();
+        let root =
+            std::env::temp_dir().join(format!("herdr-tui-parent-failure-{}", std::process::id()));
+        let adopted_path = root.join("adopted");
+        let missing_path = root.join("missing");
+        std::fs::create_dir_all(&adopted_path).unwrap();
+        std::fs::create_dir(&missing_path).unwrap();
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = root.clone();
+        let mut adopted = Workspace::test_new("adopted");
+        adopted.identity_cwd = adopted_path.canonicalize().unwrap();
+        app.state.workspaces = vec![parent, adopted];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.default_shell = root.join("missing-shell").display().to_string();
+        app.state.request_parent_space_action = Some((0, state::ParentSpaceAction::Become));
+
+        assert!(app.handle_deferred_parent_space_action());
+
+        assert!(app.state.request_parent_space_action.is_none());
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert!(app
+            .state
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.parent_space().is_none()));
+        let toast = app.state.toast.as_ref().unwrap();
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert_eq!(toast.title, "parent-space action failed");
+        assert!(toast.context.contains("parent_space_child_create_failed"));
+        assert!(app.toast_deadline.is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2972,6 +3186,65 @@ mod tests {
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
         assert_eq!(toast.title, "reloaded config");
         assert_eq!(toast.context, "using config.toml");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_replaces_live_machine_registry_only_when_valid() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-machines");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[[machines]]\nname = \"build\"\ntarget = \"first@example.com\"\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.machines[0].target, "first@example.com");
+
+        std::fs::write(
+            &path,
+            "[[machines]]\nname = \"build\"\ntarget = \"second@example.com\"\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.machines[0].target, "second@example.com");
+
+        std::fs::write(
+            &path,
+            "[[machines]]\nname = \"build\"\ntarget = \"one\"\n\
+             [[machines]]\nname = \"build\"\ntarget = \"two\"\n",
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(app.state.machines[0].target, "second@example.com");
+
+        app.begin_tui_workspace_create("test.workspace.create");
+        app.state.context_menu.as_mut().unwrap().list.highlighted = 1;
+        std::fs::write(&path, "").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(app.state.machines.is_empty());
+        let menu = app.state.context_menu.as_ref().unwrap();
+        assert_eq!(
+            menu.items(),
+            vec!["Local", "No machines registered", "Add remote machine…"]
+        );
+        assert_eq!(menu.list.highlighted, 1);
+
+        let menu = app.state.context_menu.take().unwrap();
+        app.apply_context_menu_action_via_api(menu, 1);
+        assert!(app.state.request_new_workspace_machine.is_none());
+        assert!(app.state.workspaces.is_empty());
+        assert_eq!(app.state.mode, Mode::Navigate);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -4039,7 +4312,8 @@ mod tests {
         let cwd = creation::resolve_new_terminal_cwd(
             &crate::config::NewTerminalCwdConfig::Follow,
             Some(std::path::PathBuf::from("/tmp/herdr-source")),
-        );
+        )
+        .unwrap();
 
         assert_eq!(cwd, std::path::PathBuf::from("/tmp/herdr-source"));
     }
@@ -4051,7 +4325,8 @@ mod tests {
         };
 
         let cwd =
-            creation::resolve_new_terminal_cwd(&crate::config::NewTerminalCwdConfig::Follow, None);
+            creation::resolve_new_terminal_cwd(&crate::config::NewTerminalCwdConfig::Follow, None)
+                .unwrap();
 
         assert_eq!(cwd, home);
     }
@@ -4061,9 +4336,19 @@ mod tests {
         let cwd = creation::resolve_new_terminal_cwd(
             &crate::config::NewTerminalCwdConfig::Path("/tmp/herdr-fixed".into()),
             Some(std::path::PathBuf::from("/tmp/herdr-source")),
-        );
+        )
+        .unwrap();
 
         assert_eq!(cwd, std::path::PathBuf::from("/tmp/herdr-fixed"));
+    }
+
+    #[test]
+    fn new_terminal_cwd_current_uses_current_directory() {
+        let cwd =
+            creation::resolve_new_terminal_cwd(&crate::config::NewTerminalCwdConfig::Current, None)
+                .unwrap();
+
+        assert_eq!(cwd, std::env::current_dir().unwrap());
     }
 
     #[test]
@@ -5983,28 +6268,29 @@ last_pane = "prefix+tab"
     }
 
     #[tokio::test]
-    async fn route_client_events_pastes_text_into_focused_pane_in_navigate_mode() {
-        let mut app = test_app();
-        let mut workspace = Workspace::test_new("tiled");
-        let focused = workspace.focused_pane_id().unwrap();
-        let (runtime, mut rx) = TerminalRuntime::test_with_channel(80, 24);
-        workspace.tabs[0].runtimes.insert(focused, runtime);
-        app.state.workspaces = vec![workspace];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Navigate;
+    async fn route_client_events_pastes_text_into_focused_pane_in_terminal_navigation_modes() {
+        for (mode, text) in [
+            (Mode::Terminal, "terminal-paste"),
+            (Mode::Navigate, "navigate-paste"),
+            (Mode::Prefix, "prefix-paste"),
+        ] {
+            let mut app = test_app();
+            let mut workspace = Workspace::test_new("tiled");
+            let focused = workspace.focused_pane_id().unwrap();
+            let (runtime, mut rx) = TerminalRuntime::test_with_channel(80, 24);
+            workspace.tabs[0].runtimes.insert(focused, runtime);
+            app.state.workspaces = vec![workspace];
+            app.state.active = Some(0);
+            app.state.selected = 0;
+            app.state.mode = mode;
 
-        app.route_client_events(
-            vec![crate::raw_input::RawInputEvent::Paste(
-                "navigate-paste".into(),
-            )],
-            true,
-        );
+            app.route_client_events(
+                vec![crate::raw_input::RawInputEvent::Paste(text.into())],
+                true,
+            );
 
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            bytes::Bytes::from_static(b"navigate-paste")
-        );
+            assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(text.to_owned()));
+        }
     }
 
     #[tokio::test]

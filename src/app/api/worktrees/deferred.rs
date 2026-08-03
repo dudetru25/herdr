@@ -9,7 +9,7 @@ use crate::app::App;
 use crate::events::{ApiWorktreeAddRequest, ApiWorktreeRemoveRequest, AppEvent};
 
 use super::super::responses::{encode_error, encode_success};
-use super::{absolute_user_path, WorktreeSource};
+use super::{absolute_user_path, canonical_path_failure, WorktreeSource};
 
 impl App {
     pub(crate) fn handle_deferred_worktree_api_request(
@@ -40,9 +40,12 @@ impl App {
         id
     }
 
-    fn api_create_source_workspace_idx(&self, api: &ApiWorktreeAddRequest) -> Option<usize> {
+    fn api_create_source_workspace_idx(
+        &self,
+        api: &ApiWorktreeAddRequest,
+    ) -> Result<Option<usize>, super::ApiFailure> {
         let Some(source_workspace_id) = api.source_workspace_id.as_ref() else {
-            return self.find_parent_workspace_by_key(&api.repo_key);
+            return Ok(self.find_parent_workspace_by_key(&api.repo_key));
         };
         let Some(ws_idx) = self
             .state
@@ -50,14 +53,14 @@ impl App {
             .iter()
             .position(|ws| &ws.id == source_workspace_id)
         else {
-            return self.find_parent_workspace_by_key(&api.repo_key);
+            return Ok(self.find_parent_workspace_by_key(&api.repo_key));
         };
         let workspace = &self.state.workspaces[ws_idx];
         if let Some(expected) = api.source_existing_membership.as_ref() {
             if workspace.worktree_space() == Some(expected) {
-                return Some(ws_idx);
+                return Ok(Some(ws_idx));
             }
-            return self.find_parent_workspace_by_key(&api.repo_key);
+            return Ok(self.find_parent_workspace_by_key(&api.repo_key));
         }
 
         if let Some(current) = workspace.worktree_space() {
@@ -69,9 +72,9 @@ impl App {
                 is_linked_worktree: false,
             };
             if current == &expected {
-                return Some(ws_idx);
+                return Ok(Some(ws_idx));
             }
-            return self.find_parent_workspace_by_key(&api.repo_key);
+            return Ok(self.find_parent_workspace_by_key(&api.repo_key));
         }
         let git_space = workspace.git_space().cloned().or_else(|| {
             workspace
@@ -79,16 +82,17 @@ impl App {
                 .as_deref()
                 .and_then(crate::workspace::git_space_metadata)
         });
-        if git_space.is_some_and(|space| {
-            !space.is_linked_worktree
-                && space.key == api.repo_key
-                && crate::worktree::canonical_or_original(&space.repo_root)
-                    == crate::worktree::canonical_or_original(&api.source_repo_root)
-        }) {
-            Some(ws_idx)
-        } else {
-            self.find_parent_workspace_by_key(&api.repo_key)
+        if let Some(space) = git_space {
+            // Locating the parent workspace only matches identity. Failing here would abort the
+            // caller before its typed guard response is sent, so an unresolvable path must simply
+            // not match. Removal decisions use `canonical_path` and stay fail-closed.
+            let space_root = crate::worktree::canonical_or_original(&space.repo_root);
+            let source_root = crate::worktree::canonical_or_original(&api.source_repo_root);
+            if !space.is_linked_worktree && space.key == api.repo_key && space_root == source_root {
+                return Ok(Some(ws_idx));
+            }
         }
+        Ok(self.find_parent_workspace_by_key(&api.repo_key))
     }
 
     fn start_api_worktree_create(
@@ -137,7 +141,14 @@ impl App {
                 &branch,
             ),
         };
-        let checkout_key = crate::worktree::canonical_or_original(&checkout_path);
+        let checkout_key = match crate::worktree::worktree_operation_key(&checkout_path) {
+            Ok(key) => key,
+            Err(err) => {
+                let err = canonical_path_failure(err);
+                Self::send_api_response(respond_to, encode_error(id, err.code, err.message));
+                return;
+            }
+        };
         if self
             .pending_api_worktree_creates
             .contains_key(&checkout_key)
@@ -258,23 +269,39 @@ impl App {
 
         #[cfg(windows)]
         {
-            if !params.force
-                && crate::worktree::checkout_has_dirty_files(&space.checkout_path).unwrap_or(false)
-            {
-                Self::send_api_response(
-                    respond_to,
-                    encode_error(
-                        id,
-                        "dirty_worktree_requires_force",
-                        crate::worktree::worktree_dirty_remove_message(&space.checkout_path),
-                    ),
-                );
-                return;
+            match crate::worktree::checkout_has_dirty_files(&space.checkout_path) {
+                Ok(false) => {}
+                Ok(true) if params.force => {}
+                Ok(true) => {
+                    Self::send_api_response(
+                        respond_to,
+                        encode_error(
+                            id,
+                            "dirty_worktree_requires_force",
+                            crate::worktree::worktree_dirty_remove_message(&space.checkout_path),
+                        ),
+                    );
+                    return;
+                }
+                Err(err) => {
+                    Self::send_api_response(
+                        respond_to,
+                        encode_error(id, "worktree_status_failed", err.to_string()),
+                    );
+                    return;
+                }
             }
         }
 
         let workspace_internal_id = self.state.workspaces[ws_idx].id.clone();
-        let checkout_key = crate::worktree::canonical_or_original(&space.checkout_path);
+        let checkout_key = match crate::worktree::worktree_operation_key(&space.checkout_path) {
+            Ok(key) => key,
+            Err(err) => {
+                let err = canonical_path_failure(err);
+                Self::send_api_response(respond_to, encode_error(id, err.code, err.message));
+                return;
+            }
+        };
         if self
             .pending_api_worktree_removes
             .contains_key(&workspace_internal_id)
@@ -379,7 +406,16 @@ impl App {
             return;
         }
 
-        let source_workspace_idx = self.api_create_source_workspace_idx(&api);
+        let source_workspace_idx = match self.api_create_source_workspace_idx(&api) {
+            Ok(workspace) => workspace,
+            Err(err) => {
+                Self::send_api_response(
+                    api.respond_to,
+                    encode_error(api.id, err.code, err.message),
+                );
+                return;
+            }
+        };
         let mut source = WorktreeSource {
             workspace_idx: source_workspace_idx,
             source_checkout_path: api.source_checkout_path,
@@ -392,28 +428,37 @@ impl App {
             return;
         }
 
-        let (ws_idx, created_workspace) =
-            if let Some(ws_idx) = self.open_workspace_idx_for_checkout(&result.path) {
-                if api.focus {
-                    self.state.switch_workspace(ws_idx);
+        let already_open = match self.open_workspace_idx_for_checkout(&result.path) {
+            Ok(workspace) => workspace,
+            Err(err) => {
+                Self::send_api_response(
+                    api.respond_to,
+                    encode_error(api.id, err.code, err.message),
+                );
+                return;
+            }
+        };
+        let (ws_idx, created_workspace) = if let Some(ws_idx) = already_open {
+            if api.focus {
+                self.state.switch_workspace(ws_idx);
+            }
+            (ws_idx, false)
+        } else {
+            match self.create_workspace_with_options(result.path.clone(), api.focus) {
+                Ok(ws_idx) => (ws_idx, true),
+                Err(err) => {
+                    Self::send_api_response(
+                        api.respond_to,
+                        encode_error(
+                            api.id,
+                            "worktree_open_failed",
+                            format!("created worktree but failed to open workspace: {err}"),
+                        ),
+                    );
+                    return;
                 }
-                (ws_idx, false)
-            } else {
-                match self.create_workspace_with_options(result.path.clone(), api.focus) {
-                    Ok(ws_idx) => (ws_idx, true),
-                    Err(err) => {
-                        Self::send_api_response(
-                            api.respond_to,
-                            encode_error(
-                                api.id,
-                                "worktree_open_failed",
-                                format!("created worktree but failed to open workspace: {err}"),
-                            ),
-                        );
-                        return;
-                    }
-                }
-            };
+            }
+        };
 
         self.mark_worktree_membership(
             &source,

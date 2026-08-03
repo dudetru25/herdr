@@ -2,7 +2,7 @@ use std::{
     collections::{HashSet, VecDeque},
     io::Write,
     os::fd::RawFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::OnceLock,
 };
@@ -20,6 +20,10 @@ const CHILD_GROUPS_SCAN_LIMIT: usize = 64;
 enum ProcessDetectionMode {
     Native,
     ChildGroups,
+}
+
+pub(crate) fn replace_file_platform(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, target)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

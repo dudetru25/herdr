@@ -67,6 +67,7 @@ fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
 pub(crate) struct PaneLaunchEnv {
     extra: Vec<(String, String)>,
     identity: PaneLaunchIdentity,
+    isolated: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -86,6 +87,15 @@ impl PaneLaunchEnv {
         Self {
             extra,
             identity: PaneLaunchIdentity::Inherit,
+            isolated: false,
+        }
+    }
+
+    pub(crate) fn isolated(extra: Vec<(String, String)>) -> Self {
+        Self {
+            extra,
+            identity: PaneLaunchIdentity::Inherit,
+            isolated: true,
         }
     }
 
@@ -114,6 +124,9 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
     for (key, value) in &launch_env.extra {
         cmd.env(key, value);
     }
+    if launch_env.isolated {
+        return;
+    }
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
     crate::platform::apply_pane_runtime_marker(cmd);
@@ -132,6 +145,14 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
             cmd.env_remove(crate::integration::HERDR_PANE_ID_ENV_VAR);
         }
     }
+}
+
+fn apply_argv_launch_environment(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
+    if launch_env.isolated {
+        cmd.env_clear();
+    }
+    apply_pane_terminal_env(cmd);
+    apply_pane_launch_env(cmd, launch_env);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -979,6 +1000,14 @@ impl AgentDetectionPresence {
 // ---------------------------------------------------------------------------
 
 /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
+/// Exactly how a pane's child process terminated, captured by the child
+/// watcher so supervisors can reach an explicit terminal decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneExitObservation {
+    pub success: bool,
+    pub status: String,
+}
+
 /// Dropping this shuts down all background tasks and closes the PTY.
 pub struct PaneRuntime {
     pane_id: PaneId,
@@ -988,6 +1017,7 @@ pub struct PaneRuntime {
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     child_wait_completed: Option<Arc<AtomicBool>>,
+    exit_observation: Arc<Mutex<Option<PaneExitObservation>>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
@@ -1368,7 +1398,9 @@ fn shell_mode_uses_login_shell(
 ) -> bool {
     match mode {
         crate::config::ShellModeConfig::Auto => target == ShellLaunchTarget::Macos,
-        crate::config::ShellModeConfig::Login => true,
+        // Windows shells have no shared login-shell convention. Launch the
+        // configured shell directly instead of portable-pty's cmd.exe default.
+        crate::config::ShellModeConfig::Login => target != ShellLaunchTarget::Windows,
         crate::config::ShellModeConfig::NonLogin => false,
     }
 }
@@ -1762,6 +1794,42 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<Self> {
+        Self::spawn_argv_command_with_initial_history(
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            argv,
+            launch_env,
+            agent_detection,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            None,
+            events,
+            render_notify,
+            render_dirty,
+        )
+    }
+
+    // Runtime restoration threads the normal construction inputs together with captured history.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_argv_command_with_initial_history(
+        pane_id: PaneId,
+        rows: u16,
+        cols: u16,
+        cwd: std::path::PathBuf,
+        argv: &[String],
+        launch_env: &PaneLaunchEnv,
+        agent_detection: AgentDetection,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        initial_history_ansi: Option<&str>,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> std::io::Result<Self> {
         let Some((program, args)) = argv.split_first() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1773,8 +1841,7 @@ impl PaneRuntime {
             cmd.arg(arg);
         }
         cmd.cwd(cwd);
-        apply_pane_terminal_env(&mut cmd);
-        apply_pane_launch_env(&mut cmd, launch_env);
+        apply_argv_launch_environment(&mut cmd, launch_env);
         Self::spawn_command_builder(
             pane_id,
             rows,
@@ -1787,7 +1854,11 @@ impl PaneRuntime {
             render_dirty,
             cmd,
             "failed to spawn argv command pane",
-            SpawnInitialState::default(),
+            SpawnInitialState {
+                detected_agent: None,
+                history_ansi: initial_history_ansi,
+                windows_powershell_prompt_cwd_reporting: false,
+            },
             agent_detection,
         )
     }
@@ -1930,6 +2001,7 @@ impl PaneRuntime {
             child_pid,
             reported_cwd,
             child_wait_completed: None,
+            exit_observation: Arc::new(Mutex::new(None)),
             kitty_keyboard_flags,
             detection_content_seq,
             full_lifecycle_authority_active,
@@ -1988,9 +2060,11 @@ impl PaneRuntime {
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let exit_observation = Arc::new(Mutex::new(None));
         {
             let child_pid = child_pid.clone();
             let child_wait_completed = child_wait_completed.clone();
+            let exit_observation = exit_observation.clone();
             let events = events.clone();
             let rt = tokio::runtime::Handle::current();
             let mut child = spawned.child;
@@ -1999,12 +2073,25 @@ impl PaneRuntime {
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
             tokio::task::spawn_blocking(move || {
-                match child.wait() {
+                let observed = match child.wait() {
                     Ok(status) => {
                         let status_text = format!("{status:?}");
                         crate::logging::pane_exited(pane_id.raw(), &status_text);
+                        PaneExitObservation {
+                            success: status.success(),
+                            status: status_text,
+                        }
                     }
-                    Err(e) => crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string()),
+                    Err(e) => {
+                        crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string());
+                        PaneExitObservation {
+                            success: false,
+                            status: format!("waiting for the pane child failed: {e}"),
+                        }
+                    }
+                };
+                if let Ok(mut slot) = exit_observation.lock() {
+                    *slot = Some(observed);
                 }
                 child_wait_completed.store(true, Ordering::Release);
                 // Use blocking send — PaneDied is critical, must not be dropped
@@ -2447,6 +2534,7 @@ impl PaneRuntime {
             child_pid,
             reported_cwd,
             child_wait_completed: Some(child_wait_completed),
+            exit_observation,
             kitty_keyboard_flags,
             detection_content_seq,
             full_lifecycle_authority_active,
@@ -2455,6 +2543,12 @@ impl PaneRuntime {
             preserve_processes_on_drop: false,
             detect_handle,
         })
+    }
+
+    /// The observed termination of this pane's child process, once the child
+    /// watcher has recorded it.
+    pub fn exit_observation(&self) -> Option<PaneExitObservation> {
+        self.exit_observation.lock().ok()?.clone()
     }
 
     pub fn begin_graceful_release(&self, agent: Agent) {
@@ -2941,6 +3035,7 @@ impl PaneRuntime {
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
                 child_wait_completed: None,
+                exit_observation: Arc::new(Mutex::new(None)),
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
@@ -2966,6 +3061,33 @@ mod tests {
         apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
 
         assert!(cmd.get_env("CODEX_THREAD_ID").is_none());
+    }
+
+    #[test]
+    fn isolated_argv_environment_clears_ambient_and_herdr_context() {
+        let mut command = CommandBuilder::new("worker-under-test");
+        command.env("OPENAI_API_KEY", "secret-under-test");
+        command.env(crate::integration::HERDR_PANE_ID_ENV_VAR, "pane:ambient");
+        let launch_env = PaneLaunchEnv::isolated(vec![
+            ("HOME".into(), "/explicit/home".into()),
+            ("PATH".into(), "/explicit/bin".into()),
+        ]);
+
+        apply_argv_launch_environment(&mut command, &launch_env);
+
+        assert!(command.get_env("OPENAI_API_KEY").is_none());
+        assert!(command
+            .get_env(crate::integration::HERDR_PANE_ID_ENV_VAR)
+            .is_none());
+        assert!(command.get_env(crate::api::SOCKET_PATH_ENV_VAR).is_none());
+        assert_eq!(
+            command.get_env("HOME"),
+            Some(std::ffi::OsStr::new("/explicit/home"))
+        );
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new(PANE_TERM))
+        );
     }
 
     #[tokio::test]
@@ -3161,6 +3283,10 @@ mod tests {
             ShellLaunchTarget::OtherUnix
         ));
         assert!(!shell_mode_uses_login_shell(
+            crate::config::ShellModeConfig::Login,
+            ShellLaunchTarget::Windows
+        ));
+        assert!(!shell_mode_uses_login_shell(
             crate::config::ShellModeConfig::NonLogin,
             ShellLaunchTarget::Macos
         ));
@@ -3273,6 +3399,26 @@ mod tests {
     }
 
     #[test]
+    fn windows_login_mode_preserves_configured_shell() {
+        let cmd = pane_shell_command_builder_for_target(
+            PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::Login),
+            ShellLaunchTarget::Windows,
+        )
+        .unwrap();
+
+        assert!(!cmd.is_default_prog());
+        assert_eq!(
+            cmd.get_argv(),
+            &[
+                std::ffi::OsString::from("pwsh.exe"),
+                std::ffi::OsString::from("-NoExit"),
+                std::ffi::OsString::from("-Command"),
+                std::ffi::OsString::from(WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND),
+            ]
+        );
+    }
+
+    #[test]
     fn unix_powershell_builder_launches_plain_shell() {
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("pwsh", crate::config::ShellModeConfig::NonLogin),
@@ -3284,7 +3430,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_powershell_pane_shell_predicate_requires_windows_and_non_login() {
+    fn windows_powershell_pane_shell_predicate_requires_windows_and_powershell() {
         let pwsh = PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::NonLogin);
         assert!(uses_windows_powershell_pane_shell_for_target(
             pwsh,
@@ -3298,7 +3444,7 @@ mod tests {
             pwsh,
             ShellLaunchTarget::Macos
         ));
-        assert!(!uses_windows_powershell_pane_shell_for_target(
+        assert!(uses_windows_powershell_pane_shell_for_target(
             PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::Login),
             ShellLaunchTarget::Windows
         ));
@@ -3495,6 +3641,7 @@ mod tests {
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
+            exit_observation: Arc::new(Mutex::new(None)),
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
@@ -3526,6 +3673,7 @@ mod tests {
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
+            exit_observation: Arc::new(Mutex::new(None)),
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),

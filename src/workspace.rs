@@ -180,6 +180,8 @@ pub struct Workspace {
     pub id: String,
     /// User-provided override. If set, auto-derived identity stops updating.
     pub custom_name: Option<String>,
+    /// Config registry name for a remote machine-backed workspace.
+    pub machine: Option<String>,
     /// Fallback workspace identity source for tests, old snapshots, or missing runtimes.
     pub identity_cwd: PathBuf,
     /// CWD from which the cached automatic label and Git metadata were derived.
@@ -256,6 +258,7 @@ impl Workspace {
         Self {
             id,
             custom_name: label,
+            machine: None,
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
             cached_auto_label,
@@ -333,6 +336,7 @@ impl Workspace {
             render_notify,
             render_dirty,
             None,
+            None,
             extra_env,
         )
     }
@@ -392,6 +396,40 @@ impl Workspace {
             render_notify,
             render_dirty,
             Some(argv),
+            None,
+            extra_env,
+        )
+    }
+
+    // Machine-aware workspace construction keeps launch and rendering inputs explicit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_machine_argv_command_with_extra_env(
+        machine: String,
+        initial_cwd: PathBuf,
+        rows: u16,
+        cols: u16,
+        argv: &[String],
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+        extra_env: Vec<(String, String)>,
+    ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
+        Self::new_with_tab(
+            initial_cwd,
+            rows,
+            cols,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
+            events,
+            render_notify,
+            render_dirty,
+            Some(argv),
+            Some(machine),
             extra_env,
         )
     }
@@ -409,6 +447,7 @@ impl Workspace {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
         argv: Option<&[String]>,
+        machine: Option<String>,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         let id = generate_workspace_id();
@@ -450,17 +489,29 @@ impl Workspace {
         };
         let mut public_pane_numbers = HashMap::new();
         public_pane_numbers.insert(tab.root_pane, 1);
-        let (cached_git_space, cached_auto_label, cached_git_status_key) =
-            discover_workspace_git_identity(&initial_cwd);
+        let (cached_git_space, cached_auto_label, cached_git_status_key) = if machine.is_some() {
+            (
+                None,
+                fallback_label_from_cwd(&initial_cwd),
+                initial_cwd.clone(),
+            )
+        } else {
+            discover_workspace_git_identity(&initial_cwd)
+        };
+        let cached_git_branch = machine
+            .is_none()
+            .then(|| git_branch(&initial_cwd))
+            .flatten();
         Ok((
             Self {
                 id,
-                custom_name: None,
+                custom_name: machine.clone(),
+                machine,
                 identity_cwd: initial_cwd.clone(),
                 cached_identity_cwd: initial_cwd.clone(),
                 cached_auto_label,
                 cached_git_status_key,
-                cached_git_branch: git_branch(&initial_cwd),
+                cached_git_branch,
                 cached_git_ahead_behind: None,
                 cached_git_space,
                 worktree_space: None,
@@ -537,6 +588,7 @@ impl Workspace {
             shell_config,
             None,
             extra_env,
+            false,
         )
     }
 
@@ -561,6 +613,32 @@ impl Workspace {
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             Some(argv),
             extra_env,
+            false,
+        )
+    }
+
+    pub fn create_tab_isolated_argv_command(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        cwd: PathBuf,
+        argv: &[String],
+        extra_env: Vec<(String, String)>,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+    ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
+        self.create_tab_with_runtime(
+            rows,
+            cols,
+            cwd,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
+            Some(argv),
+            extra_env,
+            true,
         )
     }
 
@@ -575,11 +653,16 @@ impl Workspace {
         shell_config: crate::pane::PaneShellConfig<'_>,
         argv: Option<&[String]>,
         extra_env: Vec<(String, String)>,
+        isolated_environment: bool,
     ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
         let number = self.next_public_tab_number;
         self.next_public_tab_number += 1;
         let pane_number = self.next_public_pane_number;
-        let launch_env = self.launch_env_for_new_pane(number, pane_number, extra_env);
+        let launch_env = if isolated_environment {
+            PaneLaunchEnv::isolated(extra_env)
+        } else {
+            self.launch_env_for_new_pane(number, pane_number, extra_env)
+        };
         let events = self
             .active_tab()
             .map(|tab| tab.events.clone())
@@ -1126,6 +1209,14 @@ impl Workspace {
         self.custom_name = Some(name);
     }
 
+    pub fn machine_name(&self) -> Option<&str> {
+        self.machine.as_deref()
+    }
+
+    pub fn is_machine(&self) -> bool {
+        self.machine.is_some()
+    }
+
     #[cfg(test)]
     pub fn resolved_identity_cwd(&self) -> Option<PathBuf> {
         Some(self.identity_cwd.clone())
@@ -1136,6 +1227,9 @@ impl Workspace {
         terminals: &HashMap<TerminalId, TerminalState>,
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> Option<PathBuf> {
+        if self.is_machine() {
+            return Some(self.identity_cwd.clone());
+        }
         self.tabs
             .first()
             .and_then(|tab| tab.cwd_for_pane(tab.root_pane, terminals, terminal_runtimes))
@@ -1192,14 +1286,23 @@ impl Workspace {
     }
 
     pub fn branch(&self) -> Option<String> {
+        if self.is_machine() {
+            return None;
+        }
         self.cached_git_branch.clone()
     }
 
     pub fn git_ahead_behind(&self) -> Option<(usize, usize)> {
+        if self.is_machine() {
+            return None;
+        }
         self.cached_git_ahead_behind
     }
 
     pub fn git_space(&self) -> Option<&GitSpaceMetadata> {
+        if self.is_machine() {
+            return None;
+        }
         self.cached_git_space.as_ref()
     }
 
@@ -1218,6 +1321,12 @@ impl Workspace {
 
     #[cfg(test)]
     pub fn refresh_git_ahead_behind(&mut self) {
+        if self.is_machine() {
+            self.cached_git_branch = None;
+            self.cached_git_ahead_behind = None;
+            self.cached_git_space = None;
+            return;
+        }
         let cwd = self.resolved_identity_cwd();
         self.cached_git_branch = cwd.as_deref().and_then(git_branch);
         self.cached_git_ahead_behind = cwd.as_deref().and_then(git_ahead_behind);
@@ -1327,6 +1436,7 @@ impl Workspace {
         Self {
             id: generate_workspace_id(),
             custom_name: Some(name.to_string()),
+            machine: None,
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
             cached_auto_label: fallback_label_from_cwd(&identity_cwd),

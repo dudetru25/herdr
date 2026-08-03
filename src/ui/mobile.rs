@@ -650,11 +650,12 @@ fn render_mobile_switcher_content(
                 .add_modifier(Modifier::BOLD),
         ));
 
-        let detail = format!(
-            "{detail_prefix}{} · {}",
-            ws.branch().unwrap_or_else(|| "shell".into()),
-            mobile_tab_status(ws)
-        );
+        let source = if ws.is_machine() {
+            "ssh".to_string()
+        } else {
+            ws.branch().unwrap_or_else(|| "shell".into())
+        };
+        let detail = format!("{detail_prefix}{source} · {}", mobile_tab_status(ws));
         render_two_line_item(
             frame,
             viewport,

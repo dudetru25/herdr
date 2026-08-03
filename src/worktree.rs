@@ -1,4 +1,6 @@
 use std::ffi::OsString;
+use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_WORKTREE_PREFIX: &str = "worktree";
@@ -147,8 +149,95 @@ pub(crate) fn expand_tilde_absolute_path(path: &str) -> PathBuf {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CanonicalPathError {
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl CanonicalPathError {
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> io::ErrorKind {
+        self.source.kind()
+    }
+}
+
+impl fmt::Display for CanonicalPathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "failed to canonicalize {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for CanonicalPathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub(crate) fn canonical_path(path: &Path) -> Result<PathBuf, CanonicalPathError> {
+    std::fs::canonicalize(path).map_err(|source| CanonicalPathError {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Canonicalizes every existing ancestor and rejects a missing path containing `..`.
+///
+/// Safe for proving where a path *would* live when its leaf is legitimately absent, such as the
+/// stale admin directory of a leftover worktree checkout.
+pub(crate) fn canonical_new_path(path: &Path) -> Result<PathBuf, CanonicalPathError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => canonical_path(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            {
+                return Err(CanonicalPathError {
+                    path: path.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cannot canonicalize a missing path containing '..'",
+                    ),
+                });
+            }
+            let Some(parent) = path.parent() else {
+                return Err(CanonicalPathError {
+                    path: path.to_path_buf(),
+                    source: err,
+                });
+            };
+            let Some(file_name) = path.file_name() else {
+                return canonical_path(path);
+            };
+            canonical_new_path(parent).map(|parent| parent.join(file_name))
+        }
+        Err(source) => Err(CanonicalPathError {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Best-effort identity for non-destructive path comparisons.
+///
+/// Decisions that authorize removal must use [`canonical_path`] instead.
 pub(crate) fn canonical_or_original(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    canonical_path(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Stable identity for coordinating create and remove operations.
+///
+/// Resolving the deepest existing ancestor keeps a missing checkout beneath a symlink keyed the
+/// same way after Git materializes it. This key only coordinates operations and does not authorize
+/// filesystem removal.
+pub(crate) fn worktree_operation_key(path: &Path) -> Result<PathBuf, CanonicalPathError> {
+    canonical_new_path(path)
 }
 
 pub(crate) fn default_checkout_path(root: &Path, repo_name: &str, branch: &str) -> PathBuf {
@@ -197,7 +286,29 @@ pub(crate) fn worktree_dirty_remove_message(path: &Path) -> String {
 }
 
 #[cfg(any(windows, test))]
-pub(crate) fn checkout_has_dirty_files(path: &Path) -> Result<bool, String> {
+#[derive(Debug)]
+pub(crate) struct CheckoutStatusError {
+    path: PathBuf,
+    message: String,
+}
+
+#[cfg(any(windows, test))]
+impl fmt::Display for CheckoutStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "could not determine whether {} is clean: {}",
+            self.path.display(),
+            self.message
+        )
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::error::Error for CheckoutStatusError {}
+
+#[cfg(any(windows, test))]
+pub(crate) fn checkout_has_dirty_files(path: &Path) -> Result<bool, CheckoutStatusError> {
     let path_arg = path.display().to_string();
     let output = crate::noninteractive_process::command("git")
         .args([
@@ -208,7 +319,10 @@ pub(crate) fn checkout_has_dirty_files(path: &Path) -> Result<bool, String> {
             "--untracked-files=all",
         ])
         .output()
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| CheckoutStatusError {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
 
     if output.status.success() {
         return Ok(!output.stdout.is_empty());
@@ -217,11 +331,20 @@ pub(crate) fn checkout_has_dirty_files(path: &Path) -> Result<bool, String> {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !stderr.is_empty() {
-        Err(stderr)
+        Err(CheckoutStatusError {
+            path: path.to_path_buf(),
+            message: stderr,
+        })
     } else if !stdout.is_empty() {
-        Err(stdout)
+        Err(CheckoutStatusError {
+            path: path.to_path_buf(),
+            message: stdout,
+        })
     } else {
-        Err(format!("git status failed with status {}", output.status))
+        Err(CheckoutStatusError {
+            path: path.to_path_buf(),
+            message: format!("git status failed with status {}", output.status),
+        })
     }
 }
 
@@ -356,6 +479,12 @@ pub(crate) fn run_worktree_remove_command_with_recovery(
 
 fn leftover_worktree_checkout_matches_repo(repo_root: &Path, path: &Path) -> bool {
     let git_file = path.join(".git");
+    let Ok(metadata) = std::fs::symlink_metadata(&git_file) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
     let Ok(content) = std::fs::read_to_string(&git_file) else {
         return false;
     };
@@ -371,7 +500,36 @@ fn leftover_worktree_checkout_matches_repo(repo_root: &Path, path: &Path) -> boo
     let Some(worktrees_dir) = git_common_worktrees_dir(repo_root) else {
         return false;
     };
-    canonical_or_original(&gitdir).starts_with(canonical_or_original(&worktrees_dir))
+    let (Ok(gitdir), Ok(worktrees_dir)) = (
+        canonical_new_path(&gitdir),
+        canonical_new_path(&worktrees_dir),
+    ) else {
+        return false;
+    };
+    if gitdir.parent() != Some(worktrees_dir.as_path()) {
+        return false;
+    }
+    std::fs::symlink_metadata(&gitdir)
+        .is_ok_and(|_| worktree_admin_record_matches_checkout(&gitdir, path))
+}
+
+fn worktree_admin_record_matches_checkout(gitdir: &Path, checkout: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(gitdir.join("gitdir")) else {
+        return false;
+    };
+    let admin_checkout = PathBuf::from(content.trim());
+    let admin_checkout = if admin_checkout.is_absolute() {
+        admin_checkout
+    } else {
+        gitdir.join(admin_checkout)
+    };
+    let Ok(expected_checkout) = canonical_path(checkout).map(|path| path.join(".git")) else {
+        return false;
+    };
+    let Ok(admin_checkout) = canonical_path(&admin_checkout) else {
+        return false;
+    };
+    admin_checkout == expected_checkout
 }
 
 fn git_common_worktrees_dir(repo_root: &Path) -> Option<PathBuf> {
@@ -492,10 +650,14 @@ pub(crate) fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWo
 }
 
 pub(crate) fn worktree_list_contains_path(repo_root: &Path, path: &Path) -> Result<bool, String> {
-    let expected = canonical_or_original(path);
-    Ok(list_existing_worktrees(repo_root)?
-        .into_iter()
-        .any(|entry| canonical_or_original(&entry.path) == expected))
+    let expected = canonical_path(path).map_err(|err| err.to_string())?;
+    for entry in list_existing_worktrees(repo_root)? {
+        let entry = canonical_path(&entry.path).map_err(|err| err.to_string())?;
+        if entry == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -712,6 +874,115 @@ prunable stale
     }
 
     #[test]
+    fn canonical_path_reports_missing_path_instead_of_using_lexical_identity() {
+        let path = unique_temp_path("missing-canonical-path");
+
+        let err = canonical_path(&path).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn worktree_membership_check_errors_when_path_identity_is_unknown() {
+        let path = unique_temp_path("missing-membership-path");
+
+        let err = worktree_list_contains_path(Path::new("."), &path).unwrap_err();
+
+        assert!(err.contains("failed to canonicalize"));
+        assert!(err.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn canonical_new_path_resolves_existing_parent_for_missing_checkout() {
+        let root = unique_temp_path("canonical-new-path");
+        std::fs::create_dir_all(&root).unwrap();
+        let checkout = root.join("missing").join("checkout");
+
+        let resolved = canonical_new_path(&checkout).unwrap();
+
+        assert_eq!(
+            resolved,
+            root.canonicalize()
+                .unwrap()
+                .join("missing")
+                .join("checkout")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_new_path_rejects_broken_symlink() {
+        let root = unique_temp_path("canonical-broken-link");
+        std::fs::create_dir_all(&root).unwrap();
+        let link = root.join("checkout");
+        std::os::unix::fs::symlink(root.join("missing-target"), &link).unwrap();
+
+        let err = canonical_new_path(&link).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canonical_new_path_rejects_unresolved_parent_components() {
+        let root = unique_temp_path("canonical-parent-component");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("missing").join("..").join("checkout");
+
+        let err = canonical_new_path(&path).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_operation_key_resolves_symlink_before_parent_component() {
+        let root = unique_temp_path("operation-key-symlink-parent");
+        let checkout_root = root.join("checkouts");
+        let outside = root.join("outside");
+        let nested = outside.join("nested");
+        let outside_checkout = outside.join("checkout");
+        let lexical_checkout = checkout_root.join("checkout");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&outside_checkout).unwrap();
+        std::fs::create_dir_all(&lexical_checkout).unwrap();
+        std::os::unix::fs::symlink(&nested, checkout_root.join("link")).unwrap();
+        let alias = checkout_root.join("link").join("..").join("checkout");
+
+        let alias_key = worktree_operation_key(&alias).unwrap();
+
+        assert_eq!(
+            alias_key,
+            worktree_operation_key(&outside_checkout).unwrap()
+        );
+        assert_ne!(
+            alias_key,
+            worktree_operation_key(&lexical_checkout).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_operation_key_rejects_missing_symlink_parent_alias() {
+        let root = unique_temp_path("operation-key-missing-symlink-parent");
+        let checkout_root = root.join("checkouts");
+        let nested = root.join("outside").join("nested");
+        std::fs::create_dir_all(&checkout_root).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::os::unix::fs::symlink(&nested, checkout_root.join("link")).unwrap();
+        let alias = checkout_root.join("link").join("..").join("checkout");
+
+        let err = worktree_operation_key(&alias).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn checkout_dirty_detection_reports_clean_and_dirty_worktrees() {
         let repo = create_committed_repo("worktree-dirty-detection-repo");
         let checkout = unique_temp_path("worktree-dirty-detection-checkout");
@@ -728,13 +999,22 @@ prunable stale
             ],
         );
 
-        assert_eq!(checkout_has_dirty_files(&checkout), Ok(false));
+        assert!(matches!(checkout_has_dirty_files(&checkout), Ok(false)));
         std::fs::write(checkout.join("README.md"), "dirty\n").unwrap();
-        assert_eq!(checkout_has_dirty_files(&checkout), Ok(true));
+        assert!(matches!(checkout_has_dirty_files(&checkout), Ok(true)));
 
         let remove = build_worktree_remove_command(&repo, &checkout, true);
         run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn checkout_dirty_detection_reports_unknown_for_missing_checkout() {
+        let checkout = unique_temp_path("missing-dirty-detection-checkout");
+
+        let err = checkout_has_dirty_files(&checkout).unwrap_err();
+
+        assert!(err.to_string().contains("could not determine whether"));
     }
 
     #[test]
@@ -865,7 +1145,7 @@ prunable stale
     }
 
     #[test]
-    fn forced_worktree_remove_recovers_leftover_unregistered_checkout() {
+    fn forced_worktree_remove_recovery_rejects_missing_admin_record() {
         let repo = create_committed_repo("worktree-recovery-repo");
         let checkout = unique_temp_path("worktree-recovery-checkout");
         let branch = "worktree/recovery";
@@ -883,9 +1163,12 @@ prunable stale
         .unwrap();
         std::fs::write(checkout.join("leftover"), "leftover\n").unwrap();
 
-        run_worktree_remove_command_with_recovery(&remove, &repo, &checkout, true).unwrap();
+        let err = run_worktree_remove_command_with_recovery(&remove, &repo, &checkout, true)
+            .expect_err("a missing admin record cannot prove checkout identity");
 
-        assert!(!checkout.exists());
+        assert!(is_not_working_tree_remove_error(&err));
+        assert!(checkout.join("leftover").exists());
+        let _ = std::fs::remove_dir_all(checkout);
         let _ = std::fs::remove_dir_all(repo);
     }
 
@@ -907,6 +1190,64 @@ prunable stale
 
         assert!(is_not_working_tree_remove_error(&err));
         assert!(checkout.join("unrelated").exists());
+        let _ = std::fs::remove_dir_all(checkout);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn forced_worktree_remove_recovery_rejects_another_active_worktree_admin_record() {
+        let repo = create_committed_repo("worktree-recovery-active-admin-repo");
+        let checkout = unique_temp_path("worktree-recovery-active-admin-checkout");
+        let other_checkout = unique_temp_path("worktree-recovery-active-admin-other");
+        let add = build_worktree_add_new_branch_command(
+            &repo,
+            &other_checkout,
+            "worktree/recovery-active-admin",
+            "HEAD",
+        );
+        run_worktree_command(&add).unwrap();
+        let other_git_file = std::fs::read_to_string(other_checkout.join(".git")).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join(".git"), other_git_file).unwrap();
+        std::fs::write(checkout.join("unrelated"), "do not delete\n").unwrap();
+        let remove = build_worktree_remove_command(&repo, &checkout, true);
+
+        let err = run_worktree_remove_command_with_recovery(&remove, &repo, &checkout, true)
+            .expect_err("another active worktree admin record must be rejected");
+
+        assert!(is_not_working_tree_remove_error(&err));
+        assert!(checkout.join("unrelated").exists());
+        let remove_other = build_worktree_remove_command(&repo, &other_checkout, true);
+        run_worktree_command(&remove_other).unwrap();
+        let _ = std::fs::remove_dir_all(checkout);
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_worktree_remove_recovery_rejects_symlinked_active_worktree_git_file() {
+        let repo = create_committed_repo("worktree-recovery-symlinked-git-repo");
+        let checkout = unique_temp_path("worktree-recovery-symlinked-git-checkout");
+        let other_checkout = unique_temp_path("worktree-recovery-symlinked-git-other");
+        let add = build_worktree_add_new_branch_command(
+            &repo,
+            &other_checkout,
+            "worktree/recovery-symlinked-git",
+            "HEAD",
+        );
+        run_worktree_command(&add).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::os::unix::fs::symlink(other_checkout.join(".git"), checkout.join(".git")).unwrap();
+        std::fs::write(checkout.join("unrelated"), "do not delete\n").unwrap();
+        let remove = build_worktree_remove_command(&repo, &checkout, true);
+
+        let err = run_worktree_remove_command_with_recovery(&remove, &repo, &checkout, true)
+            .expect_err("a symlinked active worktree admin record must be rejected");
+
+        assert!(is_not_working_tree_remove_error(&err));
+        assert!(checkout.join("unrelated").exists());
+        let remove_other = build_worktree_remove_command(&repo, &other_checkout, true);
+        run_worktree_command(&remove_other).unwrap();
         let _ = std::fs::remove_dir_all(checkout);
         let _ = std::fs::remove_dir_all(repo);
     }

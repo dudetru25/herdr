@@ -15,7 +15,10 @@ impl App {
         plugin: &InstalledPluginInfo,
         pane: PluginManifestPane,
     ) -> String {
-        let context = self.current_plugin_context("plugin-pane");
+        let context = match self.current_plugin_context("plugin-pane") {
+            Ok(context) => context,
+            Err(err) => return encode_error(id, err.code, err.message),
+        };
         let extra_env =
             match self.plugin_pane_launch_env(plugin, &pane.id, params.env.clone(), &context) {
                 Ok(env) => env,
@@ -48,7 +51,10 @@ impl App {
         plugin: &InstalledPluginInfo,
         pane: PluginManifestPane,
     ) -> String {
-        let context = self.current_plugin_context("plugin-pane");
+        let context = match self.current_plugin_context("plugin-pane") {
+            Ok(context) => context,
+            Err(err) => return encode_error(id, err.code, err.message),
+        };
         let extra_env =
             match self.plugin_pane_launch_env(plugin, &pane.id, params.env.clone(), &context) {
                 Ok(env) => env,
@@ -97,7 +103,10 @@ impl App {
                 format!("pane {target_pane_id} not found"),
             );
         };
-        let context = self.plugin_context_for_pane(ws_idx, target_pane, "plugin-pane");
+        let context = match self.plugin_context_for_pane(ws_idx, target_pane, "plugin-pane") {
+            Ok(context) => context,
+            Err(err) => return encode_error(id, err.code, err.message),
+        };
         let extra_env =
             match self.plugin_pane_launch_env(plugin, &pane.id, params.env.clone(), &context) {
                 Ok(env) => env,
@@ -185,7 +194,10 @@ impl App {
             },
         };
         let cwd = self.plugin_pane_cwd(plugin, params.cwd);
-        let context = self.plugin_context_for_workspace(ws_idx, "plugin-pane");
+        let context = match self.plugin_context_for_workspace(ws_idx, "plugin-pane") {
+            Ok(context) => context,
+            Err(err) => return encode_error(id, err.code, err.message),
+        };
         let extra_env =
             match self.plugin_pane_launch_env(plugin, &pane.id, params.env.clone(), &context) {
                 Ok(env) => env,

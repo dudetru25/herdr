@@ -19,10 +19,11 @@ pub use self::{
         IndexedKeybind, Keybinds, LiveKeybindConfig,
     },
     model::{
-        validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
-        ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, ShellModeConfig,
-        SidebarCollapsedModeConfig, TabBarPositionConfig, ToastClipboardPosition, ToastConfig,
-        ToastDelivery, ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
+        machine_ssh_argv, validated_sidebar_bounds, AgentPanelSortConfig, Config,
+        ConfigReloadReport, ConfigReloadStatus, HostCursorModeConfig, MachineConfig,
+        MachineLookupError, NewTerminalCwdConfig, ShellModeConfig, SidebarCollapsedModeConfig,
+        TabBarPositionConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
+        ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
@@ -32,7 +33,10 @@ pub use self::{
     theme::{parse_color, CustomThemeColors, ThemeConfig},
 };
 
-pub(crate) use self::io::upsert_top_level_bool;
+pub(crate) use self::io::{
+    append_machine_config, resolve_config_write_target, upsert_top_level_bool,
+    MachineConfigEditError,
+};
 pub(crate) use self::keybinds::parse_key_combo;
 
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";

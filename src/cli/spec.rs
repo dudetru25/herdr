@@ -34,6 +34,7 @@ pub(super) fn command() -> Command {
         .subcommand(server_command())
         .subcommand(api_command())
         .subcommand(workspace_command())
+        .subcommand(machine_command())
         .subcommand(worktree_command())
         .subcommand(tab_command())
         .subcommand(notification_command())
@@ -196,6 +197,7 @@ fn workspace_command() -> Command {
             Command::new("create")
                 .about("Create a workspace")
                 .arg(path_option("cwd", "PATH"))
+                .arg(option("machine", "NAME").conflicts_with("cwd"))
                 .arg(option("label", "TEXT"))
                 .arg(env_option())
                 .arg(flag("focus"))
@@ -235,6 +237,12 @@ fn workspace_command() -> Command {
                 .arg(option("ttl-ms", "N")),
         )
         .subcommand(id_command("close", "workspace_id", "Close a workspace"))
+}
+
+fn machine_command() -> Command {
+    Command::new("machine")
+        .about("Inspect configured SSH machines")
+        .subcommand(Command::new("list").about("List configured SSH machines"))
 }
 
 fn worktree_command() -> Command {

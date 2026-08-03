@@ -46,6 +46,13 @@ pub(crate) fn configure_background_command(command: &mut std::process::Command) 
     configure_background_command_platform(command);
 }
 
+pub(crate) fn replace_file(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    replace_file_platform(source, target)
+}
+
 #[cfg(not(windows))]
 fn configure_background_command_platform(_command: &mut std::process::Command) {}
 

@@ -50,10 +50,34 @@ impl App {
             Err((code, message)) => return encode_error(id, &code, message),
         };
         let (rows, cols) = self.state.estimate_pane_size();
-        let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
-            let follow_cwd = self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
-            Some(self.resolve_new_terminal_cwd(follow_cwd))
-        });
+        let machine_argv = match self.state.machine_ssh_argv_for_workspace(ws_idx) {
+            Ok(argv) => argv,
+            Err(err) => return encode_error(id, "pane_split_failed", err.to_string()),
+        };
+        if machine_argv.is_some() && params.cwd.is_some() {
+            return encode_error(
+                id,
+                "pane_split_failed",
+                "cwd is not supported for machine workspace splits",
+            );
+        }
+        let split_cwd = if machine_argv.is_some() {
+            self.state
+                .workspaces
+                .get(ws_idx)
+                .map(|workspace| workspace.identity_cwd.clone())
+        } else {
+            match params.cwd.map(std::path::PathBuf::from) {
+                Some(cwd) => Some(cwd),
+                None => {
+                    let follow_cwd = self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
+                    match self.resolve_new_terminal_cwd(follow_cwd) {
+                        Ok(cwd) => Some(cwd),
+                        Err(err) => return encode_error(id, "pane_split_failed", err.to_string()),
+                    }
+                }
+            }
+        };
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
@@ -67,8 +91,35 @@ impl App {
             crate::api::schema::SplitDirection::Down => ratatui::layout::Direction::Vertical,
         };
         let shell_config = crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode);
-        let split_result = match params.ratio {
-            Some(ratio) => ws.split_pane_with_ratio(
+        let split_result = match (machine_argv.as_deref(), params.ratio) {
+            (Some(argv), Some(ratio)) => ws.split_pane_argv_command_with_ratio(
+                target_pane_id,
+                direction,
+                ratio,
+                rows,
+                cols,
+                split_cwd,
+                argv,
+                extra_env,
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                host_terminal_appearance,
+                params.focus,
+            ),
+            (Some(argv), None) => ws.split_pane_argv_command(
+                target_pane_id,
+                direction,
+                rows,
+                cols,
+                split_cwd,
+                argv,
+                extra_env,
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                host_terminal_appearance,
+                params.focus,
+            ),
+            (None, Some(ratio)) => ws.split_pane_with_ratio(
                 target_pane_id,
                 direction,
                 ratio,
@@ -82,7 +133,7 @@ impl App {
                 extra_env,
                 params.focus,
             ),
-            None => ws.split_pane(
+            (None, None) => ws.split_pane(
                 target_pane_id,
                 direction,
                 rows,
@@ -922,12 +973,21 @@ impl App {
                 (target_ws_idx, target_tab_idx, moved_pane_id)
             }
             ResolvedPaneMoveDestination::NewWorkspace { label, tab_label } => {
-                let identity_cwd = self
+                let identity_cwd = match self
                     .state
                     .terminals
                     .get(&source_terminal_id)
                     .map(|terminal| terminal.cwd.clone())
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+                {
+                    Some(cwd) => cwd,
+                    None => match std::env::current_dir() {
+                        Ok(cwd) => cwd,
+                        Err(err) => {
+                            self.recover_failed_pane_move(recovery_context, moved);
+                            return encode_error(id, "pane_move_failed", err.to_string());
+                        }
+                    },
+                };
                 let moved_pane_id = moved.pane_id;
                 let workspace = crate::workspace::Workspace::from_existing_pane(
                     label,
@@ -1880,7 +1940,7 @@ mod tests {
     use super::*;
     use crate::{
         api::schema::{ErrorResponse, SplitDirection, SuccessResponse},
-        config::Config,
+        config::{Config, MachineConfig},
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
@@ -1949,6 +2009,47 @@ mod tests {
     fn metadata_error_code(response: &str) -> String {
         let response: ErrorResponse = serde_json::from_str(response).unwrap();
         response.error.code
+    }
+
+    #[tokio::test]
+    async fn machine_pane_split_spawns_current_ssh_argv() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.workspaces[0].machine = Some("build".into());
+        app.state.workspaces[0].identity_cwd = std::env::current_dir().unwrap();
+        app.state.machines = vec![MachineConfig {
+            name: "build".into(),
+            target: "-V".into(),
+            cwd: None,
+        }];
+
+        let response = app.handle_pane_split(
+            "machine-split".into(),
+            PaneSplitParams {
+                workspace_id: None,
+                target_pane_id: Some(public_pane_id),
+                direction: SplitDirection::Right,
+                ratio: None,
+                cwd: None,
+                focus: true,
+                env: Default::default(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = success.result else {
+            panic!("expected pane info");
+        };
+        let (_, pane_id) = app.parse_pane_id(&pane.pane_id).unwrap();
+        let terminal_id = app.state.workspaces[0].terminal_id(pane_id).unwrap();
+        assert_eq!(
+            app.state.terminals[terminal_id]
+                .launch_argv
+                .as_ref()
+                .unwrap(),
+            &["ssh".to_string(), "-t".to_string(), "-V".to_string()]
+        );
+
+        super::super::test_support::shutdown_test_runtimes(&mut app);
     }
 
     #[tokio::test]

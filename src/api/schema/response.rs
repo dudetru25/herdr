@@ -6,6 +6,7 @@ use super::events::EventEnvelope;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
 };
+use super::machines::MachineInfo;
 use super::panes::{
     LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
     PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult, PaneResizeResult,
@@ -18,6 +19,10 @@ use super::plugins::{
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
+use super::worker_runs::{
+    WorkerRunCancellationDisposition, WorkerRunRecord, WorkerRunResultManifest,
+    WorkerRunSubmissionDisposition,
+};
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::{WorktreeInfo, WorktreeSourceInfo};
 
@@ -61,6 +66,12 @@ pub enum ResponseResult {
     },
     WorkspaceList {
         workspaces: Vec<WorkspaceInfo>,
+    },
+    MachineList {
+        machines: Vec<MachineInfo>,
+    },
+    MachineAdded {
+        machine: MachineInfo,
     },
     WorkspaceParentSpace {
         parent_workspace_id: String,
@@ -111,6 +122,20 @@ pub enum ResponseResult {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+    },
+    WorkerRunSubmitted {
+        run: WorkerRunRecord,
+        disposition: WorkerRunSubmissionDisposition,
+    },
+    WorkerRun {
+        run: WorkerRunRecord,
+    },
+    WorkerRunCancelled {
+        run: WorkerRunRecord,
+        disposition: WorkerRunCancellationDisposition,
+    },
+    WorkerRunResult {
+        result: WorkerRunResultManifest,
     },
     AgentView {
         active: bool,

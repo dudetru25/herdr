@@ -310,6 +310,8 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(" ");
-    let mut state = ListState::default().with_selected(Some(menu.list.highlighted));
+    let mut state = ListState::default()
+        .with_offset(menu.visible_offset(inner.height as usize))
+        .with_selected(Some(menu.list.highlighted));
     frame.render_stateful_widget(list, inner, &mut state);
 }

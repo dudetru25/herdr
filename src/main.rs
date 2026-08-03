@@ -99,6 +99,9 @@ mod terminal_notify;
 mod terminal_theme;
 mod ui;
 mod update;
+mod worker_adapters;
+mod worker_placements;
+mod worker_runs;
 mod workspace;
 mod worktree;
 
@@ -146,6 +149,14 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Use "follow" to inherit the source pane/workspace, "home" for $HOME,
 # "current" for Herdr's process directory, or a fixed path such as "~/Projects".
 # new_cwd = "follow"
+
+# Register SSH destinations for machine-backed workspaces.
+# Each name must be unique; cwd is an optional directory on the remote machine.
+# [[machines]]
+# name = "build"
+# target = "builder@example.com"
+# cwd requires a POSIX-compatible remote login shell.
+# cwd = "~/src/project"
 
 [update]
 # Update channel used by background version checks and `herdr update`.

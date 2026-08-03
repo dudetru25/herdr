@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{collections::BTreeSet, fmt, num::NonZeroUsize};
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -241,6 +241,148 @@ pub struct TerminalConfig {
     pub new_cwd: NewTerminalCwdConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MachineConfig {
+    pub name: String,
+    pub target: String,
+    /// Optional working directory for a POSIX-compatible remote login shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachineConfigValidationError {
+    EmptyName { index: usize },
+    EmptyTarget { name: String },
+    OptionLikeTarget { name: String },
+    EmptyCwd { name: String },
+    DuplicateName { name: String },
+}
+
+impl fmt::Display for MachineConfigValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyName { index } => {
+                write!(formatter, "machines[{index}].name must not be empty")
+            }
+            Self::EmptyTarget { name } => {
+                write!(formatter, "machine {name:?} target must not be empty")
+            }
+            Self::OptionLikeTarget { name } => {
+                write!(formatter, "machine {name:?} target must not start with '-'")
+            }
+            Self::EmptyCwd { name } => {
+                write!(formatter, "machine {name:?} cwd must not be empty")
+            }
+            Self::DuplicateName { name } => {
+                write!(formatter, "machine name {name:?} must be unique")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MachineConfigValidationError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineLookupError {
+    name: String,
+}
+
+impl fmt::Display for MachineLookupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "machine {:?} is not configured", self.name)
+    }
+}
+
+impl std::error::Error for MachineLookupError {}
+
+pub(super) fn validate_machines(
+    machines: &[MachineConfig],
+) -> Result<(), MachineConfigValidationError> {
+    let mut names = BTreeSet::new();
+    for (index, machine) in machines.iter().enumerate() {
+        if machine.name.trim().is_empty() {
+            return Err(MachineConfigValidationError::EmptyName { index });
+        }
+        if machine.target.trim().is_empty() {
+            return Err(MachineConfigValidationError::EmptyTarget {
+                name: machine.name.clone(),
+            });
+        }
+        if machine.target.trim_start().starts_with('-') {
+            return Err(MachineConfigValidationError::OptionLikeTarget {
+                name: machine.name.clone(),
+            });
+        }
+        if machine
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd.trim().is_empty())
+        {
+            return Err(MachineConfigValidationError::EmptyCwd {
+                name: machine.name.clone(),
+            });
+        }
+        if !names.insert(machine.name.as_str()) {
+            return Err(MachineConfigValidationError::DuplicateName {
+                name: machine.name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn deserialize_machines<'de, D>(deserializer: D) -> Result<Vec<MachineConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let machines = Vec::<MachineConfig>::deserialize(deserializer)?;
+    validate_machines(&machines).map_err(de::Error::custom)?;
+    Ok(machines)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+// A leading tilde must stay outside the single quotes or the remote shell
+// takes it literally.
+fn remote_cd_target(cwd: &str) -> String {
+    if cwd == "~" {
+        "\"$HOME\"".to_string()
+    } else if let Some(rest) = cwd.strip_prefix("~/") {
+        format!("\"$HOME\"/{}", shell_single_quote(rest))
+    } else {
+        shell_single_quote(cwd)
+    }
+}
+
+impl MachineConfig {
+    pub fn ssh_argv(&self) -> Vec<String> {
+        let mut argv = vec!["ssh".to_string(), "-t".to_string(), self.target.clone()];
+        if let Some(cwd) = self.cwd.as_deref() {
+            argv.push(format!(
+                "cd {} && exec \"$SHELL\" -l",
+                remote_cd_target(cwd)
+            ));
+        }
+        argv
+    }
+}
+
+pub fn machine_ssh_argv(
+    machines: &[MachineConfig],
+    name: &str,
+) -> Result<Vec<String>, MachineLookupError> {
+    machines
+        .iter()
+        .find(|machine| machine.name == name)
+        .map(MachineConfig::ssh_argv)
+        .ok_or_else(|| MachineLookupError {
+            name: name.to_string(),
+        })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct SessionConfig {
@@ -290,6 +432,8 @@ pub struct Config {
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
+    #[serde(deserialize_with = "deserialize_machines")]
+    pub machines: Vec<MachineConfig>,
     pub session: SessionConfig,
     pub update: UpdateConfig,
     pub keys: KeysConfig,
@@ -1125,6 +1269,151 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_registry_parses_valid_entries() {
+        let config: Config = toml::from_str(
+            r#"
+[[machines]]
+name = "build"
+target = "builder@example.test"
+
+[[machines]]
+name = "prod"
+target = "ssh://prod.example.test:2222"
+cwd = "/srv/app"
+"#,
+        )
+        .expect("valid machine registry");
+
+        assert_eq!(
+            config.machines,
+            vec![
+                MachineConfig {
+                    name: "build".into(),
+                    target: "builder@example.test".into(),
+                    cwd: None,
+                },
+                MachineConfig {
+                    name: "prod".into(),
+                    target: "ssh://prod.example.test:2222".into(),
+                    cwd: Some("/srv/app".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn machine_registry_rejects_unsafe_or_ambiguous_entries() {
+        let cases = [
+            (
+                r#"[[machines]]
+name = " "
+target = "host"
+"#,
+                "machines[0].name must not be empty",
+            ),
+            (
+                r#"[[machines]]
+name = "build"
+target = " "
+"#,
+                "machine \"build\" target must not be empty",
+            ),
+            (
+                r#"[[machines]]
+name = "build"
+target = "  -oProxyCommand=anything"
+"#,
+                "machine \"build\" target must not start with '-'",
+            ),
+            (
+                r#"[[machines]]
+name = "build"
+target = "builder"
+cwd = " "
+"#,
+                "machine \"build\" cwd must not be empty",
+            ),
+            (
+                r#"[[machines]]
+name = "build"
+target = "one"
+
+[[machines]]
+name = "build"
+target = "two"
+"#,
+                "machine name \"build\" must be unique",
+            ),
+        ];
+
+        for (toml, expected) in cases {
+            let error = toml::from_str::<Config>(toml).expect_err("invalid machine registry");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn machine_ssh_argv_quotes_remote_cwd_for_the_shell() {
+        let without_cwd = MachineConfig {
+            name: "build".into(),
+            target: "builder".into(),
+            cwd: None,
+        };
+        assert_eq!(without_cwd.ssh_argv(), vec!["ssh", "-t", "builder"]);
+
+        let with_cwd = MachineConfig {
+            name: "prod".into(),
+            target: "deploy@prod".into(),
+            cwd: Some("/srv/it's live".into()),
+        };
+        assert_eq!(
+            with_cwd.ssh_argv(),
+            vec![
+                "ssh",
+                "-t",
+                "deploy@prod",
+                "cd '/srv/it'\\''s live' && exec \"$SHELL\" -l",
+            ]
+        );
+    }
+
+    #[test]
+    fn machine_ssh_argv_expands_leading_tilde_outside_quotes() {
+        let home_relative = MachineConfig {
+            name: "build".into(),
+            target: "builder".into(),
+            cwd: Some("~/src/herdr".into()),
+        };
+        assert_eq!(
+            home_relative.ssh_argv(),
+            vec![
+                "ssh",
+                "-t",
+                "builder",
+                "cd \"$HOME\"/'src/herdr' && exec \"$SHELL\" -l",
+            ]
+        );
+
+        let bare_home = MachineConfig {
+            name: "build".into(),
+            target: "builder".into(),
+            cwd: Some("~".into()),
+        };
+        assert_eq!(
+            bare_home.ssh_argv(),
+            vec!["ssh", "-t", "builder", "cd \"$HOME\" && exec \"$SHELL\" -l"]
+        );
+    }
+
+    #[test]
+    fn missing_machine_returns_typed_lookup_error() {
+        let error = machine_ssh_argv(&[], "removed").expect_err("missing machine");
+
+        assert_eq!(error.to_string(), "machine \"removed\" is not configured");
+        let _: &dyn std::error::Error = &error;
+    }
 
     #[test]
     fn update_config_defaults_and_parses() {

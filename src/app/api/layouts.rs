@@ -88,7 +88,6 @@ impl App {
                     .is_some_and(|ws| ws.active_tab_index() == target_tab)
         });
         let root_leaf = first_layout_leaf(&params.root);
-        let first_cwd = self.layout_root_cwd(ws_idx, replace_target, root_leaf);
         let (rows, cols) = self.state.estimate_pane_size();
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
@@ -102,12 +101,35 @@ impl App {
             Ok(command) => command,
             Err(message) => return encode_error(id, "invalid_layout", message),
         };
+        let machine_argv = if command.is_none() {
+            match self.state.machine_ssh_argv_for_workspace(ws_idx) {
+                Ok(argv) => argv,
+                Err(err) => return encode_error(id, "layout_apply_failed", err.to_string()),
+            }
+        } else {
+            None
+        };
+        if machine_argv.is_some() && root_leaf.cwd.is_some() {
+            return encode_error(
+                id,
+                "layout_apply_failed",
+                "cwd is not supported for machine workspace layout panes",
+            );
+        }
+        let first_cwd = if machine_argv.is_some() {
+            self.state.workspaces[ws_idx].identity_cwd.clone()
+        } else {
+            match self.layout_root_cwd(ws_idx, replace_target, root_leaf) {
+                Ok(cwd) => cwd,
+                Err(err) => return encode_error(id, "layout_apply_failed", err.to_string()),
+            }
+        };
 
         let created = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
                 return encode_error(id, "workspace_not_found", "workspace not found");
             };
-            if let Some(argv) = command.as_deref() {
+            if let Some(argv) = command.as_deref().or(machine_argv.as_deref()) {
                 ws.create_tab_argv_command(
                     rows,
                     cols,
@@ -337,9 +359,9 @@ impl App {
         ws_idx: usize,
         replace_target: Option<(usize, usize)>,
         pane: &LayoutPane,
-    ) -> PathBuf {
+    ) -> std::io::Result<PathBuf> {
         if let Some(cwd) = pane.cwd.as_ref() {
-            return PathBuf::from(cwd);
+            return Ok(PathBuf::from(cwd));
         }
         let follow_cwd = replace_target.and_then(|(_, tab_idx)| {
             let pane_id = self
@@ -401,11 +423,6 @@ impl App {
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
         let host_terminal_appearance = self.state.host_terminal_appearance;
-        let cwd = pane
-            .cwd
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id));
         let extra_env = super::env::normalize_launch_env(pane.env.clone())
             .map_err(|(_, message)| message.to_string())?;
         let direction = match direction {
@@ -413,11 +430,32 @@ impl App {
             SplitDirection::Down => Direction::Vertical,
         };
         let command = layout_command(pane)?;
+        let machine_argv = if command.is_none() {
+            self.state
+                .machine_ssh_argv_for_workspace(ws_idx)
+                .map_err(|err| err.to_string())?
+        } else {
+            None
+        };
+        if machine_argv.is_some() && pane.cwd.is_some() {
+            return Err("cwd is not supported for machine workspace layout panes".into());
+        }
+        let cwd = if machine_argv.is_some() {
+            self.state
+                .workspaces
+                .get(ws_idx)
+                .map(|workspace| workspace.identity_cwd.clone())
+        } else {
+            pane.cwd
+                .as_ref()
+                .map(PathBuf::from)
+                .or_else(|| self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id))
+        };
         let result = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
                 return Err("workspace not found".into());
             };
-            if let Some(argv) = command.as_deref() {
+            if let Some(argv) = command.as_deref().or(machine_argv.as_deref()) {
                 ws.split_pane_argv_command_with_ratio(
                     target_pane_id,
                     direction,
@@ -797,6 +835,41 @@ mod tests {
                 if layout.tab_id == app.public_tab_id(0, 0).unwrap()
                     && layout.panes.len() == 2
         ));
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn machine_layout_explicit_command_keeps_precedence_over_registry() {
+        let mut app = app_with_workspace();
+        app.state.workspaces[0].machine = Some("removed".into());
+        app.state.machines.clear();
+        let command = vec![exiting_test_command().to_string()];
+
+        let response = app.handle_layout_apply(
+            "machine-layout".into(),
+            LayoutApplyParams {
+                workspace_id: None,
+                tab_id: None,
+                tab_label: None,
+                focus: false,
+                root: LayoutNode::Pane {
+                    pane: LayoutPane {
+                        command: Some(command.clone()),
+                        ..Default::default()
+                    },
+                },
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::LayoutApply { .. }));
+        let created = app.state.workspaces[0].tabs.last().unwrap();
+        let terminal_id = created.terminal_id(created.root_pane).unwrap();
+        assert_eq!(
+            app.state.terminals[terminal_id].launch_argv.as_ref(),
+            Some(&command)
+        );
+
         shutdown_test_runtimes(&mut app);
     }
 

@@ -171,45 +171,29 @@ impl App {
         let entries = list
             .into_iter()
             .filter(|entry| !entry.is_bare && !entry.is_prunable)
-            .map(|entry| {
+            .map(|entry| -> Result<WorktreeOpenEntry, String> {
+                // Building the picker only describes state, so an unresolvable path must not fail
+                // the whole list. Decisions that authorize removal use `canonical_path` instead.
                 let entry_checkout_path = crate::worktree::canonical_or_original(&entry.path);
-                let entry_checkout_key = entry_checkout_path.display().to_string();
                 let repo_checkout_path = crate::worktree::canonical_or_original(&space.repo_root);
-                let already_open_ws_idx = self.state.workspaces.iter().position(|ws| {
-                    if let Some(membership) = ws.worktree_space() {
-                        return crate::worktree::canonical_or_original(&membership.checkout_path)
-                            == entry_checkout_path;
-                    }
-
-                    let git_space = ws.git_space().cloned().or_else(|| {
-                        ws.resolved_identity_cwd_from(
-                            &self.state.terminals,
-                            &self.terminal_runtimes,
-                        )
-                        .as_deref()
-                        .and_then(crate::workspace::git_space_metadata)
-                    });
-                    if git_space
-                        .as_ref()
-                        .is_some_and(|metadata| metadata.checkout_key == entry_checkout_key)
-                    {
-                        return true;
-                    }
-
-                    ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                        .as_deref()
-                        .is_some_and(|cwd| {
-                            crate::worktree::canonical_or_original(cwd) == entry_checkout_path
-                        })
-                });
-                WorktreeOpenEntry {
+                let already_open_ws_idx = self
+                    .open_workspace_idx_for_checkout(&entry_checkout_path)
+                    .map_err(|err| err.message)?;
+                Ok(WorktreeOpenEntry {
                     is_linked_worktree: entry_checkout_path != repo_checkout_path,
                     path: entry.path,
                     branch: entry.branch,
                     already_open_ws_idx,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>();
+        let entries = match entries {
+            Ok(entries) => entries,
+            Err(err) => {
+                self.state.config_diagnostic = Some(err);
+                return;
+            }
+        };
 
         if entries.is_empty() {
             self.state.config_diagnostic = Some("No Git worktrees found for this repo.".into());
@@ -360,7 +344,14 @@ impl App {
         let repo_name = open.repo_name.clone();
         self.state.worktree_open = None;
 
-        if let Some(ws_idx) = self.open_workspace_idx_for_checkout(&entry.path) {
+        let already_open_ws_idx = match self.open_workspace_idx_for_checkout(&entry.path) {
+            Ok(workspace) => workspace,
+            Err(err) => {
+                self.state.config_diagnostic = Some(err.message);
+                return;
+            }
+        };
+        if let Some(ws_idx) = already_open_ws_idx {
             self.mark_opened_existing_worktree_membership(
                 &source_workspace_id,
                 source_existing_membership,
@@ -640,12 +631,18 @@ impl App {
                     return None;
                 }
                 #[cfg(windows)]
-                if !remove.force_confirmation
-                    && crate::worktree::checkout_has_dirty_files(&remove.path).unwrap_or(false)
-                {
-                    remove.force_confirmation = true;
-                    remove.error = None;
-                    return None;
+                match crate::worktree::checkout_has_dirty_files(&remove.path) {
+                    Ok(false) => {}
+                    Ok(true) if remove.force_confirmation => {}
+                    Ok(true) => {
+                        remove.force_confirmation = true;
+                        remove.error = None;
+                        return None;
+                    }
+                    Err(err) => {
+                        remove.error = Some(err.to_string());
+                        return None;
+                    }
                 }
                 remove.removing = true;
                 remove.error = None;
@@ -750,12 +747,18 @@ impl App {
             return;
         }
         #[cfg(windows)]
-        if !remove.force_confirmation
-            && crate::worktree::checkout_has_dirty_files(&remove.path).unwrap_or(false)
-        {
-            remove.force_confirmation = true;
-            remove.error = None;
-            return;
+        match crate::worktree::checkout_has_dirty_files(&remove.path) {
+            Ok(false) => {}
+            Ok(true) if remove.force_confirmation => {}
+            Ok(true) => {
+                remove.force_confirmation = true;
+                remove.error = None;
+                return;
+            }
+            Err(err) => {
+                remove.error = Some(err.to_string());
+                return;
+            }
         }
 
         remove.removing = true;
@@ -819,7 +822,14 @@ impl App {
                 {
                     self.set_worktree_membership(source_ws_idx, source_membership, true);
                 }
-                if let Some(ws_idx) = self.open_workspace_idx_for_checkout(&path) {
+                let already_open_ws_idx = match self.open_workspace_idx_for_checkout(&path) {
+                    Ok(workspace) => workspace,
+                    Err(err) => {
+                        self.state.config_diagnostic = Some(err.message);
+                        return;
+                    }
+                };
+                if let Some(ws_idx) = already_open_ws_idx {
                     self.set_worktree_membership(
                         ws_idx,
                         crate::workspace::WorktreeSpaceMembership {

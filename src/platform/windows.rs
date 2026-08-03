@@ -2,8 +2,10 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_void, OsStr},
+    iter::once,
     mem::{size_of, MaybeUninit},
-    path::PathBuf,
+    os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
     ptr::{copy_nonoverlapping, null_mut},
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -20,6 +22,7 @@ use windows_sys::{
             NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
         },
         Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN},
+        Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
         System::{
             Console::GetConsoleWindow,
             DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
@@ -116,6 +119,32 @@ pub(crate) fn encode_windows_conpty_fallback(key: &crate::input::TerminalKey) ->
         )
         .into_bytes(),
     )
+}
+
+pub(crate) fn replace_file_platform(source: &Path, target: &Path) -> std::io::Result<()> {
+    let source_wide = source
+        .as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect::<Vec<_>>();
+    let target_wide = target
+        .as_os_str()
+        .encode_wide()
+        .chain(once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both path buffers are NUL-terminated and remain alive for the call.
+    let result = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

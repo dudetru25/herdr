@@ -16,9 +16,10 @@ mod input;
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write as _};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use crossterm::event::{
@@ -41,12 +42,15 @@ use crate::protocol::render_ansi;
 use crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
-    ClientMessage, NotifyKind, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    ClientMessage, NotifyKind, RenderEncoding, ServerMessage, LIVE_HANDOFF_RECONNECT_REASON,
+    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use crate::server::socket_paths::client_socket_path;
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+const LIVE_HANDOFF_RECONNECT_TIMEOUT: Duration = Duration::from_secs(300);
+const LIVE_HANDOFF_RECONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // Client state
@@ -73,6 +77,8 @@ struct ClientState {
     keyboard_report_all_active: bool,
     /// The terminal size we reported to the server in our last Hello/Resize.
     reported_size: (u16, u16),
+    /// The terminal cell size we reported to the server in our last Hello/Resize.
+    reported_cell_size: (u32, u32),
     /// Client-local sound playback config, refreshed on server request.
     sound_config: crate::config::SoundConfig,
     /// Whether this client may write Kitty graphics bytes to its host terminal.
@@ -353,6 +359,15 @@ fn setup_terminal_with_capabilities(
     mouse_capture: bool,
 ) -> io::Result<TerminalGuard> {
     ratatui::init();
+    let mut guard = TerminalGuard {
+        reset_modify_other_keys: false,
+        reset_host_color_scheme_reports: false,
+        reset_bracketed_paste: false,
+        reset_focus_change: false,
+        reset_keyboard_enhancements: false,
+        #[cfg(windows)]
+        restore_windows_input_mode: None,
+    };
     crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
     let host_color_scheme_reports =
         should_enable_host_color_scheme_reports(enable_client_protocols);
@@ -363,15 +378,25 @@ fn setup_terminal_with_capabilities(
         } else {
             set_mouse_capture(false)?;
         }
+        guard.reset_bracketed_paste = true;
+        guard.reset_focus_change = true;
         execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange)?;
         if host_color_scheme_reports {
+            guard.reset_host_color_scheme_reports = true;
             write_host_color_scheme_report_mode(&mut io::stdout(), true)?;
         }
+        guard.reset_keyboard_enhancements = true;
         push_keyboard_enhancement_flags()?;
     } else {
         if should_query_host_terminal_theme() {
             write_host_color_scheme_report_mode(&mut io::stdout(), false)?;
         }
+        // Scope bracketed paste to this direct-attach client. Text pastes are
+        // decoded locally and rewrapped for the attached child only when that
+        // child requested bracketed paste. An empty paste remains the existing
+        // clipboard-image trigger.
+        guard.reset_bracketed_paste = true;
+        execute!(io::stdout(), EnableBracketedPaste)?;
         if mouse_capture {
             set_mouse_capture(true)?;
         } else {
@@ -386,6 +411,10 @@ fn setup_terminal_with_capabilities(
         } else {
             WindowsVirtualTerminalInputSetup::default()
         };
+    #[cfg(windows)]
+    {
+        guard.restore_windows_input_mode = windows_virtual_terminal_input.restore_mode;
+    }
 
     #[cfg(windows)]
     if enable_client_protocols
@@ -393,30 +422,21 @@ fn setup_terminal_with_capabilities(
         && windows_virtual_terminal_input.active
         && windows_win32_input_mode_enabled()
     {
-        if let Err(err) = enable_windows_win32_input_mode(&mut io::stdout()) {
-            if let Some(mode) = windows_virtual_terminal_input.restore_mode {
-                restore_windows_input_mode_value(mode);
-            }
-            return Err(err);
-        }
+        enable_windows_win32_input_mode(&mut io::stdout())?;
     }
 
     let modify_other_keys_mode = enable_client_protocols
         .then(crate::input::host_modify_other_keys_mode)
         .flatten();
     if let Some(mode) = modify_other_keys_mode {
+        guard.reset_modify_other_keys = true;
         io::stdout().write_all(mode.set_sequence())?;
         io::stdout().flush()?;
     }
 
     execute!(io::stdout(), DisableLineWrap)?;
 
-    Ok(TerminalGuard {
-        reset_modify_other_keys: modify_other_keys_mode.is_some(),
-        reset_host_color_scheme_reports: host_color_scheme_reports,
-        #[cfg(windows)]
-        restore_windows_input_mode: windows_virtual_terminal_input.restore_mode,
-    })
+    Ok(guard)
 }
 
 fn should_enable_host_color_scheme_reports(enable_client_protocols: bool) -> bool {
@@ -427,6 +447,9 @@ fn should_enable_host_color_scheme_reports(enable_client_protocols: bool) -> boo
 struct TerminalGuard {
     reset_modify_other_keys: bool,
     reset_host_color_scheme_reports: bool,
+    reset_bracketed_paste: bool,
+    reset_focus_change: bool,
+    reset_keyboard_enhancements: bool,
     #[cfg(windows)]
     restore_windows_input_mode: Option<u32>,
 }
@@ -569,6 +592,9 @@ fn set_mouse_capture(enabled: bool) -> io::Result<()> {
 fn restore_terminal_state(
     reset_modify_other_keys: bool,
     reset_host_color_scheme_reports: bool,
+    reset_bracketed_paste: bool,
+    reset_focus_change: bool,
+    reset_keyboard_enhancements: bool,
     #[cfg(windows)] restore_windows_input_mode: Option<u32>,
 ) {
     let _ = clear_received_kitty_graphics(&mut io::stdout());
@@ -579,15 +605,17 @@ fn restore_terminal_state(
         let _ = io::stdout().flush();
     }
 
-    let _ = pop_keyboard_enhancement_flags();
+    if reset_keyboard_enhancements {
+        let _ = pop_keyboard_enhancement_flags();
+    }
 
-    let _ = execute!(
-        io::stdout(),
-        EnableLineWrap,
-        DisableFocusChange,
-        DisableBracketedPaste,
-        DisableMouseCapture
-    );
+    let _ = execute!(io::stdout(), EnableLineWrap, DisableMouseCapture);
+    if reset_focus_change {
+        let _ = execute!(io::stdout(), DisableFocusChange);
+    }
+    if reset_bracketed_paste {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+    }
     let _ = crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout());
     #[cfg(windows)]
     if let Some(mode) = restore_windows_input_mode {
@@ -650,6 +678,9 @@ impl Drop for TerminalGuard {
         restore_terminal_state(
             self.reset_modify_other_keys,
             self.reset_host_color_scheme_reports,
+            self.reset_bracketed_paste,
+            self.reset_focus_change,
+            self.reset_keyboard_enhancements,
             #[cfg(windows)]
             self.restore_windows_input_mode,
         );
@@ -813,9 +844,12 @@ enum ClientLoopEvent {
     /// Terminal resize detected.
     Resize(u16, u16, u32, u32),
     /// Server message received.
-    ServerMessage(ServerMessage),
+    ServerMessage {
+        generation: u64,
+        message: ServerMessage,
+    },
     /// Server reader thread exited (connection lost).
-    ServerDisconnected,
+    ServerDisconnected { generation: u64 },
     /// Timer tick.
     Timer,
 }
@@ -1204,6 +1238,9 @@ fn run_client_with_mode(
     // Install a panic hook to restore the terminal on panic (same as monolithic).
     let panic_resets_modify_other_keys = terminal_guard.reset_modify_other_keys;
     let panic_resets_host_color_scheme_reports = terminal_guard.reset_host_color_scheme_reports;
+    let panic_resets_bracketed_paste = terminal_guard.reset_bracketed_paste;
+    let panic_resets_focus_change = terminal_guard.reset_focus_change;
+    let panic_resets_keyboard_enhancements = terminal_guard.reset_keyboard_enhancements;
     #[cfg(windows)]
     let panic_restore_windows_input_mode = terminal_guard.restore_windows_input_mode;
     let original_hook = std::panic::take_hook();
@@ -1211,6 +1248,9 @@ fn run_client_with_mode(
         restore_terminal_state(
             panic_resets_modify_other_keys,
             panic_resets_host_color_scheme_reports,
+            panic_resets_bracketed_paste,
+            panic_resets_focus_change,
+            panic_resets_keyboard_enhancements,
             #[cfg(windows)]
             panic_restore_windows_input_mode,
         );
@@ -1243,6 +1283,7 @@ fn run_client_with_mode(
             cell_height_px,
             should_quit,
             loop_config,
+            requested_encoding,
             negotiated_encoding,
             attach_escape,
         )
@@ -1281,6 +1322,92 @@ fn run_client_with_mode(
 /// - resize poller thread → sends resize events to main loop
 /// - server reader thread → reads ServerMessages and sends to main loop
 /// - main loop: coordinates input, output, and server communication
+fn should_reconnect_after_live_handoff(
+    reason: Option<&str>,
+    direct_attach: bool,
+    remote_client: bool,
+) -> bool {
+    reason == Some(LIVE_HANDOFF_RECONNECT_REASON) && !direct_attach && !remote_client
+}
+
+async fn reconnect_after_live_handoff(
+    socket_path: &Path,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    requested_encoding: RenderEncoding,
+    should_quit: &Arc<AtomicBool>,
+) -> Result<(LocalStream, RenderEncoding), ClientError> {
+    let deadline = Instant::now() + LIVE_HANDOFF_RECONNECT_TIMEOUT;
+
+    loop {
+        if should_quit.load(Ordering::Acquire) {
+            return Err(ClientError::ConnectionLost(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "live handoff reconnect cancelled",
+            )));
+        }
+
+        let attempt_error = match crate::ipc::connect_local_stream(socket_path) {
+            Ok(mut stream) => match do_handshake(
+                &mut stream,
+                cols,
+                rows,
+                cell_width_px,
+                cell_height_px,
+                requested_encoding,
+                false,
+            ) {
+                Ok(encoding) => return Ok((stream, encoding)),
+                Err(err)
+                    if matches!(
+                        &err,
+                        ClientError::HandshakeRejected { .. } | ClientError::Protocol(_)
+                    ) =>
+                {
+                    return Err(err);
+                }
+                Err(err) => err,
+            },
+            Err(err) => ClientError::ConnectionFailed(err),
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(attempt_error);
+        }
+        tokio::time::sleep(LIVE_HANDOFF_RECONNECT_RETRY_DELAY.min(remaining)).await;
+    }
+}
+
+fn spawn_server_reader(
+    stream: &LocalStream,
+    event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    should_quit: &Arc<AtomicBool>,
+    kitty_graphics_enabled: bool,
+    generation: u64,
+) -> Result<(), ClientError> {
+    let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
+    let server_read_tx = event_tx.clone();
+    let server_read_quit = should_quit.clone();
+    std::thread::spawn(move || {
+        let max_frame_size = if kitty_graphics_enabled {
+            MAX_GRAPHICS_FRAME_SIZE
+        } else {
+            MAX_FRAME_SIZE
+        };
+        server_reader_thread(
+            read_stream,
+            server_read_tx,
+            &server_read_quit,
+            max_frame_size,
+            generation,
+        );
+    });
+    Ok(())
+}
+
 async fn run_client_loop(
     stream: LocalStream,
     cols: u16,
@@ -1289,6 +1416,7 @@ async fn run_client_loop(
     initial_cell_height_px: u32,
     should_quit: Arc<AtomicBool>,
     config: ClientLoopConfig,
+    requested_encoding: RenderEncoding,
     negotiated_encoding: RenderEncoding,
     attach_escape: Option<AttachEscapeState>,
 ) -> Result<(), ClientError> {
@@ -1297,12 +1425,15 @@ async fn run_client_loop(
     let draw_host_cursor = attach_escape.is_none() && should_draw_host_cursor(config.host_cursor);
     #[cfg(unix)]
     let is_remote_client = is_remote_client_process();
+    #[cfg(not(unix))]
+    let is_remote_client = false;
 
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active: config.mouse_capture_active,
         keyboard_report_all_active: false,
         reported_size: (cols, rows),
+        reported_cell_size: (initial_cell_width_px, initial_cell_height_px),
         sound_config: config.sound_config,
         kitty_graphics_enabled: config.kitty_graphics_enabled,
         attach_escape,
@@ -1369,24 +1500,14 @@ async fn run_client_loop(
         );
     });
 
-    // Spawn the server reader thread (blocking reads from the socket).
-    // Clone the stream's file descriptor so we can read from a blocking stream.
-    let server_read_quit = should_quit.clone();
-    let server_read_tx = event_tx.clone();
-    let read_stream = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
-    std::thread::spawn(move || {
-        let max_frame_size = if kitty_graphics_enabled {
-            MAX_GRAPHICS_FRAME_SIZE
-        } else {
-            MAX_FRAME_SIZE
-        };
-        server_reader_thread(
-            read_stream,
-            server_read_tx,
-            &server_read_quit,
-            max_frame_size,
-        );
-    });
+    let mut server_generation = 0;
+    spawn_server_reader(
+        &stream,
+        &event_tx,
+        &should_quit,
+        kitty_graphics_enabled,
+        server_generation,
+    )?;
 
     // Use the original stream for writing (blocking is fine since we write
     // from the async loop).
@@ -1410,7 +1531,16 @@ async fn run_client_loop(
         match event {
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
-                let data = if let Some(attach_escape) = &mut state.attach_escape {
+                // Bracketed-paste contents are terminal input, not local attach
+                // controls. Decode a complete paste before scanning ordinary
+                // input for Ctrl+B detach/escape sequences.
+                let direct_attach_paste = state
+                    .attach_escape
+                    .as_ref()
+                    .and_then(|_| direct_attach_bracketed_paste_text(&data));
+                let data = if direct_attach_paste.is_some() {
+                    data
+                } else if let Some(attach_escape) = &mut state.attach_escape {
                     match attach_escape.filter_input(
                         data,
                         state.reported_size.1,
@@ -1491,6 +1621,18 @@ async fn run_client_loop(
                     info!(
                         "clipboard image paste trigger received, but local clipboard has no image"
                     );
+                    if direct_attach_paste.as_deref() == Some("") {
+                        continue;
+                    }
+                }
+                if let Some(text) = direct_attach_paste {
+                    let msg = ClientMessage::InputEvents {
+                        events: vec![crate::protocol::ClientInputEvent::Paste { text }],
+                    };
+                    if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                        return Err(ClientError::ConnectionLost(e));
+                    }
+                    continue;
                 }
                 if let Some(image) = read_image_file_from_terminal_drop(&data, is_remote_client) {
                     info!(
@@ -1536,6 +1678,7 @@ async fn run_client_loop(
                 state.reported_size = (new_cols, new_rows);
                 // Resizing invalidates the host-side blit baseline.
                 state.request_repaint();
+                state.reported_cell_size = (cell_width_px, cell_height_px);
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
                     rows: new_rows,
@@ -1546,112 +1689,166 @@ async fn run_client_loop(
                     return Err(ClientError::ConnectionLost(e));
                 }
             }
-            ClientLoopEvent::ServerMessage(msg) => match msg {
-                ServerMessage::Frame(frame_data) => {
-                    let frame_data = if state.draw_host_cursor {
-                        render_ansi::frame_with_drawn_cursor(frame_data)
-                    } else {
-                        frame_data
-                    };
-                    let encoded = if state.draw_host_cursor {
-                        state.blit_encoder.encode_with_suppressed_visible_cursor(
-                            &frame_data,
-                            state.repaint_pending,
-                        )
-                    } else {
-                        state
-                            .blit_encoder
-                            .encode(&frame_data, state.repaint_pending)
-                    };
-                    let mut stdout = io::stdout();
-                    let graphics = if state.kitty_graphics_enabled {
-                        frame_data.graphics.as_slice()
-                    } else {
-                        &[]
-                    };
-                    let _ =
-                        write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
-                    let _ = stdout.flush();
-                    state.blit_encoder.commit(frame_data, encoded);
-                    state.repaint_pending = false;
+            ClientLoopEvent::ServerMessage {
+                generation,
+                message: msg,
+            } => {
+                if generation != server_generation {
+                    continue;
                 }
-                ServerMessage::Terminal(frame) => {
-                    if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
-                        record_received_kitty_graphics(&frame.bytes);
-                    }
-                    let mut stdout = io::stdout();
-                    let _ = stdout.write_all(&frame.bytes);
-                    let _ = stdout.flush();
-                }
-                ServerMessage::Graphics { bytes } => {
-                    if state.kitty_graphics_enabled {
-                        record_received_kitty_graphics(&bytes);
+                match msg {
+                    ServerMessage::Frame(frame_data) => {
+                        let frame_data = if state.draw_host_cursor {
+                            render_ansi::frame_with_drawn_cursor(frame_data)
+                        } else {
+                            frame_data
+                        };
+                        let encoded = if state.draw_host_cursor {
+                            state.blit_encoder.encode_with_suppressed_visible_cursor(
+                                &frame_data,
+                                state.repaint_pending,
+                            )
+                        } else {
+                            state
+                                .blit_encoder
+                                .encode(&frame_data, state.repaint_pending)
+                        };
                         let mut stdout = io::stdout();
-                        let _ = stdout.write_all(&bytes);
+                        let graphics = if state.kitty_graphics_enabled {
+                            frame_data.graphics.as_slice()
+                        } else {
+                            &[]
+                        };
+                        let _ = write_encoded_frame_with_graphics(
+                            &mut stdout,
+                            &encoded.bytes,
+                            graphics,
+                        );
+                        let _ = stdout.flush();
+                        state.blit_encoder.commit(frame_data, encoded);
+                        state.repaint_pending = false;
+                    }
+                    ServerMessage::Terminal(frame) => {
+                        if state.kitty_graphics_enabled
+                            && contains_kitty_graphics_bytes(&frame.bytes)
+                        {
+                            record_received_kitty_graphics(&frame.bytes);
+                        }
+                        let mut stdout = io::stdout();
+                        let _ = stdout.write_all(&frame.bytes);
                         let _ = stdout.flush();
                     }
-                }
-                ServerMessage::ServerShutdown { reason } => {
-                    return Err(ClientError::ServerShutdown { reason });
-                }
-                ServerMessage::Notify {
-                    kind,
-                    message,
-                    body,
-                } => {
-                    handle_notify(kind, &message, body.as_deref(), &state.sound_config);
-                }
-                ServerMessage::Clipboard { data } => {
-                    forward_clipboard(&data);
-                    let _ = io::stdout().flush();
-                }
-                ServerMessage::WindowTitle { title } => {
-                    write_window_title(title.as_deref());
-                    let _ = io::stdout().flush();
-                }
-                ServerMessage::ReloadSoundConfig => {
-                    reload_local_client_config(
-                        &mut state.sound_config,
-                        &mut state.redraw_on_focus_gained,
-                        &mut state.draw_host_cursor,
-                        #[cfg(unix)]
-                        &mut state.remote_image_paste_key,
-                    );
-                }
-                ServerMessage::MouseCapture { enabled } => {
-                    let desired = enabled;
-                    if desired != state.mouse_capture_active {
-                        set_mouse_capture(desired).map_err(ClientError::ConnectionFailed)?;
-                        #[cfg(windows)]
-                        if windows_vti_input_backend_enabled() {
-                            let _ = enable_windows_virtual_terminal_input();
+                    ServerMessage::Graphics { bytes } => {
+                        if state.kitty_graphics_enabled {
+                            record_received_kitty_graphics(&bytes);
+                            let mut stdout = io::stdout();
+                            let _ = stdout.write_all(&bytes);
+                            let _ = stdout.flush();
                         }
-                        state.mouse_capture_active = desired;
-                        host_mouse_capture_active.store(desired, Ordering::Release);
+                    }
+                    ServerMessage::ServerShutdown { reason } => {
+                        if should_reconnect_after_live_handoff(
+                            reason.as_deref(),
+                            state.attach_escape.is_some(),
+                            is_remote_client,
+                        ) {
+                            server_generation = server_generation.wrapping_add(1);
+                            info!(
+                                generation = server_generation,
+                                "live handoff started; waiting for replacement server"
+                            );
+                            let (replacement_stream, replacement_encoding) =
+                                reconnect_after_live_handoff(
+                                    &client_socket_path(),
+                                    state.reported_size.0,
+                                    state.reported_size.1,
+                                    state.reported_cell_size.0,
+                                    state.reported_cell_size.1,
+                                    requested_encoding,
+                                    &should_quit,
+                                )
+                                .await?;
+                            spawn_server_reader(
+                                &replacement_stream,
+                                &event_tx,
+                                &should_quit,
+                                state.kitty_graphics_enabled,
+                                server_generation,
+                            )?;
+                            write_stream = replacement_stream;
+                            state.blit_encoder = render_ansi::BlitEncoder::new();
+                            state.request_repaint();
+                            info!(
+                                generation = server_generation,
+                                ?replacement_encoding,
+                                "reconnected after live handoff"
+                            );
+                            continue;
+                        }
+                        return Err(ClientError::ServerShutdown { reason });
+                    }
+                    ServerMessage::Notify {
+                        kind,
+                        message,
+                        body,
+                    } => {
+                        handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                    }
+                    ServerMessage::Clipboard { data } => {
+                        forward_clipboard(&data);
+                        let _ = io::stdout().flush();
+                    }
+                    ServerMessage::WindowTitle { title } => {
+                        write_window_title(title.as_deref());
+                        let _ = io::stdout().flush();
+                    }
+                    ServerMessage::ReloadSoundConfig => {
+                        reload_local_client_config(
+                            &mut state.sound_config,
+                            &mut state.redraw_on_focus_gained,
+                            &mut state.draw_host_cursor,
+                            #[cfg(unix)]
+                            &mut state.remote_image_paste_key,
+                        );
+                    }
+                    ServerMessage::MouseCapture { enabled } => {
+                        let desired = enabled;
+                        if desired != state.mouse_capture_active {
+                            set_mouse_capture(desired).map_err(ClientError::ConnectionFailed)?;
+                            #[cfg(windows)]
+                            if windows_vti_input_backend_enabled() {
+                                let _ = enable_windows_virtual_terminal_input();
+                            }
+                            state.mouse_capture_active = desired;
+                            host_mouse_capture_active.store(desired, Ordering::Release);
+                        }
+                    }
+                    ServerMessage::KittyKeyboardReportAll { enabled } => {
+                        if enabled != state.keyboard_report_all_active {
+                            crate::terminal_modes::set_host_kitty_keyboard_report_all(
+                                &mut io::stdout(),
+                                enabled,
+                            )
+                            .map_err(ClientError::ConnectionFailed)?;
+                            state.keyboard_report_all_active = enabled;
+                        }
+                    }
+                    ServerMessage::PrefixInputSource { active } => {
+                        if active {
+                            prefix_input_source.switch_to_ascii();
+                        } else {
+                            prefix_input_source.restore();
+                        }
+                    }
+                    ServerMessage::Welcome { .. } => {
+                        debug!("received unexpected Welcome in main loop");
                     }
                 }
-                ServerMessage::KittyKeyboardReportAll { enabled } => {
-                    if enabled != state.keyboard_report_all_active {
-                        crate::terminal_modes::set_host_kitty_keyboard_report_all(
-                            &mut io::stdout(),
-                            enabled,
-                        )
-                        .map_err(ClientError::ConnectionFailed)?;
-                        state.keyboard_report_all_active = enabled;
-                    }
+            }
+            ClientLoopEvent::ServerDisconnected { generation } => {
+                if generation != server_generation {
+                    continue;
                 }
-                ServerMessage::PrefixInputSource { active } => {
-                    if active {
-                        prefix_input_source.switch_to_ascii();
-                    } else {
-                        prefix_input_source.restore();
-                    }
-                }
-                ServerMessage::Welcome { .. } => {
-                    debug!("received unexpected Welcome in main loop");
-                }
-            },
-            ClientLoopEvent::ServerDisconnected => {
                 return Err(ClientError::ConnectionLost(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "server closed connection",
@@ -1680,13 +1877,14 @@ fn server_reader_thread(
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
     max_frame_size: usize,
+    generation: u64,
 ) {
     // Ensure the read stream is in blocking mode to avoid WouldBlock errors
     // from read_exact inside read_message. The stream should already be
     // blocking after handshake, but we enforce it here as a safety measure.
     if stream.set_nonblocking(false).is_err() {
         // If we can't set blocking mode, the stream is likely broken.
-        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+        let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected { generation });
         return;
     }
 
@@ -1697,16 +1895,23 @@ fn server_reader_thread(
 
         match protocol::read_message(&mut stream, max_frame_size) {
             Ok(msg) => {
+                let shutdown = matches!(msg, ServerMessage::ServerShutdown { .. });
                 if event_tx
-                    .blocking_send(ClientLoopEvent::ServerMessage(msg))
+                    .blocking_send(ClientLoopEvent::ServerMessage {
+                        generation,
+                        message: msg,
+                    })
                     .is_err()
                 {
                     break; // Main loop gone.
                 }
+                if shutdown {
+                    break;
+                }
             }
             Err(protocol::FramingError::UnexpectedEof) => {
                 // Server closed connection.
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected { generation });
                 break;
             }
             Err(protocol::FramingError::Io(err)) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -1717,7 +1922,7 @@ fn server_reader_thread(
             }
             Err(err) => {
                 warn!(err = %err, "server read error");
-                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected);
+                let _ = event_tx.blocking_send(ClientLoopEvent::ServerDisconnected { generation });
                 break;
             }
         }
@@ -1850,24 +2055,51 @@ fn sound_from_notify_message(message: &str) -> Option<crate::sound::Sound> {
 #[cfg(unix)]
 fn should_bridge_clipboard_image_paste(
     data: &[u8],
-    _is_remote_client: bool,
+    is_remote_client: bool,
     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
 ) -> bool {
     if data == b"\x1b[200~\x1b[201~" {
         return true;
     }
 
-    let Some(remote_image_paste_key) = remote_image_paste_key else {
-        return false;
-    };
-
+    // Ghostty 1.3.1+ leaves a performable Cmd+V unconsumed when the macOS
+    // clipboard has no text, so accept its Kitty-encoded key as an image trigger.
     let events = crate::raw_input::parse_raw_input_bytes_sync(data);
     matches!(
         events.as_slice(),
         [crate::raw_input::RawInputEvent::Key(key)]
             if key.kind == crossterm::event::KeyEventKind::Press
-                && crate::config::terminal_key_matches_combo(key, remote_image_paste_key)
+                && (
+                    (
+                        is_remote_client
+                            && remote_image_paste_key.is_some_and(|configured| {
+                                crate::config::terminal_key_matches_combo(key, configured)
+                            })
+                    )
+                    || (
+                        cfg!(target_os = "macos")
+                            && crate::config::terminal_key_matches_combo(
+                                key,
+                                (
+                                    crossterm::event::KeyCode::Char('v'),
+                                    crossterm::event::KeyModifiers::SUPER,
+                                ),
+                            )
+                    )
+                )
     )
+}
+
+#[cfg(unix)]
+fn direct_attach_bracketed_paste_text(data: &[u8]) -> Option<String> {
+    let mut events = crate::raw_input::parse_raw_input_bytes_sync(data);
+    if events.len() != 1 {
+        return None;
+    }
+    match events.pop()? {
+        crate::raw_input::RawInputEvent::Paste(text) => Some(text),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]
@@ -2395,7 +2627,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn clipboard_image_paste_bridge_triggers_on_configured_key_and_empty_paste() {
+    fn clipboard_image_paste_bridge_routes_remote_key_empty_paste_and_macos_cmd_v() {
         let ctrl_v = crate::config::parse_key_combo("ctrl+v").unwrap();
         assert!(should_bridge_clipboard_image_paste(
             &[0x16],
@@ -2417,11 +2649,29 @@ mod tests {
             false,
             None
         ));
-        assert!(should_bridge_clipboard_image_paste(
+        assert!(!should_bridge_clipboard_image_paste(
             &[0x16],
             false,
             Some(ctrl_v)
         ));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(should_bridge_clipboard_image_paste(
+                b"\x1b[118;9u",
+                false,
+                None
+            ));
+            assert!(should_bridge_clipboard_image_paste(
+                b"\x1b[118;9u",
+                true,
+                None
+            ));
+            assert!(should_bridge_clipboard_image_paste(
+                b"\x1b[118;9:1u",
+                false,
+                None
+            ));
+        }
         assert!(!should_bridge_clipboard_image_paste(
             b"\x1b[200~text\x1b[201~",
             true,
@@ -2433,6 +2683,33 @@ mod tests {
             true,
             Some(ctrl_v)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_attach_decodes_only_one_complete_bracketed_paste() {
+        assert_eq!(
+            direct_attach_bracketed_paste_text(b"\x1b[200~hello\nworld\x1b[201~").as_deref(),
+            Some("hello\nworld")
+        );
+        assert_eq!(
+            direct_attach_bracketed_paste_text(b"\x1b[200~\x1b[201~").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            direct_attach_bracketed_paste_text(b"\x1b[200~incomplete"),
+            None
+        );
+        assert_eq!(
+            direct_attach_bracketed_paste_text(b"x\x1b[200~text\x1b[201~"),
+            None
+        );
+        assert_eq!(
+            direct_attach_bracketed_paste_text(b"\x1b[200~\x02q\x02\x02\x1b[201~")
+                .expect("control bytes remain paste text")
+                .as_bytes(),
+            b"\x02q\x02\x02"
+        );
     }
 
     #[cfg(unix)]
@@ -2792,6 +3069,30 @@ mod tests {
             AttachInputAction::Forward(bytes) => assert_eq!(bytes, b"\x1b[5;5~"),
             other => panic!("expected modified page key to forward, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn live_handoff_reconnect_is_exact_and_local_full_app_only() {
+        assert!(should_reconnect_after_live_handoff(
+            Some(LIVE_HANDOFF_RECONNECT_REASON),
+            false,
+            false
+        ));
+        assert!(!should_reconnect_after_live_handoff(
+            Some("server stopped"),
+            false,
+            false
+        ));
+        assert!(!should_reconnect_after_live_handoff(
+            Some(LIVE_HANDOFF_RECONNECT_REASON),
+            true,
+            false
+        ));
+        assert!(!should_reconnect_after_live_handoff(
+            Some(LIVE_HANDOFF_RECONNECT_REASON),
+            false,
+            true
+        ));
     }
 
     #[test]

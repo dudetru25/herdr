@@ -1082,6 +1082,12 @@
             "label": {
               "type": "string"
             },
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "number": {
               "format": "uint",
               "minimum": 0,
@@ -2291,6 +2297,27 @@
           "required": [
             "path",
             "ratio"
+          ],
+          "type": "object"
+        },
+        "MachineAddParams": {
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "target"
           ],
           "type": "object"
         },
@@ -4100,6 +4127,469 @@
           ],
           "type": "string"
         },
+        "WorkerHarness": {
+          "enum": [
+            "codex",
+            "claude"
+          ],
+          "type": "string"
+        },
+        "WorkerPlacementAvailability": {
+          "oneOf": [
+            {
+              "properties": {
+                "status": {
+                  "const": "available",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "reason": {
+                  "type": "string"
+                },
+                "status": {
+                  "const": "unavailable",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "WorkerPlacementCandidate": {
+          "additionalProperties": false,
+          "properties": {
+            "availability": {
+              "$ref": "#/schemas/request/$defs/WorkerPlacementAvailability"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/WorkerPlacementKind"
+            },
+            "target_tag": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "target_tag",
+            "kind",
+            "availability"
+          ],
+          "type": "object"
+        },
+        "WorkerPlacementKind": {
+          "enum": [
+            "local_pane",
+            "remote",
+            "remote_temporary",
+            "temporary_subspace"
+          ],
+          "type": "string"
+        },
+        "WorkerRunArtifact": {
+          "properties": {
+            "hash": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/WorkerRunArtifactKind"
+            },
+            "mediaType": {
+              "type": "string"
+            },
+            "ref": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "ref",
+            "hash",
+            "mediaType"
+          ],
+          "type": "object"
+        },
+        "WorkerRunArtifactKind": {
+          "enum": [
+            "patch",
+            "diff",
+            "test-output",
+            "validation-report",
+            "log",
+            "other"
+          ],
+          "type": "string"
+        },
+        "WorkerRunCancelParams": {
+          "properties": {
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "type": "object"
+        },
+        "WorkerRunChange": {
+          "properties": {
+            "changedFiles": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/WorkerRunChangeKind"
+            }
+          },
+          "required": [
+            "kind",
+            "changedFiles"
+          ],
+          "type": "object"
+        },
+        "WorkerRunChangeKind": {
+          "enum": [
+            "none",
+            "code"
+          ],
+          "type": "string"
+        },
+        "WorkerRunContext": {
+          "additionalProperties": false,
+          "properties": {
+            "inputs": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/WorkerRunContextInput"
+              },
+              "type": "array"
+            },
+            "instruction": {
+              "type": "string"
+            },
+            "repository_ref": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "schema": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema",
+            "instruction",
+            "repository_ref",
+            "revision",
+            "inputs"
+          ],
+          "type": "object"
+        },
+        "WorkerRunContextInput": {
+          "additionalProperties": false,
+          "properties": {
+            "hash": {
+              "type": "string"
+            },
+            "ref": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ref",
+            "hash"
+          ],
+          "type": "object"
+        },
+        "WorkerRunExecution": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "deterministic",
+                  "type": "string"
+                },
+                "result": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/request/$defs/WorkerRunResultTemplate"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "candidates": {
+                  "items": {
+                    "$ref": "#/schemas/request/$defs/WorkerPlacementCandidate"
+                  },
+                  "type": "array"
+                },
+                "harness": {
+                  "$ref": "#/schemas/request/$defs/WorkerHarness"
+                },
+                "kind": {
+                  "const": "harness",
+                  "type": "string"
+                },
+                "model": {
+                  "type": "string"
+                },
+                "placement": {
+                  "$ref": "#/schemas/request/$defs/WorkerPlacementKind"
+                },
+                "profile": {
+                  "type": "string"
+                },
+                "target_tag": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "harness",
+                "profile",
+                "model",
+                "target_tag",
+                "placement",
+                "candidates"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "WorkerRunLifecycle": {
+          "additionalProperties": false,
+          "properties": {
+            "deadline_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "WorkerRunProvenance": {
+          "properties": {
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "commit": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "harness": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "placementRef": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "harness",
+            "model",
+            "placementRef"
+          ],
+          "type": "object"
+        },
+        "WorkerRunRequest": {
+          "additionalProperties": false,
+          "properties": {
+            "capabilities": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "context": {
+              "$ref": "#/schemas/request/$defs/WorkerRunContext"
+            },
+            "lifecycle": {
+              "$ref": "#/schemas/request/$defs/WorkerRunLifecycle"
+            },
+            "result_contract": {
+              "$ref": "#/schemas/request/$defs/WorkerRunResultContract"
+            },
+            "role": {
+              "type": "string"
+            },
+            "schema": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema",
+            "role",
+            "capabilities",
+            "context",
+            "lifecycle",
+            "result_contract"
+          ],
+          "type": "object"
+        },
+        "WorkerRunResultContract": {
+          "additionalProperties": false,
+          "properties": {
+            "require_patch_for_code_changes": {
+              "type": "boolean"
+            },
+            "schema": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema",
+            "require_patch_for_code_changes"
+          ],
+          "type": "object"
+        },
+        "WorkerRunResultTarget": {
+          "properties": {
+            "result_ref": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "result_ref"
+          ],
+          "type": "object"
+        },
+        "WorkerRunResultTemplate": {
+          "properties": {
+            "artifacts": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/WorkerRunArtifact"
+              },
+              "type": "array"
+            },
+            "change": {
+              "$ref": "#/schemas/request/$defs/WorkerRunChange"
+            },
+            "provenance": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/WorkerRunProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "summary",
+            "change",
+            "artifacts"
+          ],
+          "type": "object"
+        },
+        "WorkerRunSubmitParams": {
+          "additionalProperties": false,
+          "properties": {
+            "attempt_id": {
+              "type": "string"
+            },
+            "context_hash": {
+              "type": "string"
+            },
+            "execution": {
+              "$ref": "#/schemas/request/$defs/WorkerRunExecution"
+            },
+            "request": {
+              "$ref": "#/schemas/request/$defs/WorkerRunRequest"
+            },
+            "request_hash": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "attempt_id",
+            "request_hash",
+            "context_hash",
+            "request",
+            "execution"
+          ],
+          "type": "object"
+        },
+        "WorkerRunTarget": {
+          "properties": {
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id"
+          ],
+          "type": "object"
+        },
+        "WorkerRunTimeoutParams": {
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "reason"
+          ],
+          "type": "object"
+        },
         "WorkspaceCreateParams": {
           "properties": {
             "cwd": {
@@ -4119,6 +4609,12 @@
               "type": "boolean"
             },
             "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "machine": {
               "type": [
                 "string",
                 "null"
@@ -4561,6 +5057,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorkspaceCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "machine.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "machine.add",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MachineAddParams"
             }
           },
           "required": [
@@ -5105,6 +5633,86 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentWaitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "worker.run.submit",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkerRunSubmitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "worker.run.get",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkerRunTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "worker.run.cancel",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkerRunCancelParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "worker.run.timeout",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkerRunTimeoutParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "worker.run.result",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkerRunResultTarget"
             }
           },
           "required": [
@@ -7297,6 +7905,27 @@
             }
           ]
         },
+        "MachineInfo": {
+          "properties": {
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "target"
+          ],
+          "type": "object"
+        },
         "NotificationShowReason": {
           "enum": [
             "shown",
@@ -8730,6 +9359,41 @@
             },
             {
               "properties": {
+                "machines": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/MachineInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "machine_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "machines"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "machine": {
+                  "$ref": "#/schemas/success_response/$defs/MachineInfo"
+                },
+                "type": {
+                  "const": "machine_added",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "machine"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "child_workspace_ids": {
                   "items": {
                     "type": "string"
@@ -8990,6 +9654,78 @@
               "required": [
                 "type",
                 "agents"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "disposition": {
+                  "$ref": "#/schemas/success_response/$defs/WorkerRunSubmissionDisposition"
+                },
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/WorkerRunRecord"
+                },
+                "type": {
+                  "const": "worker_run_submitted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run",
+                "disposition"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/WorkerRunRecord"
+                },
+                "type": {
+                  "const": "worker_run",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "disposition": {
+                  "$ref": "#/schemas/success_response/$defs/WorkerRunCancellationDisposition"
+                },
+                "run": {
+                  "$ref": "#/schemas/success_response/$defs/WorkerRunRecord"
+                },
+                "type": {
+                  "const": "worker_run_cancelled",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "run",
+                "disposition"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "result": {
+                  "$ref": "#/schemas/success_response/$defs/WorkerRunResultManifest"
+                },
+                "type": {
+                  "const": "worker_run_result",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "result"
               ],
               "type": "object"
             },
@@ -9875,6 +10611,300 @@
           ],
           "type": "object"
         },
+        "WorkerHarness": {
+          "enum": [
+            "codex",
+            "claude"
+          ],
+          "type": "string"
+        },
+        "WorkerRunArtifact": {
+          "properties": {
+            "hash": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/WorkerRunArtifactKind"
+            },
+            "mediaType": {
+              "type": "string"
+            },
+            "ref": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "ref",
+            "hash",
+            "mediaType"
+          ],
+          "type": "object"
+        },
+        "WorkerRunArtifactKind": {
+          "enum": [
+            "patch",
+            "diff",
+            "test-output",
+            "validation-report",
+            "log",
+            "other"
+          ],
+          "type": "string"
+        },
+        "WorkerRunCancellationDisposition": {
+          "enum": [
+            "requested",
+            "already-requested",
+            "already-terminal"
+          ],
+          "type": "string"
+        },
+        "WorkerRunChange": {
+          "properties": {
+            "changedFiles": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/WorkerRunChangeKind"
+            }
+          },
+          "required": [
+            "kind",
+            "changedFiles"
+          ],
+          "type": "object"
+        },
+        "WorkerRunChangeKind": {
+          "enum": [
+            "none",
+            "code"
+          ],
+          "type": "string"
+        },
+        "WorkerRunMetadata": {
+          "properties": {
+            "harness": {
+              "$ref": "#/schemas/success_response/$defs/WorkerHarness"
+            },
+            "model": {
+              "type": "string"
+            },
+            "placement": {
+              "type": "string"
+            },
+            "profile": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "harness",
+            "profile",
+            "model",
+            "target",
+            "placement"
+          ],
+          "type": "object"
+        },
+        "WorkerRunProvenance": {
+          "properties": {
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "commit": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "harness": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "placementRef": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "harness",
+            "model",
+            "placementRef"
+          ],
+          "type": "object"
+        },
+        "WorkerRunRecord": {
+          "properties": {
+            "attempt_id": {
+              "type": "string"
+            },
+            "cancellation_requested": {
+              "default": false,
+              "type": "boolean"
+            },
+            "content_hash": {
+              "type": "string"
+            },
+            "context_hash": {
+              "type": "string"
+            },
+            "created_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "deadline_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "metadata": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkerRunMetadata"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "request_hash": {
+              "type": "string"
+            },
+            "result_ref": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "schema": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/WorkerRunState"
+            },
+            "terminal_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updated_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "schema",
+            "attempt_id",
+            "run_id",
+            "request_hash",
+            "context_hash",
+            "content_hash",
+            "state",
+            "created_unix_ms",
+            "updated_unix_ms"
+          ],
+          "type": "object"
+        },
+        "WorkerRunResultManifest": {
+          "properties": {
+            "artifacts": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkerRunArtifact"
+              },
+              "type": "array"
+            },
+            "attemptId": {
+              "type": "string"
+            },
+            "change": {
+              "$ref": "#/schemas/success_response/$defs/WorkerRunChange"
+            },
+            "completedAt": {
+              "type": "string"
+            },
+            "provenance": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/WorkerRunProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "runRef": {
+              "type": "string"
+            },
+            "schema": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/schemas/success_response/$defs/WorkerRunResultStatus"
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema",
+            "attemptId",
+            "runRef",
+            "status",
+            "summary",
+            "change",
+            "artifacts",
+            "completedAt"
+          ],
+          "type": "object"
+        },
+        "WorkerRunResultStatus": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled",
+            "timed-out",
+            "lost"
+          ],
+          "type": "string"
+        },
+        "WorkerRunState": {
+          "enum": [
+            "submitted",
+            "running",
+            "cancelled",
+            "timed-out",
+            "failed",
+            "lost",
+            "succeeded"
+          ],
+          "type": "string"
+        },
+        "WorkerRunSubmissionDisposition": {
+          "enum": [
+            "created",
+            "duplicate-equivalent"
+          ],
+          "type": "string"
+        },
         "WorkspaceInfo": {
           "properties": {
             "active_tab_id": {
@@ -9888,6 +10918,12 @@
             },
             "label": {
               "type": "string"
+            },
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "number": {
               "format": "uint",

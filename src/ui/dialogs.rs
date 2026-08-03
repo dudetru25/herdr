@@ -11,9 +11,14 @@ use super::widgets::{
     action_button_row_rects, centered_popup_rect, panel_contrast_fg, render_action_button,
     render_modal_header, render_modal_shell, render_panel_shell, ActionButtonSpec,
 };
-use crate::app::{state::WorktreeOpenState, AppState, Mode};
+use crate::app::{
+    state::{MachineCreateField, WorktreeOpenState},
+    AppState, Mode,
+};
 use crate::terminal::TerminalRuntimeRegistry;
 
+const ADD_REMOTE_MACHINE_POPUP_WIDTH: u16 = 68;
+const ADD_REMOTE_MACHINE_POPUP_HEIGHT: u16 = 16;
 const NEW_LINKED_WORKTREE_POPUP_WIDTH: u16 = 68;
 const NEW_LINKED_WORKTREE_POPUP_HEIGHT: u16 = 12;
 
@@ -101,6 +106,153 @@ pub(super) fn render_rename_overlay(app: &AppState, frame: &mut Frame, area: Rec
         Style::default()
             .fg(app.palette.text)
             .bg(app.palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(app.palette.text)
+            .bg(app.palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+pub(crate) fn add_remote_machine_inner_rect(area: Rect) -> Option<Rect> {
+    centered_popup_rect(
+        area,
+        ADD_REMOTE_MACHINE_POPUP_WIDTH,
+        ADD_REMOTE_MACHINE_POPUP_HEIGHT,
+    )
+    .map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+pub(crate) fn add_remote_machine_input_rects(inner: Rect) -> [(MachineCreateField, Rect); 3] {
+    [
+        (
+            MachineCreateField::Name,
+            Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 1),
+        ),
+        (
+            MachineCreateField::Target,
+            Rect::new(inner.x, inner.y.saturating_add(5), inner.width, 1),
+        ),
+        (
+            MachineCreateField::Cwd,
+            Rect::new(inner.x, inner.y.saturating_add(7), inner.width, 1),
+        ),
+    ]
+}
+
+pub(crate) fn add_remote_machine_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "add and open",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+pub(super) fn render_add_remote_machine_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(create) = app.machine_create.as_ref() else {
+        return;
+    };
+
+    super::dim_background(frame, area);
+    let Some(inner) = render_modal_shell(
+        frame,
+        area,
+        ADD_REMOTE_MACHINE_POPUP_WIDTH,
+        ADD_REMOTE_MACHINE_POPUP_HEIGHT,
+        &app.palette,
+    ) else {
+        return;
+    };
+    if inner.height < 12 {
+        return;
+    }
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "add remote machine",
+        &app.palette,
+    );
+    for (label, row) in [
+        (" name", 2),
+        (" SSH target", 4),
+        (" remote cwd (optional)", 6),
+    ] {
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(app.palette.overlay0)),
+            Rect::new(inner.x, inner.y.saturating_add(row), inner.width, 1),
+        );
+    }
+
+    for (field, rect) in add_remote_machine_input_rects(inner) {
+        let value = match field {
+            MachineCreateField::Name => &create.name,
+            MachineCreateField::Target => &create.target,
+            MachineCreateField::Cwd => &create.cwd,
+        };
+        let focused = create.focused == field;
+        let text = truncate_end(
+            &format!(" {}{}", value, if focused { "█" } else { "" }),
+            rect.width as usize,
+        );
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(app.palette.text).bg(if focused {
+                app.palette.surface1
+            } else {
+                app.palette.surface0
+            })),
+            rect,
+        );
+    }
+
+    if let Some(error) = &create.error {
+        frame.render_widget(
+            Paragraph::new(format!(" {error}"))
+                .style(Style::default().fg(app.palette.red))
+                .wrap(Wrap { trim: false }),
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(9),
+                inner.width,
+                inner.height.saturating_sub(11),
+            ),
+        );
+    }
+
+    let (add_rect, cancel_rect) = add_remote_machine_button_rects(inner);
+    render_action_button(
+        frame,
+        add_rect,
+        Some("↵"),
+        "add and open",
+        Style::default()
+            .fg(panel_contrast_fg(&app.palette))
+            .bg(app.palette.accent)
             .add_modifier(Modifier::BOLD),
     );
     render_action_button(
@@ -767,12 +919,18 @@ pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
 #[cfg(test)]
 mod tests {
     use crate::{
-        app::{state::WorktreeCreateState, AppState},
+        app::{
+            state::{MachineCreateField, MachineCreateState, WorktreeCreateState},
+            AppState,
+        },
         workspace::Workspace,
     };
     use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
-    use super::{confirm_close_overlay_text, render_new_linked_worktree_overlay};
+    use super::{
+        confirm_close_overlay_text, render_add_remote_machine_overlay,
+        render_new_linked_worktree_overlay,
+    };
 
     #[test]
     fn confirm_close_text_uses_live_workspace_cwd_label() {
@@ -941,6 +1099,53 @@ mod tests {
         assert_eq!(inner.width, super::NEW_LINKED_WORKTREE_POPUP_WIDTH - 2);
         assert_eq!(inner.height, super::NEW_LINKED_WORKTREE_POPUP_HEIGHT - 2);
         assert_eq!(create.y, inner.y + inner.height - 1);
+        assert_eq!(cancel.y, inner.y + inner.height - 1);
+    }
+
+    #[test]
+    fn add_remote_machine_renders_fields_and_error() {
+        let mut app = AppState::test_new();
+        app.machine_create = Some(MachineCreateState {
+            name: "dev".into(),
+            target: "dev@example.com".into(),
+            cwd: "~/src".into(),
+            focused: MachineCreateField::Target,
+            error: Some("machine name must be unique".into()),
+        });
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(100, 30)).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_add_remote_machine_overlay(&app, frame, Rect::new(0, 0, 100, 30)))
+            .expect("add remote machine overlay should render");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("add remote machine"));
+        assert!(rendered.contains("SSH target"));
+        assert!(rendered.contains("remote cwd (optional)"));
+        assert!(rendered.contains("dev@example.com"));
+        assert!(rendered.contains("machine name must be unique"));
+        assert!(rendered.contains("add and open"));
+    }
+
+    #[test]
+    fn add_remote_machine_hit_test_geometry_matches_modal_size() {
+        let area = Rect::new(0, 0, 100, 30);
+        let inner = super::add_remote_machine_inner_rect(area).unwrap();
+        let inputs = super::add_remote_machine_input_rects(inner);
+        let (add, cancel) = super::add_remote_machine_button_rects(inner);
+
+        assert_eq!(inner.width, super::ADD_REMOTE_MACHINE_POPUP_WIDTH - 2);
+        assert_eq!(inner.height, super::ADD_REMOTE_MACHINE_POPUP_HEIGHT - 2);
+        assert_eq!(inputs[0].1.y, inner.y + 3);
+        assert_eq!(inputs[2].1.y, inner.y + 7);
+        assert_eq!(add.y, inner.y + inner.height - 1);
         assert_eq!(cancel.y, inner.y + inner.height - 1);
     }
 }

@@ -2,12 +2,16 @@ use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
-use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
+use super::{
+    model::{validate_machines, LoadedConfig, MachineConfigValidationError},
+    Config, MachineConfig, CONFIG_PATH_ENV_VAR,
+};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
     "experimental",
     "keys",
+    "machines",
     "onboarding",
     "remote",
     "session",
@@ -165,6 +169,41 @@ pub(super) fn resolve_config_relative_path(path: &Path) -> PathBuf {
         .join(path)
 }
 
+// Follow symlinks manually so updating config preserves dotfile-manager links.
+// `canonicalize` cannot resolve a dangling final target on its first write.
+pub(crate) fn resolve_config_write_target(path: &Path) -> std::io::Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    for followed in 0..=16 {
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(err) => return Err(err),
+        };
+        if !metadata.file_type().is_symlink() {
+            return Ok(current);
+        }
+        if followed == 16 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "config symlink resolution exceeded 16 links at {}",
+                    current.display()
+                ),
+            ));
+        }
+        let link = std::fs::read_link(&current)?;
+        current = if link.is_absolute() {
+            link
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(link)
+        };
+    }
+    unreachable!("bounded config symlink resolution always returns")
+}
+
 pub fn config_path() -> PathBuf {
     if let Ok(path) = std::env::var(CONFIG_PATH_ENV_VAR) {
         return PathBuf::from(path);
@@ -284,6 +323,9 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut invalid_sections,
         |section| config.terminal = section,
     );
+    load_live_machine_section(table, &mut diagnostics, &mut invalid_sections, |machines| {
+        config.machines = machines
+    });
     load_live_section(
         table,
         "session",
@@ -530,6 +572,153 @@ fn load_live_section<T>(
     }
 }
 
+fn load_live_machine_section(
+    table: &toml::map::Map<String, toml::Value>,
+    diagnostics: &mut Vec<String>,
+    invalid_sections: &mut Vec<String>,
+    apply: impl FnOnce(Vec<MachineConfig>),
+) {
+    let Some(value) = table.get("machines") else {
+        return;
+    };
+    let parsed: Result<(Vec<MachineConfig>, Vec<Vec<ConfigKeyPathSegment>>), _> =
+        deserialize_with_ignored(value.clone());
+
+    match parsed {
+        Ok((machines, ignored_keys)) => match validate_machines(&machines) {
+            Ok(()) => {
+                diagnostics.extend(unknown_config_key_diagnostics(
+                    ignored_keys,
+                    Some("machines"),
+                ));
+                apply(machines);
+            }
+            Err(err) => {
+                diagnostics.push(format!(
+                    "invalid machine config: {err}; keeping current machines settings"
+                ));
+                invalid_sections.push("machines".to_string());
+            }
+        },
+        Err(err) => {
+            diagnostics.push(format!(
+                "invalid machine config: {err}; keeping current machines settings"
+            ));
+            invalid_sections.push("machines".to_string());
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum MachineConfigEditError {
+    InvalidMachine(MachineConfigValidationError),
+    MachineAlreadyExists { name: String },
+    InvalidConfig { reason: String },
+    UnsupportedMachinesShape,
+}
+
+impl std::fmt::Display for MachineConfigEditError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidMachine(err) => err.fmt(formatter),
+            Self::MachineAlreadyExists { name } => {
+                write!(formatter, "machine {name:?} is already configured")
+            }
+            Self::InvalidConfig { reason } => {
+                write!(formatter, "config.toml is invalid: {reason}")
+            }
+            Self::UnsupportedMachinesShape => write!(
+                formatter,
+                "machines must use [[machines]] tables before Herdr can add an entry"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MachineConfigEditError {}
+
+pub(crate) fn append_machine_config(
+    content: &str,
+    machine: &MachineConfig,
+) -> Result<String, MachineConfigEditError> {
+    validate_machines(std::slice::from_ref(machine))
+        .map_err(MachineConfigEditError::InvalidMachine)?;
+
+    let value =
+        content
+            .parse::<toml::Value>()
+            .map_err(|err| MachineConfigEditError::InvalidConfig {
+                reason: err.to_string(),
+            })?;
+    let has_existing_machines = value.get("machines").is_some();
+    let existing = if let Some(machines_value) = value.get("machines").cloned() {
+        if !machines_value
+            .as_array()
+            .is_some_and(|items| items.iter().all(toml::Value::is_table))
+        {
+            return Err(MachineConfigEditError::UnsupportedMachinesShape);
+        }
+        let (machines, _ignored): (Vec<MachineConfig>, _) =
+            deserialize_with_ignored(machines_value).map_err(|err| {
+                MachineConfigEditError::InvalidConfig {
+                    reason: format!("invalid machine config: {err}"),
+                }
+            })?;
+        validate_machines(&machines).map_err(|err| MachineConfigEditError::InvalidConfig {
+            reason: format!("invalid machine config: {err}"),
+        })?;
+        machines
+    } else {
+        Vec::new()
+    };
+
+    if existing.iter().any(|current| current.name == machine.name) {
+        return Err(MachineConfigEditError::MachineAlreadyExists {
+            name: machine.name.clone(),
+        });
+    }
+
+    let mut prospective = existing;
+    prospective.push(machine.clone());
+    validate_machines(&prospective).map_err(MachineConfigEditError::InvalidMachine)?;
+
+    let serialized =
+        toml::to_string(machine).map_err(|err| MachineConfigEditError::InvalidConfig {
+            reason: format!("failed to serialize machine config: {err}"),
+        })?;
+    let mut updated = content.to_string();
+    if !updated.is_empty() {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push('\n');
+    }
+    updated.push_str("[[machines]]\n");
+    updated.push_str(&serialized);
+    let parsed = updated.parse::<toml::Value>().map_err(|err| {
+        if has_existing_machines {
+            MachineConfigEditError::UnsupportedMachinesShape
+        } else {
+            MachineConfigEditError::InvalidConfig {
+                reason: format!("updated config did not parse: {err}"),
+            }
+        }
+    })?;
+    let parsed_machines = parsed
+        .get("machines")
+        .cloned()
+        .ok_or_else(|| MachineConfigEditError::InvalidConfig {
+            reason: "updated config has no machines section".to_string(),
+        })?
+        .try_into::<Vec<MachineConfig>>()
+        .map_err(|err| MachineConfigEditError::InvalidConfig {
+            reason: format!("updated machine config did not parse: {err}"),
+        })?;
+    validate_machines(&parsed_machines).map_err(MachineConfigEditError::InvalidMachine)?;
+
+    Ok(updated)
+}
+
 pub(crate) fn upsert_top_level_bool(content: &str, key: &str, value: bool) -> String {
     let replacement = format!("{key} = {value}");
     let mut lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
@@ -713,6 +902,115 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_machine(name: &str) -> MachineConfig {
+        MachineConfig {
+            name: name.to_string(),
+            target: format!("{name}@example.test"),
+            cwd: Some(format!("~/src/{name}")),
+        }
+    }
+
+    #[test]
+    fn append_machine_config_preserves_unrelated_comments_and_formatting() {
+        let content = r#"# user heading
+[theme] # keep this inline comment
+name="latte"
+
+# existing machine
+[[machines]]
+name = "build" # keep machine comment
+target = "builder@example.test"
+
+[ui]
+# keep ui comment
+mouse_capture = false
+"#;
+
+        let updated = append_machine_config(content, &sample_machine("prod")).unwrap();
+
+        assert!(updated.contains("# user heading"));
+        assert!(updated.contains("[theme] # keep this inline comment\nname=\"latte\""));
+        assert!(updated.contains("name = \"build\" # keep machine comment"));
+        assert!(updated.contains("[ui]\n# keep ui comment\nmouse_capture = false"));
+        let parsed: Config = toml::from_str(&updated).unwrap();
+        assert_eq!(parsed.machines.len(), 2);
+        assert_eq!(parsed.machines[1], sample_machine("prod"));
+    }
+
+    #[test]
+    fn append_machine_config_escapes_values_and_creates_array_of_tables() {
+        let machine = MachineConfig {
+            name: "quote\"machine".to_string(),
+            target: r"user\name@example.test".to_string(),
+            cwd: Some("path with \"quotes\"".to_string()),
+        };
+
+        let updated = append_machine_config("# keep\n", &machine).unwrap();
+
+        assert!(updated.contains("# keep"));
+        assert!(updated.contains("[[machines]]"));
+        let parsed: Config = toml::from_str(&updated).unwrap();
+        assert_eq!(parsed.machines, vec![machine]);
+    }
+
+    #[test]
+    fn append_machine_config_rejects_duplicate_without_changing_input() {
+        let content = "[[machines]]\nname = \"build\"\ntarget = \"one\"\n";
+        let error = append_machine_config(
+            content,
+            &MachineConfig {
+                name: "build".to_string(),
+                target: "two".to_string(),
+                cwd: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MachineConfigEditError::MachineAlreadyExists { ref name } if name == "build"
+        ));
+        assert_eq!(
+            content,
+            "[[machines]]\nname = \"build\"\ntarget = \"one\"\n"
+        );
+    }
+
+    #[test]
+    fn append_machine_config_rejects_invalid_toml_and_inline_machine_arrays() {
+        let invalid = "[theme\nname = \"broken\"\n";
+        assert!(matches!(
+            append_machine_config(invalid, &sample_machine("prod")),
+            Err(MachineConfigEditError::InvalidConfig { .. })
+        ));
+
+        let inline = "machines = [{ name = \"build\", target = \"host\" }]\n";
+        assert!(matches!(
+            append_machine_config(inline, &sample_machine("prod")),
+            Err(MachineConfigEditError::UnsupportedMachinesShape)
+        ));
+    }
+
+    #[test]
+    fn append_machine_config_reuses_machine_validation() {
+        let error = append_machine_config(
+            "",
+            &MachineConfig {
+                name: "prod".to_string(),
+                target: " -oProxyCommand=bad".to_string(),
+                cwd: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MachineConfigEditError::InvalidMachine(
+                MachineConfigValidationError::OptionLikeTarget { .. }
+            )
+        ));
+    }
 
     #[test]
     fn upsert_top_level_bool_replaces_existing_value() {

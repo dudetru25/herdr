@@ -27,6 +27,7 @@ use super::{
 
 pub(super) enum MouseAction {
     NewWorkspace,
+    WorkspaceCreateTarget,
     Settings(SettingsAction),
     FocusWorkspace {
         ws_idx: usize,
@@ -56,6 +57,7 @@ pub(super) enum MouseAction {
         ratio: f32,
     },
     RenameModal(ModalAction),
+    AddRemoteMachineSubmit,
     ConfirmCloseAccept,
     ContextMenu {
         menu: ContextMenuState,
@@ -214,7 +216,10 @@ impl AppState {
 
         if matches!(
             self.mode,
-            Mode::NewLinkedWorktree | Mode::OpenExistingWorktree | Mode::ConfirmRemoveWorktree
+            Mode::AddRemoteMachine
+                | Mode::NewLinkedWorktree
+                | Mode::OpenExistingWorktree
+                | Mode::ConfirmRemoveWorktree
         ) && !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
             return None;
@@ -248,6 +253,39 @@ impl AppState {
                         }
                         Some(ModalAction::Cancel) | None => confirm_close_cancel(self),
                         _ => {}
+                    }
+                    return None;
+                }
+
+                if self.mode == Mode::AddRemoteMachine {
+                    if let Some(inner) =
+                        crate::ui::add_remote_machine_inner_rect(self.screen_rect())
+                    {
+                        if let Some((field, _)) = crate::ui::add_remote_machine_input_rects(inner)
+                            .into_iter()
+                            .find(|(_, rect)| rect_contains(*rect, mouse.column, mouse.row))
+                        {
+                            if let Some(create) = self.machine_create.as_mut() {
+                                create.focused = field;
+                            }
+                            return None;
+                        }
+
+                        let (add, cancel) = crate::ui::add_remote_machine_button_rects(inner);
+                        match modal_action_from_buttons(
+                            mouse.column,
+                            mouse.row,
+                            &[(add, ModalAction::Confirm), (cancel, ModalAction::Cancel)],
+                        ) {
+                            Some(ModalAction::Confirm) => {
+                                return Some(MouseAction::AddRemoteMachineSubmit);
+                            }
+                            Some(ModalAction::Cancel) => {
+                                self.machine_create = None;
+                                leave_modal(self);
+                            }
+                            _ => {}
+                        }
                     }
                     return None;
                 }
@@ -411,6 +449,13 @@ impl AppState {
                 }
 
                 if self.mode == Mode::ContextMenu {
+                    if in_sidebar
+                        && !self.sidebar_collapsed
+                        && rect_contains(self.sidebar_new_button_rect(), mouse.column, mouse.row)
+                    {
+                        self.context_menu = None;
+                        return Some(MouseAction::NewWorkspace);
+                    }
                     let item_idx = self.context_menu_item_at(mouse.column, mouse.row);
                     if let Some(menu) = self.context_menu.take() {
                         if let Some(idx) = item_idx {
@@ -1019,6 +1064,10 @@ impl AppState {
             MouseEventKind::Down(MouseButton::Right) if in_sidebar && !self.sidebar_collapsed => {
                 self.workspace_press = None;
                 self.tab_press = None;
+                let new_button = self.sidebar_new_button_rect();
+                if rect_contains(new_button, mouse.column, mouse.row) {
+                    return Some(MouseAction::WorkspaceCreateTarget);
+                }
                 if self
                     .workspace_list_scrollbar_target_at(mouse.column, mouse.row)
                     .is_some()
@@ -1033,6 +1082,12 @@ impl AppState {
                             parent_space: ParentSpaceMenu::Unavailable,
                         },
                         |ws| {
+                            if ws.is_machine() {
+                                return ContextMenuKind::Workspace {
+                                    ws_idx: idx,
+                                    parent_space: ParentSpaceMenu::Unavailable,
+                                };
+                            }
                             let group_state = crate::ui::workspace_parent_group_state(self, idx);
                             let git_space = ws.git_space().cloned().or_else(|| {
                                 ws.resolved_identity_cwd_from(&self.terminals, terminal_runtimes)
@@ -1274,12 +1329,17 @@ impl AppState {
             .as_ref()
             .map(|menu| menu.items().len() as u16)
             .unwrap_or(0);
+        let visible_offset = self
+            .context_menu
+            .as_ref()
+            .map(|menu| menu.visible_offset(inner_h as usize))
+            .unwrap_or(0);
         if col >= inner_x
             && col < inner_x + inner_w
             && row >= inner_y
             && row < inner_y + inner_h.min(item_count)
         {
-            Some((row - inner_y) as usize)
+            Some(visible_offset + (row - inner_y) as usize)
         } else {
             None
         }
@@ -2616,9 +2676,105 @@ mod tests {
     }
 
     #[test]
+    fn scrolled_machine_picker_maps_mouse_rows_to_visible_items() {
+        let mut app = app_for_mouse_test();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 40, 6));
+        app.state.context_menu = Some(ContextMenuState {
+            kind: ContextMenuKind::WorkspaceCreateTarget {
+                machines: (0..10).map(|index| format!("machine-{index}")).collect(),
+            },
+            x: 2,
+            y: 2,
+            // Local + ten machines + Add remote machine…
+            list: MenuListState::new(11),
+        });
+        app.state.mode = Mode::ContextMenu;
+
+        let menu = app.state.context_menu_rect().unwrap();
+        assert_eq!(
+            app.state.context_menu_item_at(menu.x + 2, menu.y + 1),
+            Some(8)
+        );
+        assert_eq!(
+            app.state.context_menu_item_at(menu.x + 2, menu.y + 4),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn add_remote_machine_mouse_focuses_fields_and_ignores_outside_clicks() {
+        let mut app = app_for_mouse_test();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 100, 30));
+        app.state.mode = Mode::AddRemoteMachine;
+        app.state.machine_create = Some(crate::app::state::MachineCreateState::default());
+        let inner = crate::ui::add_remote_machine_inner_rect(app.state.screen_rect()).unwrap();
+        let target = crate::ui::add_remote_machine_input_rects(inner)[1].1;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            target.x + 1,
+            target.y,
+        ));
+
+        assert_eq!(
+            app.state.machine_create.as_ref().unwrap().focused,
+            crate::app::state::MachineCreateField::Target
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            inner.x.saturating_sub(1),
+            inner.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::AddRemoteMachine);
+        assert!(app.state.machine_create.is_some());
+    }
+
+    #[test]
+    fn add_remote_machine_mouse_cancel_closes_form() {
+        let mut app = app_for_mouse_test();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 100, 30));
+        app.state.mode = Mode::AddRemoteMachine;
+        app.state.machine_create = Some(crate::app::state::MachineCreateState::default());
+        let inner = crate::ui::add_remote_machine_inner_rect(app.state.screen_rect()).unwrap();
+        let (_, cancel) = crate::ui::add_remote_machine_button_rects(inner);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            cancel.x + 1,
+            cancel.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert!(app.state.machine_create.is_none());
+    }
+
+    #[test]
+    fn add_remote_machine_mouse_primary_button_requests_submit() {
+        let mut app = app_for_mouse_test();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 100, 30));
+        app.state.mode = Mode::AddRemoteMachine;
+        app.state.machine_create = Some(crate::app::state::MachineCreateState::default());
+        let inner = crate::ui::add_remote_machine_inner_rect(app.state.screen_rect()).unwrap();
+        let (add, _) = crate::ui::add_remote_machine_button_rects(inner);
+
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(MouseEventKind::Down(MouseButton::Left), add.x + 1, add.y),
+        );
+
+        assert!(matches!(action, Some(MouseAction::AddRemoteMachineSubmit)));
+        assert_eq!(app.state.mode, Mode::AddRemoteMachine);
+        assert!(app.state.machine_create.is_some());
+    }
+
+    #[test]
     fn workspace_right_click_shows_parent_space_actions_only_for_valid_roles() {
         let mut app = app_for_mouse_test();
-        app.state.workspaces = vec![Workspace::test_new("workspace")];
+        let mut workspace = Workspace::test_new("workspace");
+        workspace.identity_cwd = std::env::temp_dir();
+        app.state.workspaces = vec![workspace];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
@@ -3941,7 +4097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn desktop_new_workspace_creates_immediately_by_default() {
+    async fn desktop_new_workspace_left_click_creates_locally_by_default() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.ensure_test_terminals();
@@ -3959,8 +4115,79 @@ mod tests {
 
         assert_eq!(app.state.workspaces.len(), 2);
         assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.context_menu.is_none());
         assert!(app.state.pending_workspace_create_cwd.is_none());
         crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn desktop_new_workspace_left_click_creates_locally_with_picker_open() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
+        let new_workspace = app.state.sidebar_new_button_rect();
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            new_workspace.x + 1,
+            new_workspace.y,
+        ));
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            new_workspace.x + 1,
+            new_workspace.y,
+        ));
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert!(!app.state.workspaces[1].is_machine());
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.context_menu.is_none());
+        crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[test]
+    fn desktop_new_workspace_right_click_opens_picker_anchored_beside_button() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.mobile_width_threshold = 0;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 28, 6));
+        let new_workspace = app.state.sidebar_new_button_rect();
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            new_workspace.x + 1,
+            new_workspace.y,
+        ));
+
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let menu = app.state.context_menu.as_ref().unwrap();
+        assert!(matches!(
+            menu.kind,
+            ContextMenuKind::WorkspaceCreateTarget { .. }
+        ));
+        assert_eq!(menu.x, new_workspace.x + new_workspace.width);
+        assert_eq!(menu.y, new_workspace.y);
+        assert_eq!(
+            menu.items(),
+            vec!["Local", "No machines registered", "Add remote machine…"]
+        );
+        let menu_anchor = (menu.x, menu.y);
+        let menu_rect = app.state.context_menu_rect().unwrap();
+        let screen = app.state.screen_rect();
+        assert!(menu_rect.x < menu_anchor.0);
+        assert!(menu_rect.y < menu_anchor.1);
+        assert_eq!(menu_rect.x + menu_rect.width, screen.x + screen.width);
+        assert_eq!(menu_rect.y + menu_rect.height, screen.y + screen.height);
+        assert_eq!(app.state.workspaces.len(), 1);
     }
 
     #[test]

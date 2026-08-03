@@ -100,11 +100,15 @@ pub(super) fn git_space_metadata_from_info(info: &GitWorktreeInfo) -> GitSpaceMe
 }
 
 pub(super) fn canonicalize_best_effort_path(path: &Path) -> PathBuf {
+    // Git metadata is optional presentation data, and some Git paths can be
+    // temporarily absent during worktree operations. Callers must still be able
+    // to identify the workspace by its original path.
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn git_common_dir_for_git_dir(git_dir: &Path) -> PathBuf {
     let commondir = git_dir.join("commondir");
+    // A normal checkout has no `commondir`; only linked worktrees require it.
     let Ok(contents) = std::fs::read_to_string(commondir) else {
         return git_dir.to_path_buf();
     };
@@ -124,6 +128,8 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
         return git_symbolic_head_short(&repo_root);
     }
 
+    // Branch labels are optional UI metadata; an unreadable or changing HEAD
+    // must not make the workspace itself unusable.
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     parse_git_head_branch(&head)
 }
@@ -184,6 +190,8 @@ fn parse_git_head_branch(head: &str) -> Option<String> {
 }
 
 fn read_git_config_value(path: &Path, section: &str, key: &str) -> Option<String> {
+    // These probes answer optional capability questions such as bare/reftable;
+    // absence or unreadability means the capability cannot be established.
     let contents = std::fs::read_to_string(path).ok()?;
     let mut in_section = false;
     for raw_line in contents.lines() {
@@ -226,6 +234,9 @@ fn strip_git_config_comment(value: &str) -> &str {
 }
 
 fn git_trimmed_stdout(repo_root: &Path, args: &[&str]) -> Option<String> {
+    // Symbolic-ref and revision probes feed optional Git status presentation.
+    // A command failure means that metadata is unavailable, not that workspace
+    // state should be changed.
     let output = crate::noninteractive_process::command("git")
         .arg("-C")
         .arg(repo_root)
@@ -270,6 +281,7 @@ pub(super) fn read_ref_oid(common_dir: &Path, full_ref: &str) -> Option<String> 
         }
     }
 
+    // `packed-refs` is optional; loose refs and unborn branches commonly omit it.
     let packed_refs = std::fs::read_to_string(common_dir.join("packed-refs")).ok()?;
     for line in packed_refs.lines() {
         let line = line.trim();

@@ -20,6 +20,13 @@ pub(super) fn workspace_list() -> std::io::Result<i32> {
     )
 }
 
+pub(super) fn machine_list() -> std::io::Result<i32> {
+    print_method_response(
+        "cli:machine:list",
+        Method::MachineList(EmptyParams::default()),
+    )
+}
+
 pub(super) fn workspace_create(params: WorkspaceCreateParams) -> std::io::Result<i32> {
     print_method_response("cli:workspace:create", Method::WorkspaceCreate(params))
 }

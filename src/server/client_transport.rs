@@ -7,7 +7,9 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SendError, TrySendError};
+#[cfg(unix)]
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{SendError, Sender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -20,7 +22,7 @@ use crate::ipc::LocalStream;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientInputEvent, ClientKeybindings,
     ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
-    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, MAX_INPUT_PAYLOAD, PROTOCOL_VERSION,
 };
 
 /// Minimum accepted attached client size.
@@ -37,8 +39,9 @@ const MIN_CLIENT_ROWS: u16 = 1;
 /// and cleanup overhead.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
-const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
+/// Bounds a non-reading client's ability to strand its writer and cleanup threads.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Maximum structured input events accepted in one client message.
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
 
@@ -65,6 +68,14 @@ impl ClientWriter {
                 target: ClientRenderTarget::Channel(render),
             },
         }
+    }
+}
+
+impl ClientWriter {
+    /// Flushes queued control messages, drops any pending render, and closes the
+    /// underlying transport. Test-channel writers have no transport to close.
+    pub(crate) fn close_transport(&self) {
+        self.control.close_transport();
     }
 }
 
@@ -134,6 +145,31 @@ impl ClientControlWriter {
             ClientControlTarget::Channel(sender) => sender.send(data),
         }
     }
+
+    fn close_transport(&self) {
+        match &self.target {
+            ClientControlTarget::Queue(queue) => queue.request_close(),
+            #[cfg(test)]
+            ClientControlTarget::Channel(_) => {}
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn send_with_receipt(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<Receiver<bool>, SendError<Vec<u8>>> {
+        match &self.target {
+            ClientControlTarget::Queue(queue) => queue.send_control_with_receipt(data),
+            #[cfg(test)]
+            ClientControlTarget::Channel(sender) => {
+                sender.send(data)?;
+                let (receipt_tx, receipt_rx) = std::sync::mpsc::channel();
+                let _ = receipt_tx.send(true);
+                Ok(receipt_rx)
+            }
+        }
+    }
 }
 
 impl Clone for ClientRenderWriter {
@@ -188,16 +224,24 @@ struct ClientWriterQueue {
 
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
-    control: VecDeque<Vec<u8>>,
+    control: VecDeque<ClientControlMessage>,
     render: Option<Vec<u8>>,
     senders: usize,
     writer_alive: bool,
+    closing: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
+struct ClientControlMessage {
+    data: Vec<u8>,
+    receipt: Option<Sender<bool>>,
+}
+
+#[derive(Debug)]
 enum ClientWriteItem {
-    Control(Vec<u8>),
+    Control(ClientControlMessage),
     Render(Vec<u8>),
+    Close,
 }
 
 impl ClientWriterQueue {
@@ -224,17 +268,38 @@ impl ClientWriterQueue {
 
     fn send_control(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
         let mut state = self.lock_state();
-        if !state.writer_alive {
+        if !state.writer_alive || state.closing {
             return Err(SendError(data));
         }
-        state.control.push_back(data);
+        state.control.push_back(ClientControlMessage {
+            data,
+            receipt: None,
+        });
         self.ready.notify_one();
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn send_control_with_receipt(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<Receiver<bool>, SendError<Vec<u8>>> {
+        let mut state = self.lock_state();
+        if !state.writer_alive || state.closing {
+            return Err(SendError(data));
+        }
+        let (receipt_tx, receipt_rx) = std::sync::mpsc::channel();
+        state.control.push_back(ClientControlMessage {
+            data,
+            receipt: Some(receipt_tx),
+        });
+        self.ready.notify_one();
+        Ok(receipt_rx)
+    }
+
     fn try_send_render(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
         let mut state = self.lock_state();
-        if !state.writer_alive {
+        if !state.writer_alive || state.closing {
             return Err(TrySendError::Disconnected(data));
         }
         if state.render.is_some() {
@@ -248,8 +313,12 @@ impl ClientWriterQueue {
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
         loop {
-            if let Some(data) = state.control.pop_front() {
-                return Some(ClientWriteItem::Control(data));
+            if let Some(message) = state.control.pop_front() {
+                return Some(ClientWriteItem::Control(message));
+            }
+            if state.closing {
+                state.render = None;
+                return Some(ClientWriteItem::Close);
             }
             if let Some(data) = state.render.take() {
                 self.ready.notify_one();
@@ -263,6 +332,12 @@ impl ClientWriterQueue {
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+    }
+
+    fn request_close(&self) {
+        let mut state = self.lock_state();
+        state.closing = true;
+        self.ready.notify_one();
     }
 
     fn close_writer(&self) {
@@ -469,6 +544,33 @@ fn set_client_recv_timeout(
     stream.set_recv_timeout(timeout)
 }
 
+#[cfg(windows)]
+fn set_client_send_timeout(
+    stream: &LocalStream,
+    timeout: Option<Duration>,
+    context: &'static str,
+    client_id: u64,
+) -> io::Result<()> {
+    match stream.set_send_timeout(timeout) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+            debug!(client_id, err = %err, context, "client socket send timeout unavailable");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(windows))]
+fn set_client_send_timeout(
+    stream: &LocalStream,
+    timeout: Option<Duration>,
+    _context: &'static str,
+    _client_id: u64,
+) -> io::Result<()> {
+    stream.set_send_timeout(timeout)
+}
+
 /// Handles the client handshake on a blocking thread.
 ///
 /// Reads the `Hello` message, validates the version, sends `Welcome`,
@@ -603,6 +705,12 @@ pub(crate) fn handle_client_handshake(
 
     // Spawn a writer thread that forwards messages from the channels to the stream.
     let write_stream = stream.try_clone()?;
+    set_client_send_timeout(
+        &write_stream,
+        Some(CLIENT_WRITE_TIMEOUT),
+        "failed to bound client writes",
+        client_id,
+    )?;
     let writer_event_tx = server_event_tx.clone();
     std::thread::spawn(move || {
         client_writer_loop(write_stream, client_id, writer_queue, writer_event_tx);
@@ -626,6 +734,7 @@ pub(crate) fn handle_client_handshake(
 }
 
 /// The client writer loop — prioritizes control messages over render frames.
+#[cfg(not(windows))]
 fn client_writer_loop(
     mut stream: LocalStream,
     client_id: u64,
@@ -634,8 +743,12 @@ fn client_writer_loop(
 ) {
     while let Some(item) = writer_queue.recv() {
         match item {
-            ClientWriteItem::Control(data) => {
-                if !write_framed_bytes(&mut stream, &data) {
+            ClientWriteItem::Control(message) => {
+                let written = write_framed_bytes(&mut stream, &message.data);
+                if let Some(receipt) = message.receipt {
+                    let _ = receipt.send(written);
+                }
+                if !written {
                     break;
                 }
             }
@@ -646,10 +759,204 @@ fn client_writer_loop(
                     break;
                 }
             }
+            ClientWriteItem::Close => {
+                shutdown_local_stream(&stream);
+                break;
+            }
         }
     }
+    shutdown_local_stream(&stream);
     writer_queue.close_writer();
     debug!("client writer thread exiting");
+}
+
+#[cfg(windows)]
+fn client_writer_loop(
+    stream: LocalStream,
+    client_id: u64,
+    writer_queue: Arc<ClientWriterQueue>,
+    server_event_tx: mpsc::Sender<ServerEvent>,
+) {
+    let mut worker = match WindowsWriteWorker::spawn(&stream) {
+        Ok(worker) => worker,
+        Err(err) => {
+            debug!(client_id, err = %err, "failed to start bounded client writer");
+            shutdown_local_stream(&stream);
+            writer_queue.close_writer();
+            return;
+        }
+    };
+
+    while let Some(item) = writer_queue.recv() {
+        match item {
+            ClientWriteItem::Control(message) => {
+                let written = worker.write(message.data);
+                if let Some(receipt) = message.receipt {
+                    let _ = receipt.send(written);
+                }
+                if !written {
+                    break;
+                }
+            }
+            ClientWriteItem::Render(data) => {
+                let _ =
+                    server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
+                if !worker.write(data) {
+                    break;
+                }
+            }
+            ClientWriteItem::Close => break,
+        }
+    }
+
+    shutdown_local_stream(&stream);
+    worker.stop();
+    writer_queue.close_writer();
+    debug!("client writer thread exiting");
+}
+
+#[cfg(windows)]
+struct WindowsWriteRequest {
+    data: Vec<u8>,
+    result: Sender<bool>,
+}
+
+#[cfg(windows)]
+struct WindowsWriteWorker {
+    requests: Option<Sender<WindowsWriteRequest>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    thread_handle: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl WindowsWriteWorker {
+    fn spawn(stream: &LocalStream) -> io::Result<Self> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThreadId, OpenThread, THREAD_TERMINATE,
+        };
+
+        let mut write_stream = stream.try_clone()?;
+        let (request_tx, request_rx) = std::sync::mpsc::channel::<WindowsWriteRequest>();
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel::<io::Result<OwnedHandle>>(1);
+        let thread = std::thread::spawn(move || {
+            let raw_handle = unsafe { OpenThread(THREAD_TERMINATE, 0, GetCurrentThreadId()) };
+            if raw_handle.is_null() {
+                let _ = startup_tx.send(Err(io::Error::last_os_error()));
+                return;
+            }
+            let thread_handle = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
+            if startup_tx.send(Ok(thread_handle)).is_err() {
+                return;
+            }
+
+            while let Ok(request) = request_rx.recv() {
+                let written = write_framed_bytes(&mut write_stream, &request.data);
+                let _ = request.result.send(written);
+                if !written {
+                    break;
+                }
+            }
+        });
+
+        let thread_handle = match startup_rx.recv() {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(err)) => {
+                let _ = thread.join();
+                return Err(err);
+            }
+            Err(err) => {
+                let _ = thread.join();
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("client writer startup channel closed: {err}"),
+                ));
+            }
+        };
+
+        Ok(Self {
+            requests: Some(request_tx),
+            thread: Some(thread),
+            thread_handle,
+        })
+    }
+
+    fn write(&self, data: Vec<u8>) -> bool {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let Some(requests) = &self.requests else {
+            return false;
+        };
+        if requests
+            .send(WindowsWriteRequest {
+                data,
+                result: result_tx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+
+        match result_rx.recv_timeout(CLIENT_WRITE_TIMEOUT) {
+            Ok(written) => written,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                debug!("client write timed out, cancelling writer I/O");
+                self.cancel();
+                false
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => false,
+        }
+    }
+
+    fn stop(&mut self) {
+        self.cancel();
+        self.requests.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    fn cancel(&self) {
+        use std::os::windows::io::{AsHandle, AsRawHandle};
+        use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+        use windows_sys::Win32::System::IO::CancelSynchronousIo;
+
+        let cancelled =
+            unsafe { CancelSynchronousIo(self.thread_handle.as_handle().as_raw_handle()) };
+        if cancelled == 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(ERROR_NOT_FOUND as i32) {
+                debug!(err = %err, "failed to cancel client writer I/O");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn shutdown_local_stream(stream: &LocalStream) {
+    let LocalStream::UdSocket(stream) = stream;
+    if let Err(err) = stream.inner().shutdown(std::net::Shutdown::Both) {
+        debug!(err = %err, "failed to shut down client socket during cleanup");
+    }
+}
+
+#[cfg(windows)]
+fn shutdown_local_stream(stream: &LocalStream) {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
+    use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
+
+    let LocalStream::NamedPipe(pipe) = stream;
+    if !pipe.inner().is_server() {
+        return;
+    }
+
+    let disconnected = unsafe { DisconnectNamedPipe(pipe.as_handle().as_raw_handle()) };
+    if disconnected == 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(ERROR_PIPE_NOT_CONNECTED as i32) {
+            debug!(err = %err, "failed to disconnect client named pipe during cleanup");
+        }
+    }
 }
 
 fn write_framed_bytes(stream: &mut LocalStream, data: &[u8]) -> bool {
@@ -702,17 +1009,21 @@ fn client_read_loop(
             ClientMessage::Input { data } => {
                 // Validate input size.
                 if data.len() > MAX_INPUT_PAYLOAD {
-                    if crate::raw_input::is_complete_text_bracketed_paste(&data) {
-                        warn!(
-                            client_id,
-                            size = data.len(),
-                            max = MAX_INPUT_PAYLOAD,
-                            "oversized bracketed paste from client, rejecting"
-                        );
-                        ServerEvent::ClientPasteRejected {
-                            client_id,
-                            size: data.len(),
-                            max: MAX_INPUT_PAYLOAD,
+                    if let Some(size) = crate::raw_input::complete_text_bracketed_paste_len(&data) {
+                        if size > MAX_INPUT_PAYLOAD {
+                            warn!(
+                                client_id,
+                                size,
+                                max = MAX_INPUT_PAYLOAD,
+                                "oversized bracketed paste from client, rejecting"
+                            );
+                            ServerEvent::ClientPasteRejected {
+                                client_id,
+                                size,
+                                max: MAX_INPUT_PAYLOAD,
+                            }
+                        } else {
+                            ServerEvent::ClientInput { client_id, data }
                         }
                     } else {
                         warn!(
@@ -810,7 +1121,10 @@ fn client_read_loop(
                     cell_height_px,
                 }
             }
-            ClientMessage::Detach => ServerEvent::ClientDetach { client_id },
+            ClientMessage::Detach => {
+                let _ = server_event_tx.blocking_send(ServerEvent::ClientDetach { client_id });
+                break;
+            }
             ClientMessage::AttachTerminal {
                 terminal_id,
                 takeover,
@@ -854,7 +1168,11 @@ fn client_read_loop(
 mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
+    use std::io::Read as _;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_TEST_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
 
     struct TestSocketPath(PathBuf);
 
@@ -869,7 +1187,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let filename = format!("h{}-{nanos}.sock", std::process::id());
+        let sequence = NEXT_TEST_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        let filename = format!("h{}-{nanos}-{sequence}.sock", std::process::id());
         #[cfg(unix)]
         {
             let _ = name;
@@ -903,12 +1222,10 @@ mod tests {
         }
     }
 
-    fn bracketed_paste_with_total_len(total_len: usize) -> Vec<u8> {
-        const DELIMITER_BYTES: usize = b"\x1b[200~".len() + b"\x1b[201~".len();
-        assert!(total_len >= DELIMITER_BYTES);
-        let mut data = Vec::with_capacity(total_len);
+    fn bracketed_paste_with_content_len(content_len: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(b"\x1b[200~".len() + content_len + b"\x1b[201~".len());
         data.extend_from_slice(b"\x1b[200~");
-        data.resize(total_len - b"\x1b[201~".len(), b'x');
+        data.resize(b"\x1b[200~".len() + content_len, b'x');
         data.extend_from_slice(b"\x1b[201~");
         data
     }
@@ -981,6 +1298,35 @@ mod tests {
         {
             ServerEvent::ClientWriterDrained { client_id } => assert_eq!(client_id, 9),
             other => panic!("expected writer drained event, got {other:?}"),
+        }
+
+        drop(writer);
+        handle.join().expect("writer exits after senders drop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_writer_receipt_confirms_control_socket_write() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-writer-control-receipt");
+        let (writer, queue) = test_queue_writer();
+        let receipt = writer
+            .control
+            .send_with_receipt(frame_server_message(&ServerMessage::ReloadSoundConfig))
+            .expect("queue receipted control");
+
+        let (server_event_tx, _server_event_rx) = mpsc::channel(1);
+        let handle = std::thread::spawn(move || {
+            client_writer_loop(server_stream, 10, queue, server_event_tx);
+        });
+
+        assert!(
+            receipt.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "control writer should confirm a successful socket write"
+        );
+        match protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read control") {
+            ServerMessage::ReloadSoundConfig => {}
+            other => panic!("expected control message, got {other:?}"),
         }
 
         drop(writer);
@@ -1069,6 +1415,143 @@ mod tests {
             writer.render.try_send(vec![b'z']),
             Err(TrySendError::Disconnected(_))
         ));
+    }
+
+    #[test]
+    fn client_writer_flushes_control_before_transport_close() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-writer-close-transport");
+        let (writer, queue) = test_queue_writer();
+        let shutdown = ServerMessage::ServerShutdown {
+            reason: Some("detached".to_owned()),
+        };
+        writer
+            .control
+            .send(frame_server_message(&shutdown))
+            .expect("queue final shutdown");
+
+        let (server_event_tx, _server_event_rx) = mpsc::channel(1);
+        let handle = std::thread::spawn(move || {
+            client_writer_loop(server_stream, 14, queue, server_event_tx);
+        });
+        writer.close_transport();
+
+        match protocol::read_message(&mut client_stream, MAX_FRAME_SIZE)
+            .expect("read final shutdown before EOF")
+        {
+            ServerMessage::ServerShutdown { reason } => {
+                assert_eq!(reason.as_deref(), Some("detached"));
+            }
+            other => panic!("expected final shutdown, got {other:?}"),
+        }
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client_stream.read(&mut byte).expect("read transport EOF"),
+            0,
+            "transport should close after its queued control messages"
+        );
+        handle.join().expect("writer exits after transport close");
+        assert!(matches!(writer.control.send(vec![b'x']), Err(SendError(_))));
+    }
+
+    #[test]
+    fn client_read_loop_exits_after_explicit_detach() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-reader-explicit-detach");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(2);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = client_read_loop(server_stream, 15, &server_event_tx, &read_quit);
+            let _ = done_tx.send(result);
+        });
+
+        protocol::write_message(&mut client_stream, &ClientMessage::Detach)
+            .expect("write explicit detach");
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "explicit detach"),
+            ServerEvent::ClientDetach { client_id: 15 }
+        ));
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader exits after explicit detach")
+            .expect("reader exits cleanly");
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client_stream.read(&mut byte).expect("read detach EOF"),
+            0,
+            "explicit detach should close the reader transport"
+        );
+    }
+
+    #[test]
+    fn client_read_loop_disconnects_on_malformed_frame_and_exits() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-reader-malformed-frame");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(2);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = client_read_loop(server_stream, 16, &server_event_tx, &read_quit);
+            let _ = done_tx.send(result);
+        });
+
+        client_stream
+            .write_all(&[1, 0, 0, 0, 0xff])
+            .expect("write malformed bincode frame");
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "malformed frame disconnect"),
+            ServerEvent::ClientDisconnected { client_id: 16 }
+        ));
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader exits after malformed frame")
+            .expect("reader reports malformed frame through typed disconnect event");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_read_loop_disconnects_on_truncated_length_prefixes() {
+        for prefix_len in 1..=3 {
+            let (mut client_stream, server_stream, _path) =
+                local_stream_pair("client-reader-truncated-prefix");
+            let (server_event_tx, mut server_event_rx) = mpsc::channel(2);
+            let should_quit = Arc::new(AtomicBool::new(false));
+            let read_quit = should_quit.clone();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = client_read_loop(
+                    server_stream,
+                    20 + prefix_len as u64,
+                    &server_event_tx,
+                    &read_quit,
+                );
+                let _ = done_tx.send(result);
+            });
+
+            client_stream
+                .write_all(&[8, 0, 0][..prefix_len])
+                .expect("write truncated length prefix");
+            let LocalStream::UdSocket(stream) = &client_stream;
+            stream
+                .inner()
+                .shutdown(std::net::Shutdown::Write)
+                .expect("finish truncated prefix");
+
+            assert!(matches!(
+                recv_server_event(&mut server_event_rx, "truncated prefix disconnect"),
+                ServerEvent::ClientDisconnected { client_id }
+                    if client_id == 20 + prefix_len as u64
+            ));
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("reader exits after truncated prefix")
+                .expect("reader reports truncated prefix through typed disconnect event");
+        }
     }
 
     #[test]
@@ -1301,7 +1784,7 @@ new_tab = "ctrl+notakey"
         protocol::write_message(
             &mut client_stream,
             &ClientMessage::Input {
-                data: bracketed_paste_with_total_len(MAX_INPUT_PAYLOAD),
+                data: bracketed_paste_with_content_len(MAX_INPUT_PAYLOAD),
             },
         )
         .expect("write maximum-size bracketed paste");
@@ -1309,7 +1792,10 @@ new_tab = "ctrl+notakey"
         match recv_server_event(&mut server_event_rx, "maximum-size paste event") {
             ServerEvent::ClientInput { client_id, data } => {
                 assert_eq!(client_id, 7);
-                assert_eq!(data.len(), MAX_INPUT_PAYLOAD);
+                assert_eq!(
+                    crate::raw_input::complete_text_bracketed_paste_len(&data),
+                    Some(MAX_INPUT_PAYLOAD)
+                );
             }
             other => panic!("expected maximum-size ClientInput, got {other:?}"),
         }
@@ -1317,7 +1803,7 @@ new_tab = "ctrl+notakey"
         protocol::write_message(
             &mut client_stream,
             &ClientMessage::Input {
-                data: bracketed_paste_with_total_len(MAX_INPUT_PAYLOAD + 1),
+                data: bracketed_paste_with_content_len(MAX_INPUT_PAYLOAD + 1),
             },
         )
         .expect("write oversized bracketed paste");
@@ -1404,7 +1890,7 @@ new_tab = "ctrl+notakey"
         let handle = std::thread::spawn(move || {
             client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
         });
-        let mut data = bracketed_paste_with_total_len(MAX_INPUT_PAYLOAD + 1);
+        let mut data = bracketed_paste_with_content_len(MAX_INPUT_PAYLOAD + 1);
         data[b"\x1b[200~".len()] = 0xff;
 
         protocol::write_message(&mut client_stream, &ClientMessage::Input { data })

@@ -4,12 +4,14 @@ pub mod agents;
 pub mod common;
 pub mod events;
 pub mod integrations;
+pub mod machines;
 pub mod panes;
 pub mod plugins;
 pub mod response;
 pub mod server;
 pub mod session;
 pub mod tabs;
+pub mod worker_runs;
 pub mod workspaces;
 pub mod worktrees;
 
@@ -17,12 +19,14 @@ pub use agents::*;
 pub use common::*;
 pub use events::*;
 pub use integrations::*;
+pub use machines::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
+pub use worker_runs::*;
 pub use workspaces::*;
 pub use worktrees::*;
 
@@ -65,6 +69,10 @@ pub enum Method {
     SessionSnapshot(EmptyParams),
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
+    #[serde(rename = "machine.list")]
+    MachineList(EmptyParams),
+    #[serde(rename = "machine.add")]
+    MachineAdd(MachineAddParams),
     #[serde(rename = "workspace.list")]
     WorkspaceList(EmptyParams),
     #[serde(rename = "workspace.get")]
@@ -133,6 +141,16 @@ pub enum Method {
     AgentPrompt(AgentPromptParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
+    #[serde(rename = "worker.run.submit")]
+    WorkerRunSubmit(WorkerRunSubmitParams),
+    #[serde(rename = "worker.run.get")]
+    WorkerRunGet(WorkerRunTarget),
+    #[serde(rename = "worker.run.cancel")]
+    WorkerRunCancel(WorkerRunCancelParams),
+    #[serde(rename = "worker.run.timeout")]
+    WorkerRunTimeout(WorkerRunTimeoutParams),
+    #[serde(rename = "worker.run.result")]
+    WorkerRunResult(WorkerRunResultTarget),
     #[serde(rename = "pane.split")]
     PaneSplit(PaneSplitParams),
     #[serde(rename = "pane.swap")]
