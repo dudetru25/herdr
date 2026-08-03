@@ -88,30 +88,15 @@ pub struct WorkerPlacementFailure {
     pub reason: String,
 }
 
+/// Resolves one approved worker placement. Approval comes entirely from the
+/// user-granted `[[worker_placements]]` registry; no host, path, or operating
+/// system fact compiled into this file may approve or reject a placement.
 pub fn resolve_worker_placement(
     target_tag: &str,
     harness: WorkerHarness,
     requested_kind: WorkerPlacementKind,
     candidates: &[WorkerPlacementCandidate],
     approved: &[WorkerPlacementConfig],
-) -> Result<ResolvedWorkerPlacement, WorkerPlacementFailure> {
-    resolve_worker_placement_for_platform(
-        target_tag,
-        harness,
-        requested_kind,
-        candidates,
-        approved,
-        std::env::consts::OS,
-    )
-}
-
-fn resolve_worker_placement_for_platform(
-    target_tag: &str,
-    harness: WorkerHarness,
-    requested_kind: WorkerPlacementKind,
-    candidates: &[WorkerPlacementCandidate],
-    approved: &[WorkerPlacementConfig],
-    host_os: &str,
 ) -> Result<ResolvedWorkerPlacement, WorkerPlacementFailure> {
     let matching = candidates
         .iter()
@@ -250,12 +235,6 @@ fn resolve_worker_placement_for_platform(
                 reason: "approved local placement must not have a machine binding".into(),
             });
         }
-        if host_os != "macos" {
-            return Err(WorkerPlacementFailure {
-                kind: WorkerPlacementFailureKind::Unavailable,
-                reason: "the approved local worker placement is available only on macos".into(),
-            });
-        }
         if !cwd.is_absolute() {
             return Err(WorkerPlacementFailure {
                 kind: WorkerPlacementFailureKind::Blocked,
@@ -347,13 +326,12 @@ mod tests {
 
     #[test]
     fn only_explicitly_approved_local_pane_resolves() {
-        let resolved = resolve_worker_placement_for_platform(
+        let resolved = resolve_worker_placement(
             LOCAL_TARGET,
             WorkerHarness::Codex,
             WorkerPlacementKind::LocalPane,
             &[local_candidate(true)],
             &[approval(LOCAL_TARGET, WorkerPlacementKindConfig::LocalPane)],
-            "macos",
         )
         .unwrap();
         assert_eq!(resolved.target_tag, LOCAL_TARGET);
@@ -364,13 +342,12 @@ mod tests {
 
     #[test]
     fn approved_remote_target_resolves_without_a_local_os_assumption() {
-        let resolved = resolve_worker_placement_for_platform(
+        let resolved = resolve_worker_placement(
             REMOTE_TARGET,
             WorkerHarness::Claude,
             WorkerPlacementKind::Remote,
             &[remote_candidate()],
             &[approval(REMOTE_TARGET, WorkerPlacementKindConfig::Remote)],
-            "macos",
         )
         .unwrap();
         assert_eq!(resolved.machine.as_deref(), Some("RUG-DEV-3-WIN"));
@@ -381,25 +358,37 @@ mod tests {
     }
 
     #[test]
+    fn approved_local_placement_resolves_without_a_host_os_literal() {
+        let resolved = resolve_worker_placement(
+            LOCAL_TARGET,
+            WorkerHarness::Codex,
+            WorkerPlacementKind::LocalPane,
+            &[local_candidate(true)],
+            &[approval(LOCAL_TARGET, WorkerPlacementKindConfig::LocalPane)],
+        )
+        .unwrap();
+        assert_eq!(resolved.target_tag, LOCAL_TARGET);
+        assert_eq!(resolved.approval_ref, "user-approved:TASK-10");
+    }
+
+    #[test]
     fn unknown_and_ambiguous_targets_fail_closed() {
-        let unknown = resolve_worker_placement_for_platform(
+        let unknown = resolve_worker_placement(
             "herdr-target:unknown",
             WorkerHarness::Codex,
             WorkerPlacementKind::LocalPane,
             &[local_candidate(true)],
             &[approval(LOCAL_TARGET, WorkerPlacementKindConfig::LocalPane)],
-            "macos",
         )
         .unwrap_err();
         assert_eq!(unknown.kind, WorkerPlacementFailureKind::UnknownTarget);
 
-        let ambiguous = resolve_worker_placement_for_platform(
+        let ambiguous = resolve_worker_placement(
             LOCAL_TARGET,
             WorkerHarness::Codex,
             WorkerPlacementKind::LocalPane,
             &[local_candidate(true), local_candidate(true)],
             &[approval(LOCAL_TARGET, WorkerPlacementKindConfig::LocalPane)],
-            "macos",
         )
         .unwrap_err();
         assert_eq!(ambiguous.kind, WorkerPlacementFailureKind::AmbiguousTarget);
@@ -407,13 +396,12 @@ mod tests {
 
     #[test]
     fn unavailable_and_unauthorized_harnesses_are_explicit_results() {
-        let local = resolve_worker_placement_for_platform(
+        let local = resolve_worker_placement(
             LOCAL_TARGET,
             WorkerHarness::Codex,
             WorkerPlacementKind::LocalPane,
             &[local_candidate(false)],
             &[approval(LOCAL_TARGET, WorkerPlacementKindConfig::LocalPane)],
-            "macos",
         )
         .unwrap_err();
         assert_eq!(local.kind, WorkerPlacementFailureKind::Unavailable);
@@ -421,13 +409,12 @@ mod tests {
 
         let mut claude_only = approval(REMOTE_TARGET, WorkerPlacementKindConfig::Remote);
         claude_only.harnesses = vec!["claude".into()];
-        let unauthorized = resolve_worker_placement_for_platform(
+        let unauthorized = resolve_worker_placement(
             REMOTE_TARGET,
             WorkerHarness::Codex,
             WorkerPlacementKind::Remote,
             &[remote_candidate()],
             &[claude_only],
-            "macos",
         )
         .unwrap_err();
         assert_eq!(unauthorized.kind, WorkerPlacementFailureKind::Unavailable);
