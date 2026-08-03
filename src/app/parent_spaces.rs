@@ -108,23 +108,21 @@ impl AppState {
             .iter()
             .enumerate()
             .filter(|(_, workspace)| !workspace.is_machine())
-            .map(|(ws_idx, workspace)| {
-                workspace
-                    .identity_cwd
-                    .canonicalize()
-                    .map(|path| (ws_idx, path))
-                    .map_err(|err| {
-                        ParentSpaceActionError::new(
-                            "parent_space_scan_failed",
-                            format!(
-                                "failed to canonicalize workspace {} at {}: {err}",
-                                workspace.id,
-                                workspace.identity_cwd.display()
-                            ),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .filter_map(
+                |(ws_idx, workspace)| match workspace.identity_cwd.canonicalize() {
+                    Ok(path) => Some((ws_idx, path)),
+                    Err(err) => {
+                        warn!(
+                            workspace_id = %workspace.id,
+                            path = %workspace.identity_cwd.display(),
+                            %err,
+                            "failed to canonicalize workspace identity for parent-space adoption"
+                        );
+                        None
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
 
         let mut adopted_indices = Vec::new();
         let mut missing_directories = Vec::new();
@@ -520,6 +518,29 @@ mod tests {
             .unwrap();
         assert_eq!(plan.missing_directories, vec![beta.canonicalize().unwrap()]);
         assert_eq!(state.workspaces.len(), 3);
+    }
+
+    #[test]
+    fn scan_ignores_workspace_with_missing_identity_path() {
+        let fixture = TempFixture::new();
+        let child_path = fixture.root.join("child");
+        std::fs::create_dir(&child_path).unwrap();
+
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = fixture.root.clone();
+        let mut stale = Workspace::test_new("stale");
+        stale.identity_cwd = fixture.root.join("removed-workspace");
+        let mut state = AppState::test_new();
+        state.workspaces = vec![parent, stale];
+
+        let directories = immediate_subdirectories(&fixture.root).unwrap();
+        let plan = state.plan_parent_space_scan(0, &directories).unwrap();
+
+        assert!(plan.adopted_indices.is_empty());
+        assert_eq!(
+            plan.missing_directories,
+            vec![child_path.canonicalize().unwrap()]
+        );
     }
 
     #[tokio::test]
