@@ -32,6 +32,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::WorkspaceBecomeParent(_)
             | Method::WorkspaceRescanChildren(_)
             | Method::WorkspaceStopParent(_)
+            | Method::WorkspaceMoveBlock(_)
             | Method::WorkspaceReportMetadata(_)
             | Method::WorkspaceClose(_)
             | Method::WorktreeCreate(_)

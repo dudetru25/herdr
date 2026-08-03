@@ -12,25 +12,39 @@ test-one filter:
     cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
 # Run fast local lint checks
+[unix]
 lint:
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
 
+[script("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File")]
+[windows]
+lint:
+    & .\scripts\windows_check.ps1 -Mode lint
+
 # Run PR CI checks
+[unix]
 ci filter='all()': lint
     cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
     just integration-assets-test
     just plugin-marketplace-test
 
 # Run Windows target lint from Unix/macOS to catch cfg(windows) compile and clippy failures before CI
+[unix]
 windows-lint:
     rustup target add x86_64-pc-windows-msvc
     LIBGHOSTTY_VT_SIMD=false cargo clippy --bin herdr --locked --target x86_64-pc-windows-msvc -- -D warnings
 
 # Check formatting + run unit tests + Windows target lint + maintenance script tests
+[unix]
 check: ci windows-lint
     python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
     @echo "docs reminder: if this changes user-facing behavior, make sure the relevant release docs are updated or called out before release."
+
+[script("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File")]
+[windows]
+check:
+    & .\scripts\windows_check.ps1 -Mode check
 
 # Install repo-local git hooks
 install-hooks:
@@ -65,7 +79,9 @@ release-docs-check:
     python3 scripts/agent_detection_manifest_check.py --require-website
     python3 scripts/config_reference_check.py
     node website/scripts/docs-versions.mjs check
+    node website/scripts/docs-preview.mjs check
     @test -f docs/next/README.md
+    @test -f docs/next/README.zh-CN.md
     @if ! diff -u CHANGELOG.md docs/next/CHANGELOG.md; then \
         echo "error: CHANGELOG.md differs from docs/next/CHANGELOG.md; finalize release notes before releasing"; \
         exit 1; \
@@ -94,8 +110,8 @@ release-docs-check:
         fi; \
     done
     python3 scripts/docs_translation_parity.py --docs-root docs/next/website/src/content/docs
-    python3 scripts/docs_translation_parity.py --docs-root website/src/content/docs
     just website-build
+    cd website && bun run build:draft
 
 # Prepare the release commit without tagging or pushing (usage: just release-prepare 0.1.1)
 release-prepare version:

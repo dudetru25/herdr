@@ -119,6 +119,21 @@ impl FocusEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorScheme {
+    Light,
+    Dark,
+}
+
+impl ColorScheme {
+    fn as_raw(self) -> ffi::GhosttyColorScheme {
+        match self {
+            Self::Light => ffi::GhosttyColorScheme_GHOSTTY_COLOR_SCHEME_LIGHT,
+            Self::Dark => ffi::GhosttyColorScheme_GHOSTTY_COLOR_SCHEME_DARK,
+        }
+    }
+}
+
 pub const MOD_SHIFT: u16 = ffi::GHOSTTY_MODS_SHIFT as u16;
 pub const MOD_CTRL: u16 = ffi::GHOSTTY_MODS_CTRL as u16;
 pub const MOD_ALT: u16 = ffi::GHOSTTY_MODS_ALT as u16;
@@ -163,6 +178,7 @@ pub const MODE_MOUSE_SGR_PIXELS: u16 = 1016;
 pub const MODE_BRACKETED_PASTE: u16 = 2004;
 pub const MODE_SYNCHRONIZED_OUTPUT: u16 = 2026;
 pub const MODE_GRAPHEME_CLUSTER: u16 = 2027;
+pub const MODE_COLOR_SCHEME_REPORT: u16 = 2031;
 // These are documented in vendor/libghostty-vt/include/ghostty/vt/terminal.h,
 // but the generated bindings do not currently expose named constants for them.
 const TERMINAL_DATA_COLOR_FOREGROUND: ffi::GhosttyTerminalData = 18;
@@ -457,6 +473,25 @@ struct TerminalCallbackState {
     pwd_changes: Vec<Vec<u8>>,
     clipboard_writes: Vec<Vec<u8>>,
     size_report: ffi::GhosttySizeReportSize,
+    color_scheme: Option<ColorScheme>,
+}
+
+unsafe extern "C" fn color_scheme_trampoline(
+    _terminal: ffi::GhosttyTerminal,
+    userdata: *mut c_void,
+    out_scheme: *mut ffi::GhosttyColorScheme,
+) -> bool {
+    if userdata.is_null() || out_scheme.is_null() {
+        return false;
+    }
+    let state = unsafe { &*userdata.cast::<TerminalCallbackState>() };
+    let Some(color_scheme) = state.color_scheme else {
+        return false;
+    };
+    unsafe {
+        out_scheme.write(color_scheme.as_raw());
+    }
+    true
 }
 
 unsafe extern "C" fn size_trampoline(
@@ -534,7 +569,6 @@ unsafe fn capture_clipboard_write(
     // SAFETY: userdata is the TerminalCallbackState installed with this terminal.
     let state = unsafe { &mut *userdata.cast::<TerminalCallbackState>() };
     if request.contents_len == 0 {
-        state.clipboard_writes.push(Vec::new());
         return ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS;
     }
     if request.contents_len != 1 {
@@ -794,6 +828,12 @@ impl Terminal {
             .into_result()?;
             ffi::ghostty_terminal_set(
                 terminal.raw,
+                ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_COLOR_SCHEME,
+                (color_scheme_trampoline as *const ()).cast(),
+            )
+            .into_result()?;
+            ffi::ghostty_terminal_set(
+                terminal.raw,
                 ffi::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_GLYPH_PROTOCOL,
                 (&glyph_protocol as *const bool).cast(),
             )
@@ -912,6 +952,10 @@ impl Terminal {
         }
         self.callback_state.write_pty = Some(Box::new(callback));
         Ok(())
+    }
+
+    pub fn set_color_scheme(&mut self, color_scheme: Option<ColorScheme>) -> Option<ColorScheme> {
+        mem::replace(&mut self.callback_state.color_scheme, color_scheme)
     }
 
     pub fn take_pwd_changes(&mut self) -> Vec<Vec<u8>> {
@@ -3839,7 +3883,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_callback_rejects_writes_the_text_pipeline_cannot_represent() {
+    fn clipboard_callback_ignores_clear_and_rejects_unsupported_writes() {
         let mut terminal = Terminal::new(10, 5, 0).unwrap();
         let full_size = std::mem::size_of::<ffi::GhosttyClipboardWrite>();
         let success = ffi::GhosttyClipboardWriteResult_GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS;
@@ -3851,7 +3895,7 @@ mod tests {
             invoke_clipboard_callback(&mut terminal, &[], full_size),
             success
         );
-        assert_eq!(terminal.take_clipboard_writes(), vec![Vec::<u8>::new()]);
+        assert!(terminal.take_clipboard_writes().is_empty());
 
         let empty = test_clipboard_content(b"text/plain", b"");
         assert_eq!(
@@ -3893,7 +3937,7 @@ mod tests {
         assert!(terminal.take_clipboard_writes().is_empty());
 
         terminal.write(b"\x1b]52;c;\x07");
-        assert_eq!(terminal.take_clipboard_writes(), vec![Vec::<u8>::new()]);
+        assert!(terminal.take_clipboard_writes().is_empty());
     }
 
     #[test]

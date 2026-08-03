@@ -2,7 +2,7 @@ import { defineConfig } from 'astro/config';
 import sitemap from '@astrojs/sitemap';
 import starlight from '@astrojs/starlight';
 
-const repoBlob = 'https://github.com/ogulcancelik/herdr/blob/master/';
+const repoBlob = 'https://github.com/herdrdev/herdr/blob/master/';
 const nonCanonicalDocsPath = /^\/(?:ja\/|zh-cn\/)?docs\/(?:preview|\d+\.\d+\.\d+)(?:\/|$)/;
 
 function rewriteHerdrLinks() {
@@ -77,7 +77,7 @@ export default defineConfig({
         {
           icon: 'github',
           label: 'GitHub',
-          href: 'https://github.com/ogulcancelik/herdr',
+          href: 'https://github.com/herdrdev/herdr',
         },
       ],
       components: {
@@ -146,7 +146,7 @@ export default defineConfig({
         },
       ],
       editLink: {
-        baseUrl: 'https://github.com/ogulcancelik/herdr/edit/master/',
+        baseUrl: 'https://github.com/herdrdev/herdr/edit/master/',
       },
       lastUpdated: true,
       disable404Route: true,
@@ -199,7 +199,7 @@ export default defineConfig({
           translations: { ja: 'ヘルプ', 'zh-CN': '帮助' },
           items: [
             { label: 'Troubleshooting', translations: { ja: 'トラブルシューティング', 'zh-CN': '故障排除' }, slug: 'docs/troubleshooting' },
-            { label: 'Next docs', translations: { ja: '次期版ドキュメント', 'zh-CN': '下一版文档' }, slug: 'docs/preview' },
+            { label: 'Preview docs', translations: { ja: 'プレビュー版ドキュメント', 'zh-CN': '预览版文档' }, slug: 'docs/preview' },
           ],
         },
       ],

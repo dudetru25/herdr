@@ -16,7 +16,7 @@ mod input;
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write as _};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -1158,7 +1158,7 @@ fn run_client_with_mode(
 
     // Get the terminal geometry before handshake (before raw mode).
     let (cols, rows, cell_width_px, cell_height_px) =
-        current_terminal_geometry(kitty_graphics_enabled);
+        initial_terminal_geometry(kitty_graphics_enabled);
 
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = match do_handshake(
@@ -1225,17 +1225,22 @@ fn run_client_with_mode(
 
     let should_quit = Arc::new(AtomicBool::new(false));
 
-    // Install Ctrl+C handler.
+    // ctrlc's "termination" feature also catches SIGTERM/SIGHUP so direct
+    // termination signals still run the quit path and TerminalGuard::Drop.
     let quit_flag = should_quit.clone();
-    let _ = ctrlc::set_handler(move || {
+    if let Err(err) = ctrlc::set_handler(move || {
         quit_flag.store(true, Ordering::Release);
-    });
+    }) {
+        warn!(%err, "failed to install termination handler; terminal restore relies on TerminalGuard::Drop and the panic hook");
+    }
 
     let result = rt.block_on(async {
         run_client_loop(
             stream,
             cols,
             rows,
+            cell_width_px,
+            cell_height_px,
             should_quit,
             loop_config,
             negotiated_encoding,
@@ -1280,6 +1285,8 @@ async fn run_client_loop(
     stream: LocalStream,
     cols: u16,
     rows: u16,
+    initial_cell_width_px: u32,
+    initial_cell_height_px: u32,
     should_quit: Arc<AtomicBool>,
     config: ClientLoopConfig,
     negotiated_encoding: RenderEncoding,
@@ -1309,6 +1316,9 @@ async fn run_client_loop(
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
+    // Cell size reported by the host terminal, packed as width<<32 | height.
+    // Zero means the host has not reported one.
+    let reported_cell_size = Arc::new(AtomicU64::new(0));
 
     // Channel for events from the stdin, resize, and server reader threads.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ClientLoopEvent>(256);
@@ -1316,6 +1326,10 @@ async fn run_client_loop(
     // Spawn the stdin reader thread.
     let will_query_host_terminal_theme =
         state.attach_escape.is_none() && should_query_host_terminal_theme();
+    // Terminals behind ConPTY report no pixel size through the ioctl, so ask the
+    // host terminal directly instead of falling back to an assumed cell size.
+    let will_query_host_cell_size = state.attach_escape.is_none()
+        && host_cell_size_query_required(state.kitty_graphics_enabled);
     let stdin_quit = should_quit.clone();
     let stdin_tx = event_tx.clone();
     let stdin_mouse_capture_active = host_mouse_capture_active.clone();
@@ -1324,6 +1338,7 @@ async fn run_client_loop(
             stdin_tx,
             &stdin_quit,
             will_query_host_terminal_theme,
+            will_query_host_cell_size,
             stdin_mouse_capture_active,
         );
     });
@@ -1332,12 +1347,26 @@ async fn run_client_loop(
         query_host_terminal_theme();
     }
 
+    if will_query_host_cell_size {
+        query_host_cell_size();
+    }
+
     // Spawn the resize poller thread.
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
+    let resize_cell_size = reported_cell_size.clone();
     let kitty_graphics_enabled = state.kitty_graphics_enabled;
     std::thread::spawn(move || {
-        resize_poll_loop(resize_tx, cols, rows, kitty_graphics_enabled, &resize_quit);
+        resize_poll_loop(
+            resize_tx,
+            cols,
+            rows,
+            initial_cell_width_px,
+            initial_cell_height_px,
+            kitty_graphics_enabled,
+            &resize_cell_size,
+            &resize_quit,
+        );
     });
 
     // Spawn the server reader thread (blocking reads from the socket).
@@ -1366,7 +1395,8 @@ async fn run_client_loop(
         .set_nonblocking(false)
         .map_err(ClientError::ConnectionFailed)?;
 
-    // This (foreground) client owns the prefix ASCII input-source switch; a no-op on non-macOS.
+    // This (foreground) client owns the prefix ASCII input-source switch
+    // (implemented on macOS and Windows; a no-op on other platforms).
     use crate::platform::PrefixInputSource;
     let mut prefix_input_source = crate::platform::RealPrefixInputSource::default();
 
@@ -1424,6 +1454,9 @@ async fn run_client_loop(
                     }
                     if crate::raw_input::events_require_host_terminal_theme_query(&events) {
                         query_host_terminal_theme();
+                    }
+                    if let Some((width_px, height_px)) = reported_cell_size_from_events(&events) {
+                        store_reported_cell_size(&reported_cell_size, width_px, height_px);
                     }
                     data
                 };
@@ -1501,6 +1534,8 @@ async fn run_client_loop(
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                 state.reported_size = (new_cols, new_rows);
+                // Resizing invalidates the host-side blit baseline.
+                state.request_repaint();
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
                     rows: new_rows,
@@ -1831,7 +1866,7 @@ fn should_bridge_clipboard_image_paste(
         events.as_slice(),
         [crate::raw_input::RawInputEvent::Key(key)]
             if key.kind == crossterm::event::KeyEventKind::Press
-                && crate::config::terminal_key_matches_combo(*key, remote_image_paste_key)
+                && crate::config::terminal_key_matches_combo(key, remote_image_paste_key)
     )
 }
 
@@ -2075,35 +2110,83 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // Resize polling
 // ---------------------------------------------------------------------------
 
-fn current_terminal_geometry(kitty_graphics_enabled: bool) -> (u16, u16, u32, u32) {
+/// Cell size assumed when neither the terminal size ioctl nor the host
+/// terminal reports pixel dimensions.
+const DEFAULT_CELL_WIDTH_PX: u32 = 8;
+const DEFAULT_CELL_HEIGHT_PX: u32 = 16;
+
+/// Cell size derived from the terminal size ioctl, if it reports pixels.
+fn ioctl_cell_size() -> Option<(u32, u32)> {
+    let size = crossterm::terminal::window_size().ok()?;
+    if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
+        return None;
+    }
+    Some((
+        (size.width as u32 / size.columns as u32).max(1),
+        (size.height as u32 / size.rows as u32).max(1),
+    ))
+}
+
+/// Cell size used when the ioctl reports no pixels.
+fn cell_size_fallback(reported: u64) -> (u32, u32) {
+    unpack_cell_size(reported).unwrap_or((DEFAULT_CELL_WIDTH_PX, DEFAULT_CELL_HEIGHT_PX))
+}
+
+#[cfg(any(unix, test))]
+fn pack_cell_size(width_px: u32, height_px: u32) -> u64 {
+    (u64::from(width_px) << 32) | u64::from(height_px)
+}
+
+fn unpack_cell_size(packed: u64) -> Option<(u32, u32)> {
+    let width_px = (packed >> 32) as u32;
+    let height_px = (packed & u64::from(u32::MAX)) as u32;
+    (width_px > 0 && height_px > 0).then_some((width_px, height_px))
+}
+
+fn current_terminal_geometry(
+    kitty_graphics_enabled: bool,
+    reported_cell_size: &AtomicU64,
+) -> (u16, u16, u32, u32) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     if !kitty_graphics_enabled {
         return (cols, rows, 0, 0);
     }
-    let Ok(size) = crossterm::terminal::window_size() else {
-        return (cols, rows, 8, 16);
-    };
-    if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
-        return (cols, rows, 8, 16);
-    }
-    (
-        cols,
-        rows,
-        (size.width as u32 / size.columns as u32).max(1),
-        (size.height as u32 / size.rows as u32).max(1),
-    )
+    let (cell_width_px, cell_height_px) = ioctl_cell_size()
+        .unwrap_or_else(|| cell_size_fallback(reported_cell_size.load(Ordering::Acquire)));
+    (cols, rows, cell_width_px, cell_height_px)
 }
 
-/// Polls the terminal size and sends resize events when it changes.
+/// Reads the terminal geometry before the handshake, before any host cell
+/// size report can exist.
+fn initial_terminal_geometry(kitty_graphics_enabled: bool) -> (u16, u16, u32, u32) {
+    current_terminal_geometry(kitty_graphics_enabled, &AtomicU64::new(0))
+}
+
+/// Reports polled changes and signalled resizes that return to the same size.
+fn resize_report_required(
+    signalled: bool,
+    new_size: (u16, u16, u32, u32),
+    last_size: (u16, u16, u32, u32),
+) -> bool {
+    signalled || new_size != last_size
+}
+
+/// Watches the terminal size and sends resize events when it changes.
+///
+/// The baseline cell size must match what the handshake sent to the server:
+/// reading a fresh one here would race the host cell size reply and could
+/// swallow the first change.
 fn resize_poll_loop(
     resize_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
     initial_cols: u16,
     initial_rows: u16,
+    initial_cell_width: u32,
+    initial_cell_height: u32,
     kitty_graphics_enabled: bool,
+    reported_cell_size: &AtomicU64,
     should_quit: &Arc<AtomicBool>,
 ) {
-    let (_, _, initial_cell_width, initial_cell_height) =
-        current_terminal_geometry(kitty_graphics_enabled);
+    crate::platform::watch_terminal_resize_signal();
     let mut last_size = (
         initial_cols,
         initial_rows,
@@ -2112,8 +2195,9 @@ fn resize_poll_loop(
     );
     while !should_quit.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(100));
-        let new_size = current_terminal_geometry(kitty_graphics_enabled);
-        if new_size != last_size {
+        let signalled = crate::platform::take_terminal_resize_signal();
+        let new_size = current_terminal_geometry(kitty_graphics_enabled, reported_cell_size);
+        if resize_report_required(signalled, new_size, last_size) {
             last_size = new_size;
             if resize_tx
                 .blocking_send(ClientLoopEvent::Resize(
@@ -2146,6 +2230,49 @@ fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()>
     writer.flush()
 }
 
+/// XTWINOPS request for the host terminal cell size in pixels.
+const HOST_CELL_SIZE_QUERY: &[u8] = b"\x1b[16t";
+
+fn query_host_cell_size() {
+    let _ = write_host_cell_size_query(io::stdout());
+}
+
+fn should_query_host_cell_size() -> bool {
+    !cfg!(windows)
+}
+
+/// Only pane graphics need pixel dimensions, and only when the ioctl cannot
+/// provide them.
+fn host_cell_size_query_required(kitty_graphics_enabled: bool) -> bool {
+    kitty_graphics_enabled && should_query_host_cell_size() && ioctl_cell_size().is_none()
+}
+
+fn write_host_cell_size_query(mut writer: impl io::Write) -> io::Result<()> {
+    writer.write_all(HOST_CELL_SIZE_QUERY)?;
+    writer.flush()
+}
+
+#[cfg(any(unix, test))]
+fn store_reported_cell_size(reported_cell_size: &AtomicU64, width_px: u32, height_px: u32) {
+    let packed = pack_cell_size(width_px, height_px);
+    if reported_cell_size.swap(packed, Ordering::AcqRel) != packed {
+        debug!(width_px, height_px, "host terminal reported cell size");
+    }
+}
+
+#[cfg(any(unix, test))]
+fn reported_cell_size_from_events(
+    events: &[crate::raw_input::RawInputEvent],
+) -> Option<(u32, u32)> {
+    events.iter().rev().find_map(|event| match event {
+        crate::raw_input::RawInputEvent::HostCellSizeReport {
+            width_px,
+            height_px,
+        } => Some((*width_px, *height_px)),
+        _ => None,
+    })
+}
+
 fn init_logging() {
     crate::logging::init_file_logging("herdr-client.log");
 }
@@ -2163,6 +2290,15 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn resize_signal_reports_even_when_polled_size_is_unchanged() {
+        let size = (120, 40, 8, 16);
+        assert!(resize_report_required(true, size, size));
+        assert!(!resize_report_required(false, size, size));
+        assert!(resize_report_required(false, (120, 41, 8, 16), size));
+        assert!(resize_report_required(false, (120, 40, 9, 18), size));
     }
 
     fn restore_env_var(key: &str, value: Option<OsString>) {
@@ -2469,6 +2605,36 @@ mod tests {
     #[test]
     fn host_terminal_theme_query_is_disabled_on_windows() {
         assert_eq!(should_query_host_terminal_theme(), !cfg!(windows));
+    }
+
+    #[test]
+    fn write_host_cell_size_query_emits_xtwinops_request() {
+        let mut output = Vec::new();
+        write_host_cell_size_query(&mut output).unwrap();
+
+        assert_eq!(output, b"\x1b[16t");
+    }
+
+    #[test]
+    fn host_cell_size_query_is_disabled_on_windows() {
+        assert_eq!(should_query_host_cell_size(), !cfg!(windows));
+    }
+
+    #[test]
+    fn cell_size_fallback_prefers_reported_size_over_default() {
+        assert_eq!(cell_size_fallback(0), (8, 16));
+        assert_eq!(cell_size_fallback(pack_cell_size(10, 21)), (10, 21));
+        assert_eq!(cell_size_fallback(pack_cell_size(10, 0)), (8, 16));
+        assert_eq!(cell_size_fallback(pack_cell_size(0, 21)), (8, 16));
+    }
+
+    #[test]
+    fn reported_cell_size_is_taken_from_host_cell_size_events() {
+        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[?997;1n");
+        assert_eq!(reported_cell_size_from_events(&events), None);
+
+        let events = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[6;21;10t\x1b[6;18;9t");
+        assert_eq!(reported_cell_size_from_events(&events), Some((9, 18)));
     }
 
     #[test]

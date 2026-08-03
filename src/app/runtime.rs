@@ -1,11 +1,13 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+#[cfg(test)]
+use std::time::Duration;
 
 use crossterm::terminal;
 
 use super::{
-    background_update_check_enabled, pressed_key_identity, App, ANIMATION_INTERVAL,
-    AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL, RESIZE_POLL_INTERVAL,
-    SELECTION_AUTOSCROLL_INTERVAL,
+    background_update_check_enabled, App, AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL,
+    RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
 };
 fn retain_custom_command_after_wait(
     pid: u32,
@@ -28,12 +30,20 @@ impl App {
             .retain_mut(|child| retain_custom_command_after_wait(child.id(), child.try_wait()));
     }
 
+    pub(crate) fn shutdown_terminal_runtime(&mut self, terminal_id: crate::terminal::TerminalId) {
+        let target = super::TerminalInputTarget {
+            terminal_id: terminal_id.clone(),
+        };
+        self.release_input_target_headless(&target);
+        if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
+            runtime.shutdown();
+        }
+    }
+
     pub(crate) fn shutdown_detached_terminal_runtimes(&mut self) {
         let terminal_ids = std::mem::take(&mut self.state.terminal_runtime_shutdowns);
         for terminal_id in terminal_ids {
-            if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
-                runtime.shutdown();
-            }
+            self.shutdown_terminal_runtime(terminal_id);
         }
     }
 
@@ -101,6 +111,65 @@ impl App {
         changed
     }
 
+    async fn execute_repeat_plan(
+        &mut self,
+        lease_key: super::input::InputLeaseKey,
+        key: crate::input::TerminalKey,
+        plan: super::input::RepeatPlan,
+    ) -> bool {
+        match plan {
+            super::input::RepeatPlan::Forwarded(target) => {
+                if !self.forward_terminal_key_to_target(&target, key).await {
+                    self.input_leases.remove(&lease_key);
+                }
+                true
+            }
+            super::input::RepeatPlan::Reprocess {
+                context,
+                repetitions,
+                tracked,
+            } => {
+                let key = key
+                    .with_kind(crossterm::event::KeyEventKind::Repeat)
+                    .with_repeat_count(1);
+                let mut forwarded_target = None;
+                for _ in 0..repetitions {
+                    if let Some(target) = &forwarded_target {
+                        if !self
+                            .forward_terminal_key_to_target(target, key.clone())
+                            .await
+                        {
+                            self.input_leases.remove(&lease_key);
+                            break;
+                        }
+                        continue;
+                    }
+                    let current_context = self.terminal_input_context();
+                    if !self.input_leases.reprocess_allowed(
+                        lease_key,
+                        &context,
+                        current_context.as_ref(),
+                        tracked,
+                    ) {
+                        break;
+                    }
+                    if let Some(target) = self.handle_key(key.clone()).await {
+                        if tracked {
+                            self.input_leases.insert_forwarded(
+                                lease_key,
+                                target.clone(),
+                                key.clone(),
+                            );
+                            forwarded_target = Some(target);
+                        }
+                    }
+                }
+                true
+            }
+            super::input::RepeatPlan::Ignore => false,
+        }
+    }
+
     pub(super) async fn handle_raw_input_event(
         &mut self,
         event: crate::raw_input::RawInputEvent,
@@ -108,72 +177,60 @@ impl App {
         let previous_mode = self.state.mode;
         let changed = match event {
             crate::raw_input::RawInputEvent::Key(key) => {
-                let pressed_key_id = pressed_key_identity(super::LOCAL_INPUT_SOURCE, &key);
+                let lease_key = super::input::InputLeaseKey::new(super::LOCAL_INPUT_SOURCE, &key);
+                let key = self.input_leases.normalize_press(&lease_key, key);
                 match key.kind {
                     crossterm::event::KeyEventKind::Press => {
-                        if self.state.popup_pane.is_some()
-                            || self.state.mode == crate::app::Mode::Terminal
-                        {
-                            self.suppressed_repeat_keys.remove(&pressed_key_id);
-                        } else {
-                            self.suppressed_repeat_keys.insert(pressed_key_id);
-                        }
-                        if let Some(target) = self.handle_key(key).await {
-                            if !key.is_text_commit {
-                                self.pressed_terminal_keys.insert(
-                                    pressed_key_id,
-                                    super::PressedTerminalKey { target, key },
-                                );
-                            }
-                        } else {
-                            self.pressed_terminal_keys.remove(&pressed_key_id);
-                        }
+                        let initial_context = self.terminal_input_context();
+                        let target = self.handle_key(key.clone()).await;
+                        let resulting_context = self.terminal_input_context();
+                        let plan = self.input_leases.complete_press(
+                            lease_key,
+                            &key,
+                            initial_context.as_ref(),
+                            resulting_context.as_ref(),
+                            target,
+                        );
+                        self.execute_repeat_plan(lease_key, key, plan).await;
                         true
                     }
                     crossterm::event::KeyEventKind::Repeat => {
-                        if let Some(pressed) =
-                            self.pressed_terminal_keys.get(&pressed_key_id).cloned()
-                        {
-                            if !self
-                                .forward_terminal_key_to_target(&pressed.target, key)
-                                .await
-                            {
-                                self.pressed_terminal_keys.remove(&pressed_key_id);
-                            }
-                            true
-                        } else if (self.state.popup_pane.is_some()
-                            || self.state.mode == crate::app::Mode::Terminal)
-                            && !self.suppressed_repeat_keys.contains(&pressed_key_id)
-                        {
-                            self.handle_key(key).await;
-                            true
-                        } else {
-                            false
-                        }
+                        let current_context = self.terminal_input_context();
+                        let plan = self.input_leases.plan_repeat(
+                            lease_key,
+                            &key,
+                            current_context.as_ref(),
+                        );
+                        self.execute_repeat_plan(lease_key, key, plan).await
                     }
                     crossterm::event::KeyEventKind::Release => {
-                        self.suppressed_repeat_keys.remove(&pressed_key_id);
-                        if let Some(pressed) = self.pressed_terminal_keys.remove(&pressed_key_id) {
+                        if let Some(lease) = self.input_leases.remove_forwarded(&lease_key) {
                             let _ = self
-                                .forward_terminal_key_to_target(&pressed.target, key)
+                                .forward_terminal_key_to_target(&lease.target, key)
                                 .await;
                         }
                         false
                     }
                 }
             }
+            crate::raw_input::RawInputEvent::Text(text) => {
+                self.handle_text_commit(text.into_string()).await;
+                true
+            }
             crate::raw_input::RawInputEvent::Paste(text) => {
                 self.handle_paste(text).await;
                 true
             }
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
+                let changes_view = !matches!(mouse.kind, crossterm::event::MouseEventKind::Moved)
+                    || self.state.mode.mouse_motion_changes_view();
                 if self.state.popup_pane.is_some() || self.state.mouse_capture {
                     self.handle_mouse(mouse);
                 } else {
                     self.state
                         .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
                 }
-                true
+                changes_view
             }
             crate::raw_input::RawInputEvent::OuterFocusGained => {
                 self.send_outer_focus_event(crate::ghostty::FocusEvent::Gained);
@@ -200,6 +257,8 @@ impl App {
                 self.query_host_terminal_theme();
                 self.set_host_terminal_appearance(appearance, true)
             }
+            // Cell size reports are consumed by the thin client, not the runtime.
+            crate::raw_input::RawInputEvent::HostCellSizeReport { .. } => false,
             crate::raw_input::RawInputEvent::Unsupported => false,
         };
         self.sync_prefix_input_source(previous_mode);
@@ -221,8 +280,6 @@ impl App {
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
         let mut resized = false;
-
-        self.sync_animation_timer(now);
 
         if now >= self.next_resize_poll {
             resized = self.handle_resize_poll();
@@ -285,15 +342,6 @@ impl App {
         }
 
         if self
-            .next_animation_tick
-            .is_some_and(|deadline| now >= deadline)
-        {
-            self.state.spinner_tick = self.state.spinner_tick.wrapping_add(1);
-            self.next_animation_tick = Some(now + ANIMATION_INTERVAL);
-            changed = true;
-        }
-
-        if self
             .selection_autoscroll_deadline
             .is_some_and(|deadline| now >= deadline)
         {
@@ -334,7 +382,6 @@ impl App {
             self.sync_pending_agent_resume_deadline(now);
             changed |= self.start_pending_agent_resumes(self.pending_agent_resume_due(now));
         }
-        self.sync_animation_timer(now);
         changed
     }
 
@@ -389,29 +436,6 @@ impl App {
             self.emit_workspace_token_updated(ws_idx);
         }
         self.sync_agent_metadata_deadline();
-    }
-
-    pub(crate) fn sync_animation_timer(&mut self, now: Instant) {
-        self.sync_animation_timer_with_interval(now, ANIMATION_INTERVAL);
-    }
-
-    pub(crate) fn sync_headless_animation_timer(&mut self, now: Instant) {
-        self.sync_animation_timer_with_interval(now, crate::app::HEADLESS_ANIMATION_INTERVAL);
-    }
-
-    fn sync_animation_timer_with_interval(&mut self, now: Instant, interval: Duration) {
-        if self.agent_panel_has_animation() {
-            self.next_animation_tick.get_or_insert(now + interval);
-        } else {
-            self.next_animation_tick = None;
-        }
-    }
-
-    fn agent_panel_has_animation(&self) -> bool {
-        self.state
-            .workspaces
-            .iter()
-            .any(|ws| ws.has_working_pane(&self.state.terminals))
     }
 
     pub(crate) fn tick_selection_autoscroll(&mut self, now: Instant) {
@@ -566,7 +590,6 @@ impl App {
             self.state.next_pending_agent_notification_deadline(),
             self.state.next_managed_agent_deadline(),
             self.copy_feedback_deadline,
-            self.next_animation_tick,
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
                 .flatten(),
@@ -806,6 +829,24 @@ mod tests {
         // At scrollback bottom, can't scroll further down — should stop
         assert!(app.state.selection_autoscroll.is_none());
         assert!(app.selection_autoscroll_deadline.is_none());
+    }
+
+    #[tokio::test]
+    async fn passive_mouse_motion_does_not_request_monolithic_render() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.mode = crate::app::Mode::Terminal;
+        let motion = || {
+            crate::raw_input::RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Moved,
+                column: 10,
+                row: 5,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            })
+        };
+
+        assert!(!app.handle_raw_input_event(motion()).await);
+        app.state.mode = crate::app::Mode::GlobalMenu;
+        assert!(app.handle_raw_input_event(motion()).await);
     }
 
     #[tokio::test]

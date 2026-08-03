@@ -362,6 +362,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::WorkspaceBecomeParent(_) => "workspace.become_parent",
         Method::WorkspaceRescanChildren(_) => "workspace.rescan_children",
         Method::WorkspaceStopParent(_) => "workspace.stop_parent",
+        Method::WorkspaceMoveBlock(_) => "workspace.move_block",
         Method::WorkspaceReportMetadata(_) => "workspace.report_metadata",
         Method::WorkspaceClose(_) => "workspace.close",
         Method::WorktreeList(_) => "worktree.list",

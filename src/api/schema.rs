@@ -81,6 +81,8 @@ pub enum Method {
     WorkspaceRescanChildren(WorkspaceParentSpaceParams),
     #[serde(rename = "workspace.stop_parent")]
     WorkspaceStopParent(WorkspaceParentSpaceParams),
+    #[serde(rename = "workspace.move_block")]
+    WorkspaceMoveBlock(WorkspaceMoveBlockParams),
     #[serde(rename = "workspace.report_metadata")]
     WorkspaceReportMetadata(WorkspaceReportMetadataParams),
     #[serde(rename = "workspace.close")]

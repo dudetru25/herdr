@@ -48,17 +48,25 @@ pub(super) fn encode_api_keys(
     Ok(encoded_keys)
 }
 
-pub(super) fn encode_api_submission(
+pub(super) fn encode_api_submission_parts(
     runtime: &crate::terminal::TerminalRuntime,
     text: &str,
-) -> Vec<u8> {
-    let mut bytes = encode_api_text(runtime, text);
+) -> (Vec<u8>, Vec<u8>) {
+    let text = encode_api_text(runtime, text);
     let enter = crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Enter,
         crossterm::event::KeyModifiers::NONE,
     );
-    bytes.extend_from_slice(&runtime.encode_terminal_key(enter.into()));
-    bytes
+    (text, runtime.encode_terminal_key(enter.into()))
+}
+
+pub(super) fn encode_api_submission(
+    runtime: &crate::terminal::TerminalRuntime,
+    text: &str,
+) -> Vec<u8> {
+    let (mut text, enter) = encode_api_submission_parts(runtime, text);
+    text.extend_from_slice(&enter);
+    text
 }
 
 pub(super) fn encode_api_input(
@@ -135,7 +143,10 @@ pub(super) fn read_terminal_snapshot(
     }
 }
 
-fn limit_snapshot_lines(text: String, limit: Option<usize>) -> crate::pane::TerminalReadSnapshot {
+pub(crate) fn limit_snapshot_lines(
+    text: String,
+    limit: Option<usize>,
+) -> crate::pane::TerminalReadSnapshot {
     let Some(limit) = limit else {
         return crate::pane::TerminalReadSnapshot {
             text,
