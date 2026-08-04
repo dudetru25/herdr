@@ -142,6 +142,7 @@ impl App {
                 &machine.target,
                 &launch.resolved_placement.cwd,
                 &remote_argv,
+                launch.metadata.harness,
                 &launch.run_id,
             )
             .map_err(|error| {
@@ -174,18 +175,33 @@ impl App {
             self.state.host_terminal_theme,
             self.state.host_terminal_appearance,
         );
-        let (tab_idx, terminal, runtime) = result.map_err(|error| {
-            crate::worker_runs::WorkerRunError::new(
-                "worker_harness_unavailable",
-                format!(
-                    "{} worker failed to initialize in the approved pane: {error}",
-                    match launch.metadata.harness {
-                        crate::api::schema::WorkerHarness::Codex => "codex",
-                        crate::api::schema::WorkerHarness::Claude => "claude",
+        let (tab_idx, terminal, runtime) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(target) = remote_target.as_deref() {
+                    if let Err(cleanup_error) =
+                        crate::remote::cleanup_remote_worker_files(target, &launch.run_id)
+                    {
+                        tracing::warn!(
+                            run = %launch.run_id,
+                            target,
+                            err = %cleanup_error,
+                            "failed to clean up remote worker bootstrap after pane initialization failure"
+                        );
                     }
-                ),
-            )
-        })?;
+                }
+                return Err(crate::worker_runs::WorkerRunError::new(
+                    "worker_harness_unavailable",
+                    format!(
+                        "{} worker failed to initialize in the approved pane: {error}",
+                        match launch.metadata.harness {
+                            crate::api::schema::WorkerHarness::Codex => "codex",
+                            crate::api::schema::WorkerHarness::Claude => "claude",
+                        }
+                    ),
+                ));
+            }
+        };
         let terminal_id = terminal.id.clone();
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.terminals.insert(terminal.id.clone(), terminal);
@@ -199,12 +215,30 @@ impl App {
             },
         );
         self.state.remove_alias_shadowed_by_new_pane(pane_id);
-        let public_pane_id = self.public_pane_id(ws_idx, pane_id).ok_or_else(|| {
-            crate::worker_runs::WorkerRunError::new(
-                "worker_placement_blocked",
-                "initialized worker pane has no public identity",
-            )
-        })?;
+        let public_pane_id = match self.public_pane_id(ws_idx, pane_id) {
+            Some(public_pane_id) => public_pane_id,
+            None => {
+                if let Some(supervised) = self.supervised_worker_runs.remove(&pane_id) {
+                    if let Some(target) = supervised.remote_target.as_deref() {
+                        if let Err(error) =
+                            crate::remote::cleanup_remote_worker_files(target, &launch.run_id)
+                        {
+                            tracing::warn!(
+                                run = %launch.run_id,
+                                target,
+                                err = %error,
+                                "failed to clean up remote worker after pane identity failure"
+                            );
+                        }
+                    }
+                    self.shutdown_terminal_runtime(supervised.terminal_id);
+                }
+                return Err(crate::worker_runs::WorkerRunError::new(
+                    "worker_placement_blocked",
+                    "initialized worker pane has no public identity",
+                ));
+            }
+        };
         Ok(if is_remote {
             format!("remote-pane:{public_pane_id}")
         } else {
@@ -290,10 +324,43 @@ impl App {
         match crate::worker_runs::WorkerRunStore::persistent()
             .cancel(&params.run_id, params.reason.as_deref())
         {
-            Ok((run, disposition)) => responses::encode_success(
-                id,
-                crate::api::schema::ResponseResult::WorkerRunCancelled { run, disposition },
-            ),
+            Ok((run, disposition)) => {
+                if matches!(
+                    disposition,
+                    crate::api::schema::WorkerRunCancellationDisposition::Requested
+                        | crate::api::schema::WorkerRunCancellationDisposition::AlreadyRequested
+                ) {
+                    let supervised = self
+                        .supervised_worker_runs
+                        .iter()
+                        .find(|(_, supervised)| supervised.run_id == params.run_id)
+                        .map(|(pane_id, supervised)| (*pane_id, supervised.clone()));
+                    if let Some((pane_id, supervised)) = supervised {
+                        if let Some(target) = supervised.remote_target.as_deref() {
+                            if let Err(error) =
+                                crate::remote::cleanup_remote_worker_files(target, &params.run_id)
+                            {
+                                tracing::warn!(
+                                    run = %params.run_id,
+                                    target,
+                                    err = %error,
+                                    "failed to clean up remote worker after cancellation"
+                                );
+                            }
+                        }
+                        self.shutdown_terminal_runtime(supervised.terminal_id);
+                        tracing::debug!(
+                            run = %params.run_id,
+                            pane = pane_id.raw(),
+                            "stopped supervised worker after cancellation"
+                        );
+                    }
+                }
+                responses::encode_success(
+                    id,
+                    crate::api::schema::ResponseResult::WorkerRunCancelled { run, disposition },
+                )
+            }
             Err(error) => responses::encode_error(id, error.code, error.message),
         }
     }

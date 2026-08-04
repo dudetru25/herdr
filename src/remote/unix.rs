@@ -28,6 +28,8 @@ const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
+const MAX_REMOTE_ARTIFACT_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REMOTE_ARTIFACT_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
@@ -510,7 +512,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $cwd '.git'))) {{
 }}
 Set-Location -LiteralPath $cwd
 try {{
-    Get-Command -Name {command} -CommandType Application,ExternalScript -ErrorAction Stop | Out-Null
+    $command = @(
+        Get-Command -Name {command} -CommandType Application -ErrorAction SilentlyContinue
+        Get-Command -Name {command} -CommandType ExternalScript -ErrorAction SilentlyContinue
+    ) | Select-Object -First 1
+    if ($null -eq $command) {{ throw 'worker executable is unavailable' }}
 }} catch {{
     [Console]::WriteLine('HERDR-HARNESS-UNAVAILABLE')
     exit 44
@@ -588,14 +594,16 @@ function Set-HerdrWorkerEnvironment {
 "#;
 
 /// Build a non-interactive Windows SSH command for an approved remote worker.
-/// The worker argv is embedded in a PowerShell array so JSON payloads and
-/// Windows paths are passed as literal arguments instead of being reparsed by
-/// cmd.exe. The marker is expanded on the remote device after `$env:TEMP` is
-/// resolved there; no client artifact path or environment value crosses SSH.
+/// The long worker bootstrap is uploaded over SSH stdin first. Only a short
+/// launcher is passed as a remote command, so the provider payload is not
+/// subject to the Windows command-line limit. The marker is expanded on the
+/// remote device after `$env:TEMP` is resolved there; no client artifact path
+/// or environment value crosses SSH.
 pub(crate) fn remote_worker_argv(
     target: &str,
     cwd: &Path,
     worker_argv: &[String],
+    harness: WorkerHarness,
     run_id: &str,
 ) -> io::Result<Vec<String>> {
     if target.trim().is_empty() {
@@ -611,6 +619,22 @@ pub(crate) fn remote_worker_argv(
         ));
     }
     let component = remote_worker_component(run_id)?;
+    let script = remote_worker_script(cwd, worker_argv, &component);
+    let mut files = vec![(format!("{component}.ps1"), script)];
+    if harness == WorkerHarness::Codex {
+        files.push((
+            format!("{component}-launcher.ps1"),
+            remote_worker_launcher_script(&component, harness),
+        ));
+    }
+    if let Err(error) = upload_remote_worker_files(target, &files) {
+        let _ = cleanup_remote_worker_files(target, run_id);
+        return Err(error);
+    }
+    Ok(remote_worker_command(target, &component, harness))
+}
+
+fn remote_worker_script(cwd: &Path, worker_argv: &[String], component: &str) -> String {
     let mut args = String::new();
     for (index, argument) in worker_argv.iter().enumerate() {
         args.push_str("    ");
@@ -621,18 +645,38 @@ pub(crate) fn remote_worker_argv(
         args.push('\n');
     }
     let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
+        r#"param([string]$ArtifactRoot)
+$ErrorActionPreference = 'Stop'
 {environment}
-$root = Join-Path ([IO.Path]::GetTempPath()) {artifact_subpath}
+$root = if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {{ Join-Path ([IO.Path]::GetTempPath()) {artifact_subpath} }} else {{ $ArtifactRoot }}
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 Set-Location -LiteralPath {cwd}
 $workerArgs = @(
 {args})
-$workerArgs = @($workerArgs | ForEach-Object {{ $_.Replace({marker}, $root) }})
+for ($index = 0; $index -lt ($workerArgs.Count - 1); $index++) {{
+    if ($workerArgs[$index] -eq '--add-dir' -and $workerArgs[$index + 1] -eq {marker}) {{
+        $workerArgs[$index + 1] = $root
+    }} elseif ($workerArgs[$index].StartsWith('sandbox_workspace_write.writable_roots=')) {{
+        $workerArgs[$index] = $workerArgs[$index].Replace({marker}, $root)
+    }}
+}}
+$assignment = $workerArgs[$workerArgs.Count - 1] | ConvertFrom-Json
+if ($null -eq $assignment.resultPublication) {{ throw 'worker assignment is missing resultPublication' }}
+foreach ($field in @('directory', 'manifestPath', 'instruction')) {{
+    $value = $assignment.resultPublication.$field
+    if ($null -ne $value) {{
+        $assignment.resultPublication.$field = ([string]$value).Replace({marker}, $root)
+    }}
+}}
+$workerArgs[$workerArgs.Count - 1] = $assignment | ConvertTo-Json -Compress -Depth 100
 if (-not (Set-HerdrWorkerEnvironment)) {{ throw 'remote worker environment is unavailable' }}
-$command = Get-Command -Name $workerArgs[0] -CommandType Application,ExternalScript -ErrorAction Stop
+$command = @(
+    Get-Command -Name $workerArgs[0] -CommandType Application -ErrorAction SilentlyContinue
+    Get-Command -Name $workerArgs[0] -CommandType ExternalScript -ErrorAction SilentlyContinue
+) | Select-Object -First 1
+if ($null -eq $command) {{ throw "worker executable '$($workerArgs[0])' is unavailable" }}
 $env:HERDR_WORKER_ARTIFACT_DIR = $root
-& $command.Source $workerArgs[1..($workerArgs.Count - 1)]
+& $command.Path $workerArgs[1..($workerArgs.Count - 1)]
 $exitCode = $LASTEXITCODE
 if ($null -eq $exitCode) {{ $exitCode = 0 }}
 exit $exitCode
@@ -643,7 +687,14 @@ exit $exitCode
         environment = REMOTE_WORKER_ENVIRONMENT_SETUP,
         args = args,
     );
-    Ok(vec![
+    script
+}
+
+fn remote_worker_command(target: &str, component: &str, harness: WorkerHarness) -> Vec<String> {
+    if harness == WorkerHarness::Codex {
+        return remote_worker_file_command(target, component);
+    }
+    vec![
         "ssh".into(),
         "-o".into(),
         "SendEnv=NONE".into(),
@@ -654,8 +705,221 @@ exit $exitCode
         "-NoProfile".into(),
         "-NonInteractive".into(),
         "-EncodedCommand".into(),
-        encode_powershell(&script),
-    ])
+        encode_powershell(&remote_worker_launcher_script(component, harness)),
+    ]
+}
+
+fn remote_worker_file_command(target: &str, component: &str) -> Vec<String> {
+    let wrapper = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$path = Join-Path ([IO.Path]::GetTempPath()) {launcher_path}
+$exitCode = 1
+try {{
+    & powershell.exe -NoLogo -NoProfile -NonInteractive -File $path
+    $exitCode = $LASTEXITCODE
+    if ($null -eq $exitCode) {{ $exitCode = 0 }}
+}} finally {{
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+}}
+exit $exitCode
+"#,
+        launcher_path = powershell_quote(&format!("herdr-worker-runs\\{component}-launcher.ps1")),
+    );
+    vec![
+        "ssh".into(),
+        "-o".into(),
+        "SendEnv=NONE".into(),
+        "-t".into(),
+        target.into(),
+        "powershell.exe".into(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-EncodedCommand".into(),
+        encode_powershell(&wrapper),
+    ]
+}
+
+fn remote_worker_launcher_script(component: &str, harness: WorkerHarness) -> String {
+    if harness == WorkerHarness::Codex {
+        return remote_worker_interactive_launcher_script(component);
+    }
+    remote_worker_direct_launcher_script(component)
+}
+
+fn remote_worker_direct_launcher_script(component: &str) -> String {
+    format!(
+        r#"$ErrorActionPreference = 'Stop'
+$script = Join-Path ([IO.Path]::GetTempPath()) {script_path}
+$exitCode = 1
+try {{
+    & powershell.exe -NoLogo -NoProfile -NonInteractive -File $script
+    $exitCode = $LASTEXITCODE
+    if ($null -eq $exitCode) {{ $exitCode = 0 }}
+}} finally {{
+    Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
+}}
+exit $exitCode
+"#,
+        script_path = powershell_quote(&format!("herdr-worker-runs\\{component}.ps1")),
+    )
+}
+
+/// Native Windows Codex's elevated sandbox needs an interactive desktop token.
+/// OpenSSH starts its PowerShell child in service session 0, so schedule the
+/// already-uploaded worker bootstrap under the logged-in user's interactive
+/// token. The task is per-run and leaves the Herdr-owned artifact directory for
+/// the fetch step.
+fn remote_worker_interactive_launcher_script(component: &str) -> String {
+    format!(
+        r#"$ErrorActionPreference = 'Stop'
+$temporary = [IO.Path]::GetTempPath()
+$script = Join-Path $temporary {worker_script}
+$artifactRoot = Join-Path $temporary {artifact_subpath}
+$taskName = 'Herdr-Worker-{component}'
+$exitCode = 1
+$taskFinished = $false
+try {{
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoLogo -NoProfile -NonInteractive -File "' + $script + '" -ArtifactRoot "' + $artifactRoot + '"')
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+    $principal = New-ScheduledTaskPrincipal -UserId ("{{0}}\{{1}}" -f [Environment]::UserDomainName, [Environment]::UserName) -LogonType Interactive -RunLevel Highest
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+    $startedAt = Get-Date
+    Start-ScheduledTask -TaskName $taskName
+    $deadline = (Get-Date).AddMinutes(30)
+    while (-not $taskFinished -and (Get-Date) -lt $deadline) {{
+        Start-Sleep -Seconds 1
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+        $taskState = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($null -ne $taskInfo -and $null -ne $taskState -and $taskState.State.ToString() -eq 'Ready' -and $taskInfo.LastRunTime -ge $startedAt) {{
+            $exitCode = [int]$taskInfo.LastTaskResult
+            $taskFinished = $true
+        }}
+    }}
+    if (-not $taskFinished) {{
+        [Console]::Error.WriteLine('native Windows Codex worker timed out waiting for the interactive desktop task')
+    }}
+}} finally {{
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {{
+        $taskState = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($null -eq $taskState -or $taskState.State.ToString() -eq 'Ready') {{ break }}
+        Start-Sleep -Milliseconds 200
+    }}
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
+}}
+exit $exitCode
+"#,
+        worker_script = powershell_quote(&format!("herdr-worker-runs\\{component}.ps1")),
+        artifact_subpath = powershell_quote(&format!("herdr-worker-runs\\{component}")),
+        component = component,
+    )
+}
+
+pub(crate) fn cleanup_remote_worker_files(target: &str, run_id: &str) -> io::Result<()> {
+    let component = remote_worker_component(run_id)?;
+    let script = format!(
+        r#"$ErrorActionPreference = 'Stop'
+$temporary = [IO.Path]::GetTempPath()
+$root = Join-Path $temporary {artifact_subpath}
+$bootstrap = Join-Path $temporary {bootstrap_path}
+$launcher = Join-Path $temporary {launcher_path}
+$taskName = 'Herdr-Worker-{component}'
+$failed = $false
+$taskState = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($null -ne $taskState) {{
+    try {{ Stop-ScheduledTask -TaskName $taskName -ErrorAction Stop }} catch {{ $failed = $true }}
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {{
+        $taskState = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($null -eq $taskState -or $taskState.State.ToString() -eq 'Ready') {{ break }}
+        Start-Sleep -Milliseconds 200
+    }}
+    if ($null -ne $taskState) {{
+        try {{ Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop }} catch {{ $failed = $true }}
+        if ($null -ne (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) {{ $failed = $true }}
+    }}
+}}
+foreach ($path in @($root, $bootstrap, $launcher)) {{
+    if (Test-Path -LiteralPath $path) {{
+        try {{ Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop }} catch {{ $failed = $true }}
+    }}
+}}
+if ($failed) {{ exit 1 }}
+exit 0
+"#,
+        artifact_subpath = powershell_quote(&format!("herdr-worker-runs\\{component}")),
+        bootstrap_path = powershell_quote(&format!("herdr-worker-runs\\{component}.ps1")),
+        launcher_path = powershell_quote(&format!("herdr-worker-runs\\{component}-launcher.ps1")),
+        component = component,
+    );
+    let output = run_remote_powershell(target, &script)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_failed("remote worker cleanup failed", &output))
+    }
+}
+
+fn upload_remote_worker_files(target: &str, files: &[(String, String)]) -> io::Result<()> {
+    let upload_script = r#"$ErrorActionPreference = 'Stop'
+$directory = Join-Path ([IO.Path]::GetTempPath()) 'herdr-worker-runs'
+New-Item -ItemType Directory -Force -Path $directory | Out-Null
+$lines = [Console]::In.ReadToEnd().Trim() -split '\r?\n'
+if ($lines.Count -lt 2 -or ($lines.Count % 2) -ne 0) { throw 'remote worker upload payload is invalid' }
+for ($index = 0; $index -lt $lines.Count; $index += 2) {
+    $filename = $lines[$index]
+    if ([string]::IsNullOrWhiteSpace($filename) -or $filename.Contains('\') -or $filename.Contains('/')) {
+        throw 'remote worker upload filename is invalid'
+    }
+    $encoded = $lines[$index + 1]
+    if ([string]::IsNullOrWhiteSpace($encoded)) { throw 'remote worker upload payload is empty' }
+    $path = Join-Path $directory $filename
+    [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($encoded))
+}
+"#.to_string();
+    let manage_ssh_config = crate::config::Config::load()
+        .config
+        .remote
+        .manage_ssh_config;
+    let ssh = RemoteSsh::new(target.to_owned(), manage_ssh_config);
+    let mut child = ssh
+        .command()
+        .arg("powershell.exe")
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-EncodedCommand")
+        .arg(encode_powershell(&upload_script))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut payload = String::new();
+    for (filename, script) in files {
+        payload.push_str(filename);
+        payload.push('\n');
+        payload.push_str(&base64::engine::general_purpose::STANDARD.encode(script.as_bytes()));
+        payload.push('\n');
+    }
+    let write_result = if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(payload.as_bytes())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "remote worker bootstrap stdin missing",
+        ))
+    };
+    let output = child.wait_with_output()?;
+    write_result?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_failed(
+            "remote worker bootstrap upload failed",
+            &output,
+        ))
+    }
 }
 
 /// Read every remote artifact back over a binary-safe base64 line protocol.
@@ -673,21 +937,43 @@ $ProgressPreference = 'SilentlyContinue'
 $WarningPreference = 'SilentlyContinue'
 $InformationPreference = 'SilentlyContinue'
 $root = Join-Path ([IO.Path]::GetTempPath()) {artifact_subpath}
-if (-not (Test-Path -LiteralPath $root -PathType Container)) {{ exit 41 }}
+$bootstrap = Join-Path ([IO.Path]::GetTempPath()) {bootstrap_path}
+$launcher = Join-Path ([IO.Path]::GetTempPath()) {launcher_path}
+$missing = -not (Test-Path -LiteralPath $root -PathType Container)
 try {{
-    Get-ChildItem -LiteralPath $root -File -Recurse | ForEach-Object {{
-        $relative = $_.FullName.Substring($root.Length).TrimStart([char[]]"/\\").Replace('\\', '/')
-        $name = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($relative))
-        $bytes = [IO.File]::ReadAllBytes($_.FullName)
-        [Console]::WriteLine("HERDR-FILE:$name")
-        [Console]::WriteLine([Convert]::ToBase64String($bytes))
+    if (-not $missing) {{
+        Get-ChildItem -LiteralPath $root -File -Recurse | ForEach-Object {{
+            $relative = $_.FullName.Substring($root.Length).TrimStart([char[]]"/\\").Replace('\\', '/')
+            $name = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($relative))
+            $bytes = [IO.File]::ReadAllBytes($_.FullName)
+            [Console]::WriteLine("HERDR-FILE:$name")
+            [Console]::WriteLine([Convert]::ToBase64String($bytes))
+        }}
+        [Console]::WriteLine('HERDR-END')
     }}
-    [Console]::WriteLine('HERDR-END')
 }} finally {{
-    Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    try {{
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
+    }} catch {{
+        # Artifact transfer already succeeded; cleanup is best effort.
+    }}
+    try {{
+        Remove-Item -LiteralPath $bootstrap -Force -ErrorAction Stop
+    }} catch {{
+        # Artifact transfer already succeeded; cleanup is best effort.
+    }}
+    try {{
+        Remove-Item -LiteralPath $launcher -Force -ErrorAction Stop
+    }} catch {{
+        # Artifact transfer already succeeded; cleanup is best effort.
+    }}
 }}
+if ($missing) {{ exit 41 }}
+exit 0
 "#,
         artifact_subpath = powershell_quote(&format!("herdr-worker-runs\\{component}")),
+        bootstrap_path = powershell_quote(&format!("herdr-worker-runs\\{component}.ps1")),
+        launcher_path = powershell_quote(&format!("herdr-worker-runs\\{component}-launcher.ps1")),
     );
     let output = run_remote_powershell(target, &script)?;
     if !output.status.success() {
@@ -695,6 +981,11 @@ try {{
             "remote worker artifact fetch failed",
             &output,
         ));
+    }
+    if output.stdout.len() > MAX_REMOTE_ARTIFACT_STREAM_BYTES {
+        return Err(io::Error::other(format!(
+            "remote worker artifact stream exceeds {MAX_REMOTE_ARTIFACT_STREAM_BYTES} bytes"
+        )));
     }
 
     fs::create_dir_all(local_root)?;
@@ -720,11 +1011,14 @@ try {{
             io::Error::other(format!("remote artifact name was not utf-8: {error}"))
         })?;
         let relative = PathBuf::from(&name);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::ParentDir
+            )
+        }) {
             return Err(io::Error::other(format!(
                 "remote worker artifact path escapes its root: {name:?}"
             )));
@@ -735,6 +1029,11 @@ try {{
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded_bytes)
             .map_err(|error| io::Error::other(format!("invalid remote artifact bytes: {error}")))?;
+        if bytes.len() > MAX_REMOTE_ARTIFACT_FILE_BYTES {
+            return Err(io::Error::other(format!(
+                "remote worker artifact exceeds {MAX_REMOTE_ARTIFACT_FILE_BYTES} bytes"
+            )));
+        }
         let destination = local_root.join(&relative);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
@@ -2396,13 +2695,14 @@ mod tests {
             r"G:\GithubProjects\agent-ide-lab".to_string(),
             "payload with ' a quote".to_string(),
         ];
-        let command = remote_worker_argv(
-            "RUG-DEV-3-WIN",
+        let component = remote_worker_component("worker-run:sha256:remote-smoke")
+            .expect("approved remote worker id should sanitize");
+        let script = remote_worker_script(
             Path::new(r"G:\GithubProjects\agent-ide-lab"),
             &argv,
-            "worker-run:sha256:remote-smoke",
-        )
-        .expect("approved remote worker command should build");
+            &component,
+        );
+        let command = remote_worker_command("RUG-DEV-3-WIN", &component, WorkerHarness::Claude);
 
         assert_eq!(command[0], "ssh");
         assert!(command.iter().any(|argument| argument == "RUG-DEV-3-WIN"));
@@ -2410,17 +2710,81 @@ mod tests {
         assert!(command
             .windows(2)
             .any(|window| window[0] == "-o" && window[1] == "SendEnv=NONE"));
-        let script = decode_powershell(command.last().expect("encoded script"));
         assert!(script.contains("Set-Location -LiteralPath 'G:\\GithubProjects\\agent-ide-lab'"));
         assert!(script.contains(crate::worker_adapters::REMOTE_WORKER_ARTIFACT_MARKER));
         assert!(script.contains("$env:HERDR_WORKER_ARTIFACT_DIR = $root"));
         assert!(script.contains("Set-HerdrWorkerEnvironment"));
         assert!(script.contains("GetEnvironmentVariables('Process')"));
+        assert!(!script.contains("HERDR_WORKER_INTERACTIVE_SESSION"));
+        assert!(script.starts_with("param([string]$ArtifactRoot)"));
+        assert!(script.contains("$ArtifactRoot"));
+        assert!(script.contains("ConvertFrom-Json"));
+        assert!(!script.contains("$workerArgs | ForEach-Object"));
         assert!(script.contains("CLAUDE_CONFIG_DIR"));
         assert!(script.contains("SetEnvironmentVariable([string]$n,$null,'Process')"));
+        assert!(script.contains(
+            "Get-Command -Name $workerArgs[0] -CommandType Application -ErrorAction SilentlyContinue"
+        ));
+        assert!(script.contains(
+            "Get-Command -Name $workerArgs[0] -CommandType ExternalScript -ErrorAction SilentlyContinue"
+        ));
+        assert!(script.contains(") | Select-Object -First 1"));
+        assert!(script.contains("& $command.Path"));
+        assert!(!script.contains("& $command.Source"));
         assert!(script.contains("payload with '' a quote"));
         assert!(script.contains("payload with '' a quote'\n)"));
         assert!(!script.contains("/Users/"));
+
+        let launcher = decode_powershell(command.last().expect("encoded launcher"));
+        assert!(launcher.contains("herdr-worker-runs\\worker-run_sha256_remote-smoke.ps1"));
+        assert!(!launcher.contains("payload with"));
+    }
+
+    #[test]
+    fn codex_remote_worker_uses_the_native_interactive_desktop_bridge() {
+        let component = remote_worker_component("worker-run:codex-native").unwrap();
+        let launcher = remote_worker_interactive_launcher_script(&component);
+
+        assert!(launcher.contains("New-ScheduledTaskPrincipal"));
+        assert!(launcher.contains("-LogonType Interactive"));
+        assert!(launcher.contains("-RunLevel Highest"));
+        assert!(launcher.contains("Start-ScheduledTask"));
+        assert!(launcher.contains("Get-ScheduledTaskInfo"));
+        assert!(launcher.contains("$taskState.State.ToString() -eq 'Ready'"));
+        assert!(launcher.contains("$taskFinished = $false"));
+        assert!(launcher.contains("-ArtifactRoot"));
+        assert!(launcher.contains("Start-Sleep -Milliseconds 200"));
+        assert!(!launcher.contains("status.txt"));
+        assert!(launcher.contains("Unregister-ScheduledTask"));
+    }
+
+    #[test]
+    fn codex_remote_worker_command_uses_a_bounded_uploaded_launcher_wrapper() {
+        let component =
+            remote_worker_component(&format!("worker-run:{}", "a".repeat(180))).unwrap();
+        let command = remote_worker_command("RUG-DEV-3-WIN", &component, WorkerHarness::Codex);
+        let wrapper = decode_powershell(command.last().expect("encoded launcher wrapper"));
+
+        assert!(wrapper.contains("herdr-worker-runs\\worker-run_"));
+        assert!(wrapper.contains("-launcher.ps1"));
+        assert!(wrapper.contains("Remove-Item -LiteralPath $path"));
+        assert!(!wrapper.contains("New-ScheduledTaskPrincipal"));
+        assert!(encode_powershell(&wrapper).len() < 8_191);
+    }
+
+    #[test]
+    fn remote_worker_large_bootstrap_uses_a_bounded_remote_command() {
+        let payload = "assignment payload ".to_string() + &"x".repeat(65_536);
+        let argv = vec!["claude.exe".into(), "--print".into(), payload.clone()];
+        let component = remote_worker_component("worker-run:large-payload")
+            .expect("approved remote worker id should sanitize");
+        let bootstrap = remote_worker_script(Path::new(r"G:\worktree"), &argv, &component);
+        let launcher = remote_worker_launcher_script(&component, WorkerHarness::Claude);
+
+        assert!(encode_powershell(&bootstrap).len() > 32_767);
+        assert!(encode_powershell(&launcher).len() < 8_191);
+        assert!(bootstrap.contains(&payload));
+        assert!(!launcher.contains(&payload));
     }
 
     #[test]

@@ -3400,3 +3400,311 @@ approved_at = "2026-08-02"
 
     cleanup_spawned_herdr(child, base);
 }
+
+/// Real approved-remote lifecycle evidence. This keeps the client lifecycle
+/// operations on separate socket connections while the worker is placed on the
+/// approved remote machine, proving duplicate submission, same-run reconnect,
+/// and explicit cancellation through the real Herdr API.
+///
+/// ```text
+/// HERDR_REMOTE_SMOKE_HARNESS=claude HERDR_REMOTE_SMOKE_MODEL=claude-opus-5 \
+/// HERDR_REMOTE_SMOKE_PROFILE=claude \
+/// HERDR_REMOTE_SMOKE_TARGET=RUG-DEV-3-WIN \
+/// HERDR_REMOTE_SMOKE_MACHINE=rug-dev-3 \
+/// HERDR_REMOTE_SMOKE_TARGET_TAG=herdr-target:rug-dev-3-win \
+/// HERDR_REMOTE_SMOKE_CWD='G:\\GithubProjects\\agent-ide-lab' \
+///   cargo nextest run --locked --run-ignored only \
+///   -E 'test(real_approved_remote_worker_lifecycle_is_duplicate_reconnect_and_cancel)'
+/// ```
+#[test]
+#[ignore = "launches approved remote workers; run explicitly to capture lifecycle evidence"]
+fn real_approved_remote_worker_lifecycle_is_duplicate_reconnect_and_cancel() {
+    fn required(variable: &str) -> String {
+        std::env::var(variable)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| panic!("{variable} must name the approved remote worker input"))
+    }
+
+    let _lock = test_lock();
+    let harness = required("HERDR_REMOTE_SMOKE_HARNESS");
+    assert!(
+        harness == "codex" || harness == "claude",
+        "HERDR_REMOTE_SMOKE_HARNESS must be codex or claude, not {harness:?}"
+    );
+    let model = required("HERDR_REMOTE_SMOKE_MODEL");
+    let profile = required("HERDR_REMOTE_SMOKE_PROFILE");
+    let target = required("HERDR_REMOTE_SMOKE_TARGET");
+    let machine = required("HERDR_REMOTE_SMOKE_MACHINE");
+    let target_tag = required("HERDR_REMOTE_SMOKE_TARGET_TAG");
+    let remote_cwd = required("HERDR_REMOTE_SMOKE_CWD");
+
+    let worker_config = format!(
+        r#"
+[[machines]]
+name = {machine:?}
+target = {target:?}
+
+[[worker_placements]]
+target_tag = {target_tag:?}
+kind = "remote"
+machine = {machine:?}
+cwd = {remote_cwd:?}
+harnesses = ["codex", "claude"]
+
+[worker_placements.approval]
+reference = "TASK-10:approved-remote-rug-dev-3-win"
+approved_at = "2026-08-02"
+"#,
+        machine = machine,
+        target = target,
+        target_tag = target_tag,
+        remote_cwd = remote_cwd,
+    );
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let child =
+        spawn_herdr_with_worker_config(&config_home, &runtime_dir, &socket_path, &worker_config);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lifecycle_workspace",
+            "method": "workspace.create",
+            "params": {"machine": machine, "focus": true}
+        })
+        .to_string(),
+    );
+    assert_eq!(created["result"]["type"], "workspace_created");
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let attempt_id = format!("TASK-4.8:real-remote-lifecycle-success-{unique_suffix}");
+    let mut submit_params = serde_json::json!({
+        "attempt_id": attempt_id,
+        "request": worker_request(
+            "Create lifecycle-success.txt in the approved remote repository at your working directory containing exactly the single line ok, then publish your result manifest exactly as resultPublication instructs, with the patch bytes for that change written into the publication directory."
+        ),
+        "execution": {
+            "kind": "harness",
+            "harness": harness,
+            "profile": profile,
+            "model": model,
+            "target_tag": target_tag,
+            "placement": "remote",
+            "candidates": [{
+                "target_tag": target_tag,
+                "kind": "remote",
+                "workspace_id": workspace_id,
+                "cwd": remote_cwd,
+                "availability": {"status": "available"}
+            }]
+        }
+    });
+    bind_worker_hashes(&mut submit_params);
+    let submitted = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lifecycle_submit",
+            "method": "worker.run.submit",
+            "params": submit_params
+        })
+        .to_string(),
+    );
+    println!(
+        "lifecycle submitted: {}",
+        serde_json::to_string(&submitted).unwrap()
+    );
+    assert_eq!(submitted["result"]["type"], "worker_run_submitted");
+    assert_eq!(submitted["result"]["disposition"], "created");
+    let first_run = submitted["result"]["run"].clone();
+    assert_eq!(first_run["state"], "running");
+    assert_eq!(first_run["metadata"]["harness"], harness);
+    assert_eq!(first_run["metadata"]["target"], target_tag);
+    let run_id = first_run["run_id"].as_str().unwrap().to_string();
+    let placement = first_run["metadata"]["placement"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(placement.starts_with("remote-pane:"));
+
+    let mut duplicate_params = submit_params.clone();
+    duplicate_params["attempt_id"] = attempt_id.clone().into();
+    let duplicate = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lifecycle_duplicate",
+            "method": "worker.run.submit",
+            "params": duplicate_params
+        })
+        .to_string(),
+    );
+    println!(
+        "lifecycle duplicate: {}",
+        serde_json::to_string(&duplicate).unwrap()
+    );
+    assert_eq!(duplicate["result"]["disposition"], "duplicate-equivalent");
+    assert_eq!(duplicate["result"]["run"]["run_id"], run_id);
+    assert_eq!(
+        duplicate["result"]["run"]["metadata"]["placement"],
+        placement
+    );
+
+    // Close the first client after observing the run, then reconcile from a
+    // fresh socket connection while the same remote run remains durable.
+    let mut disconnected_client = open_subscription(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lifecycle_disconnect_probe",
+            "method": "worker.run.get",
+            "params": {"run_id": run_id}
+        })
+        .to_string(),
+    );
+    let disconnect_probe = disconnected_client.read_json_line(Duration::from_secs(5));
+    assert_eq!(disconnect_probe["result"]["run"]["run_id"], run_id);
+    drop(disconnected_client);
+    thread::sleep(Duration::from_millis(250));
+    let reconnected = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lifecycle_reconnect",
+            "method": "worker.run.get",
+            "params": {"run_id": run_id}
+        })
+        .to_string(),
+    );
+    println!(
+        "lifecycle reconnect: {}",
+        serde_json::to_string(&reconnected).unwrap()
+    );
+    assert_eq!(reconnected["result"]["run"]["run_id"], run_id);
+    assert_eq!(
+        reconnected["result"]["run"]["metadata"]["placement"],
+        placement
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut terminal = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        let observed = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id": "lifecycle_get",
+                "method": "worker.run.get",
+                "params": {"run_id": run_id}
+            })
+            .to_string(),
+        );
+        let state = observed["result"]["run"]["state"].as_str().unwrap_or("");
+        if state != "submitted" && state != "running" {
+            terminal = observed["result"]["run"].clone();
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    println!(
+        "lifecycle terminal: {}",
+        serde_json::to_string(&terminal).unwrap()
+    );
+    assert_eq!(terminal["state"], "succeeded");
+    let result = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lifecycle_result",
+            "method": "worker.run.result",
+            "params": {"result_ref": terminal["result_ref"]}
+        })
+        .to_string(),
+    );
+    println!(
+        "lifecycle result: {}",
+        serde_json::to_string(&result).unwrap()
+    );
+    assert_eq!(result["result"]["result"]["runRef"], run_id);
+
+    let cancel_attempt_id = format!("TASK-4.8:real-remote-lifecycle-cancel-{unique_suffix}");
+    let mut cancel_params = submit_params.clone();
+    cancel_params["attempt_id"] = cancel_attempt_id.into();
+    cancel_params["request"]["context"]["instruction"] =
+        "Remain active until explicit cancellation is requested; do not publish a result before then."
+            .into();
+    bind_worker_hashes(&mut cancel_params);
+    let cancel_submitted = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lifecycle_cancel_submit",
+            "method": "worker.run.submit",
+            "params": cancel_params
+        })
+        .to_string(),
+    );
+    println!(
+        "lifecycle cancellation submitted: {}",
+        serde_json::to_string(&cancel_submitted).unwrap()
+    );
+    assert_eq!(cancel_submitted["result"]["type"], "worker_run_submitted");
+    assert_eq!(cancel_submitted["result"]["run"]["state"], "running");
+    let cancel_run_id = cancel_submitted["result"]["run"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(cancel_submitted["result"]["run"]["metadata"]["placement"]
+        .as_str()
+        .unwrap()
+        .starts_with("remote-pane:"));
+
+    let cancelled = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lifecycle_cancel",
+            "method": "worker.run.cancel",
+            "params": {"run_id": cancel_run_id, "reason": "TASK-4.8 explicit remote cancellation"}
+        })
+        .to_string(),
+    );
+    println!(
+        "lifecycle cancelled: {}",
+        serde_json::to_string(&cancelled).unwrap()
+    );
+    assert_eq!(cancelled["result"]["disposition"], "requested");
+    assert_eq!(cancelled["result"]["run"]["state"], "cancelled");
+    let cancelled_reconnect = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lifecycle_cancel_reconnect",
+            "method": "worker.run.get",
+            "params": {"run_id": cancel_run_id}
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        cancelled_reconnect["result"]["run"]["run_id"],
+        cancel_run_id
+    );
+    assert_eq!(cancelled_reconnect["result"]["run"]["state"], "cancelled");
+    let cancelled_again = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lifecycle_cancel_again",
+            "method": "worker.run.cancel",
+            "params": {"run_id": cancel_run_id}
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        cancelled_again["result"]["disposition"],
+        "already-requested"
+    );
+
+    cleanup_spawned_herdr(child, base);
+}

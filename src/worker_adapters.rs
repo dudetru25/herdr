@@ -105,6 +105,17 @@ pub fn prepare_worker_launch(
             "worker artifact directory is not valid utf-8",
         )
     })?;
+    let cwd_value = placement.cwd.to_str().ok_or_else(|| {
+        WorkerAdapterError::new(
+            "worker_adapter_invalid",
+            "worker checkout directory is not valid utf-8",
+        )
+    })?;
+    let codex_writable_roots = [
+        toml_literal_string(cwd_value)?,
+        toml_literal_string(artifact_dir_value)?,
+    ]
+    .join(",");
     let publication = result_publication(request, artifact_dir_value);
     let assignment_bytes = canonical_json_bytes(&WorkerAssignment {
         schema: ASSIGNMENT_SCHEMA,
@@ -126,18 +137,14 @@ pub fn prepare_worker_launch(
             metadata.model.clone(),
             "--profile".into(),
             metadata.profile.clone(),
+            "--config".into(),
+            "approval_policy='never'".into(),
+            "--config".into(),
+            "windows.sandbox='elevated'".into(),
             "--sandbox".into(),
             "workspace-write".into(),
             "--config".into(),
-            format!(
-                "sandbox_workspace_write.writable_roots=[{}]",
-                serde_json::to_string(artifact_dir_value).map_err(|error| {
-                    WorkerAdapterError::new(
-                        "worker_adapter_invalid",
-                        format!("serialize worker artifact directory: {error}"),
-                    )
-                })?
-            ),
+            format!("sandbox_workspace_write.writable_roots=[{codex_writable_roots}]"),
         ],
         WorkerHarness::Claude => vec![
             "claude".into(),
@@ -183,6 +190,16 @@ pub fn prepare_worker_launch(
     })
 }
 
+fn toml_literal_string(value: &str) -> Result<String, WorkerAdapterError> {
+    if value.chars().any(char::is_control) || value.contains("'''") {
+        return Err(WorkerAdapterError::new(
+            "worker_adapter_invalid",
+            "worker artifact directory cannot be represented as a TOML literal string",
+        ));
+    }
+    Ok(format!("'''{value}'''"))
+}
+
 /// Replace only Herdr-owned artifact paths in a prepared launch. The marker is
 /// expanded by the remote PowerShell bootstrap after it resolves the remote
 /// temp directory; request bytes and client environment values are unchanged.
@@ -195,22 +212,68 @@ pub(crate) fn rewrite_worker_argv_for_remote(
             "worker artifact directory is not valid utf-8",
         )
     })?;
+    let mut argv = launch.argv.clone();
+    let local_artifact_literal = toml_literal_string(local_artifact_dir)?;
+    let remote_artifact_literal = toml_literal_string(REMOTE_WORKER_ARTIFACT_MARKER)?;
     let mut replaced = false;
-    let argv = launch
-        .argv
-        .iter()
-        .map(|argument| {
-            let updated = argument.replace(local_artifact_dir, REMOTE_WORKER_ARTIFACT_MARKER);
-            replaced |= updated != *argument;
-            updated
-        })
-        .collect::<Vec<_>>();
+    for index in 0..argv.len().saturating_sub(1) {
+        if argv[index] == "--add-dir" && argv[index + 1] == local_artifact_dir {
+            argv[index + 1] = REMOTE_WORKER_ARTIFACT_MARKER.to_string();
+            replaced = true;
+        } else if argv[index].starts_with("sandbox_workspace_write.writable_roots=") {
+            let updated = argv[index].replace(&local_artifact_literal, &remote_artifact_literal);
+            replaced |= updated != argv[index];
+            argv[index] = updated;
+        }
+    }
+    let payload = argv.last_mut().ok_or_else(|| {
+        WorkerAdapterError::new(
+            "worker_adapter_invalid",
+            "remote worker launch did not contain an assignment payload",
+        )
+    })?;
+    let mut assignment: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+        WorkerAdapterError::new(
+            "worker_adapter_invalid",
+            format!("remote worker assignment payload is invalid JSON: {error}"),
+        )
+    })?;
+    let publication = assignment
+        .get_mut("resultPublication")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| {
+            WorkerAdapterError::new(
+                "worker_adapter_invalid",
+                "remote worker assignment payload is missing resultPublication",
+            )
+        })?;
+    for field in ["directory", "manifestPath", "instruction"] {
+        let value = publication
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let Some(value) = value else {
+            return Err(WorkerAdapterError::new(
+                "worker_adapter_invalid",
+                format!("remote worker resultPublication is missing {field}"),
+            ));
+        };
+        let updated = value.replace(local_artifact_dir, REMOTE_WORKER_ARTIFACT_MARKER);
+        replaced |= updated != value;
+        publication.insert(field.to_string(), serde_json::Value::String(updated));
+    }
     if !replaced {
         return Err(WorkerAdapterError::new(
             "worker_adapter_invalid",
             "remote worker launch did not contain the Herdr artifact directory",
         ));
     }
+    *payload = String::from_utf8(canonical_json_bytes(&assignment)?).map_err(|error| {
+        WorkerAdapterError::new(
+            "worker_adapter_invalid",
+            format!("remote worker assignment payload is not utf-8: {error}"),
+        )
+    })?;
     Ok(argv)
 }
 
@@ -518,6 +581,52 @@ mod tests {
     }
 
     #[test]
+    fn remote_rewrite_changes_only_herdr_owned_artifact_fields() {
+        let mut request = request();
+        request.context.instruction = format!(
+            "Keep the literal path /explicit/request/artifacts and marker {REMOTE_WORKER_ARTIFACT_MARKER} unchanged."
+        );
+        let metadata = WorkerRunMetadata {
+            harness: WorkerHarness::Claude,
+            profile: "profile-under-test".into(),
+            model: "opaque-model-under-test".into(),
+            target: "herdr-target:local-macos-primary".into(),
+            placement: "local-pane:workspace:1".into(),
+        };
+        let launch = prepare_worker_launch(
+            &request,
+            &metadata,
+            &placement(),
+            "worker-run:0123456789abcdef0123456789abcdef",
+            Path::new("/explicit/request/artifacts"),
+        )
+        .unwrap();
+        let rewritten = rewrite_worker_argv_for_remote(&launch).unwrap();
+        let add_dir = rewritten
+            .iter()
+            .position(|argument| argument == "--add-dir")
+            .unwrap();
+        assert_eq!(rewritten[add_dir + 1], REMOTE_WORKER_ARTIFACT_MARKER);
+        let payload: serde_json::Value = serde_json::from_str(rewritten.last().unwrap()).unwrap();
+        assert_eq!(
+            payload["request"]["context"]["instruction"],
+            request.context.instruction
+        );
+        assert_eq!(
+            canonical_json_bytes(&payload["request"]).unwrap(),
+            canonical_json_bytes(&request).unwrap()
+        );
+        assert_eq!(
+            payload["resultPublication"]["directory"],
+            REMOTE_WORKER_ARTIFACT_MARKER
+        );
+        assert!(payload["resultPublication"]["instruction"]
+            .as_str()
+            .unwrap()
+            .contains(REMOTE_WORKER_ARTIFACT_MARKER));
+    }
+
+    #[test]
     fn worker_payload_states_the_herdr_owned_result_publication_location() {
         let request = request();
         for harness in [WorkerHarness::Codex, WorkerHarness::Claude] {
@@ -574,6 +683,46 @@ mod tests {
             // A variadic flag directly before the payload would swallow it.
             assert_ne!(launch.argv[launch.argv.len() - 2], "--add-dir");
         }
+    }
+
+    #[test]
+    fn codex_writable_roots_include_checkout_and_artifacts() {
+        let metadata = WorkerRunMetadata {
+            harness: WorkerHarness::Codex,
+            profile: "profile-under-test".into(),
+            model: "opaque-model-under-test".into(),
+            target: "herdr-target:local-macos-primary".into(),
+            placement: "local-pane:workspace:1".into(),
+        };
+        let launch = prepare_worker_launch(
+            &request(),
+            &metadata,
+            &placement(),
+            "worker-run:0123456789abcdef0123456789abcdef",
+            Path::new("/explicit/o'malley/artifacts"),
+        )
+        .unwrap();
+        let config = launch
+            .argv
+            .windows(2)
+            .find(|window| {
+                window[0] == "--config"
+                    && window[1].starts_with("sandbox_workspace_write.writable_roots=")
+            })
+            .map(|window| window[1].as_str())
+            .expect("Codex launch should include its writable-root config");
+
+        assert!(launch
+            .argv
+            .windows(2)
+            .any(|window| { window[0] == "--config" && window[1] == "approval_policy='never'" }));
+        assert!(launch.argv.windows(2).any(|window| {
+            window[0] == "--config" && window[1] == "windows.sandbox='elevated'"
+        }));
+        assert_eq!(
+            config,
+            "sandbox_workspace_write.writable_roots=['''/explicit/request/worktree''','''/explicit/o'malley/artifacts''']"
+        );
     }
 
     #[test]
