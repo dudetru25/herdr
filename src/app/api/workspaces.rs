@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, ResponseResult, WorkspaceCreateParams,
     WorkspaceMoveBlockParams, WorkspaceMoveParams, WorkspaceParentSpaceParams,
-    WorkspaceRenameParams, WorkspaceReportMetadataParams, WorkspaceTarget,
+    WorkspaceRenameParams, WorkspaceReportMetadataParams, WorkspaceRetargetParams, WorkspaceTarget,
 };
 use crate::app::App;
 
@@ -130,6 +130,58 @@ impl App {
                 label: params.label,
             },
         });
+
+        encode_success(
+            id,
+            ResponseResult::WorkspaceInfo {
+                workspace: self.workspace_info(index),
+            },
+        )
+    }
+
+    pub(super) fn handle_workspace_retarget(
+        &mut self,
+        id: String,
+        params: WorkspaceRetargetParams,
+    ) -> String {
+        let Some(index) = self.parse_workspace_id(&params.workspace_id) else {
+            return workspace_not_found(id, &params.workspace_id);
+        };
+        let Some(workspace) = self.state.workspaces.get(index) else {
+            return workspace_not_found(id, &params.workspace_id);
+        };
+        if workspace.is_machine() {
+            return encode_error(
+                id,
+                "workspace_retarget_machine_unsupported",
+                "machine workspaces cannot be retargeted",
+            );
+        }
+
+        let path = match resolve_workspace_retarget_path(&params.path) {
+            Ok(path) => path,
+            Err((code, message)) => return encode_error(id, code, message),
+        };
+        let terminal_ids = self.state.terminal_ids_for_workspace(index);
+        let pane_ids = self.state.pane_ids_for_workspace(index);
+        if let Err(message) = self.state.retarget_workspace(index, path.clone()) {
+            return encode_error(id, "workspace_retarget_state_invalid", message);
+        }
+        for terminal_id in terminal_ids {
+            if let Some(runtime) = self.terminal_runtimes.get(&terminal_id) {
+                runtime.set_reported_cwd(path.clone());
+            }
+        }
+        self.schedule_session_save();
+        self.emit_event(EventEnvelope {
+            event: EventKind::WorkspaceUpdated,
+            data: EventData::WorkspaceUpdated {
+                workspace: self.workspace_info(index),
+            },
+        });
+        for pane_id in pane_ids {
+            self.emit_pane_updated(index, pane_id);
+        }
 
         encode_success(
             id,
@@ -428,17 +480,49 @@ fn workspace_not_found(id: String, workspace_id: &str) -> String {
     )
 }
 
+fn resolve_workspace_retarget_path(raw_path: &str) -> Result<PathBuf, (&'static str, String)> {
+    let path = PathBuf::from(raw_path);
+    if !path.is_absolute() {
+        return Err((
+            "workspace_retarget_path_not_absolute",
+            "workspace retarget path must be absolute".into(),
+        ));
+    }
+    if !path.exists() {
+        return Err((
+            "workspace_retarget_path_not_found",
+            format!("workspace retarget path does not exist: {}", path.display()),
+        ));
+    }
+    let is_non_bare_checkout = path.is_dir()
+        && crate::workspace::git_worktree_is_bare(&path).is_some_and(|is_bare| !is_bare);
+    if !is_non_bare_checkout {
+        return Err((
+            "workspace_retarget_path_not_checkout",
+            format!(
+                "workspace retarget path is not a usable Git checkout: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     use crate::{
-        api::schema::{ErrorResponse, Method, Request, SuccessResponse},
+        api::{
+            schema::{ErrorResponse, Method, Request, SuccessResponse},
+            EventHub,
+        },
         config::{Config, MachineConfig},
         workspace::{ParentSpaceMembership, Workspace},
     };
+    use ratatui::layout::Direction;
 
     static NEXT_PARENT_SPACE_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -479,6 +563,115 @@ mod tests {
         app.state.selected = 0;
         app.state.ensure_test_terminals();
         app
+    }
+
+    fn test_git_checkout(root: &Path, name: &str) -> PathBuf {
+        let checkout = root.join(name);
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&checkout)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        checkout
+    }
+
+    fn test_bare_git_repository(root: &Path, name: &str) -> PathBuf {
+        let repository = root.join(name);
+        let output = std::process::Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&repository)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git init --bare failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        repository
+    }
+
+    fn test_linked_git_worktree(root: &Path, name: &str) -> PathBuf {
+        let source = test_git_checkout(root, &format!("{name}-source"));
+        for args in [
+            ["config", "user.email", "herdr@example.invalid"],
+            ["config", "user.name", "Herdr Test"],
+        ] {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git config failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["commit", "--quiet", "--allow-empty", "-m", "initial"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let checkout = root.join(name);
+        let branch = format!("{name}-branch");
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["worktree", "add", "--quiet", "-b"])
+            .arg(branch)
+            .arg(&checkout)
+            .arg("HEAD")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(checkout.join(".git").is_file());
+        checkout
+    }
+
+    fn retarget_test_app(old_path: &Path) -> (App, EventHub, String) {
+        let mut workspace = Workspace::test_new("one");
+        workspace.identity_cwd = old_path.to_path_buf();
+        workspace.cached_identity_cwd = old_path.to_path_buf();
+        let workspace_id = workspace.id.clone();
+        let event_hub = EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub.clone());
+        app.state.default_shell = super::super::test_support::exiting_test_command().into();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        (app, event_hub, workspace_id)
+    }
+
+    fn assert_retarget_rejection(app: &App, old_path: &Path, response: &str, expected_code: &str) {
+        let error: ErrorResponse = serde_json::from_str(response).unwrap();
+        assert_eq!(error.error.code, expected_code);
+        assert_eq!(app.state.workspaces[0].identity_cwd, old_path);
+        assert_eq!(app.state.workspaces[0].cached_identity_cwd, old_path);
+        assert!(app
+            .state
+            .terminal_ids_for_workspace(0)
+            .iter()
+            .all(|terminal_id| app.state.terminals[terminal_id].cwd == old_path));
+        assert!(!app.state.session_dirty);
     }
 
     fn machine_config(target: &str) -> Config {
@@ -592,6 +785,201 @@ mod tests {
         assert!(app.state.workspaces.is_empty());
         assert!(!app.state.terminals.contains_key(&terminal_id));
         assert!(app.state.session_dirty);
+    }
+
+    #[test]
+    fn workspace_retarget_updates_workspace_and_all_panes() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "old");
+        let new_path = test_git_checkout(&fixture.root, "new");
+        let (mut app, event_hub, workspace_id) = retarget_test_app(&old_path);
+        app.state.workspaces[0].test_split(Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let new_path_display = new_path.display().to_string();
+
+        let response = app.handle_api_request(Request {
+            id: "retarget".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id,
+                path: new_path_display.clone(),
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        assert_eq!(app.state.workspaces[0].identity_cwd, new_path);
+        assert_eq!(app.state.workspaces[0].cached_identity_cwd, new_path);
+        assert!(app
+            .state
+            .terminal_ids_for_workspace(0)
+            .iter()
+            .all(|terminal_id| app.state.terminals[terminal_id].cwd == new_path));
+        for pane_id in app.state.pane_ids_for_workspace(0) {
+            let pane = app.pane_info(0, pane_id).expect("retargeted pane");
+            assert_eq!(pane.cwd.as_deref(), Some(new_path_display.as_str()));
+        }
+        assert!(app.state.session_dirty);
+        assert!(event_hub
+            .events_after(0)
+            .iter()
+            .any(|(_, event)| matches!(&event.data, EventData::WorkspaceUpdated { .. })));
+        assert_eq!(
+            event_hub
+                .events_after(0)
+                .iter()
+                .filter(|(_, event)| matches!(&event.data, EventData::PaneUpdated { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn workspace_retarget_rejects_nonexistent_path() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "old");
+        let (mut app, _event_hub, workspace_id) = retarget_test_app(&old_path);
+        let missing_path = fixture.root.join("missing");
+
+        let response = app.handle_api_request(Request {
+            id: "missing".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id,
+                path: missing_path.display().to_string(),
+            }),
+        });
+
+        assert_retarget_rejection(
+            &app,
+            &old_path,
+            &response,
+            "workspace_retarget_path_not_found",
+        );
+    }
+
+    #[test]
+    fn workspace_retarget_rejects_non_checkout_path() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "old");
+        let non_checkout = fixture.root.join("not-checkout");
+        std::fs::create_dir_all(&non_checkout).unwrap();
+        let (mut app, _event_hub, workspace_id) = retarget_test_app(&old_path);
+
+        let response = app.handle_api_request(Request {
+            id: "non-checkout".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id,
+                path: non_checkout.display().to_string(),
+            }),
+        });
+
+        assert_retarget_rejection(
+            &app,
+            &old_path,
+            &response,
+            "workspace_retarget_path_not_checkout",
+        );
+    }
+
+    #[test]
+    fn workspace_retarget_rejects_bare_repository() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "old");
+        let bare_repository = test_bare_git_repository(&fixture.root, "bare.git");
+        let (mut app, _event_hub, workspace_id) = retarget_test_app(&old_path);
+
+        let response = app.handle_api_request(Request {
+            id: "bare-repository".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id,
+                path: bare_repository.display().to_string(),
+            }),
+        });
+
+        assert_retarget_rejection(
+            &app,
+            &old_path,
+            &response,
+            "workspace_retarget_path_not_checkout",
+        );
+    }
+
+    #[test]
+    fn workspace_retarget_accepts_linked_worktree() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "old");
+        let linked_worktree = test_linked_git_worktree(&fixture.root, "linked");
+        let (mut app, _event_hub, workspace_id) = retarget_test_app(&old_path);
+
+        let response = app.handle_api_request(Request {
+            id: "linked-worktree".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id,
+                path: linked_worktree.display().to_string(),
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        assert_eq!(app.state.workspaces[0].identity_cwd, linked_worktree);
+        assert!(app
+            .state
+            .terminal_ids_for_workspace(0)
+            .iter()
+            .all(|terminal_id| app.state.terminals[terminal_id].cwd == linked_worktree));
+    }
+
+    #[test]
+    fn workspace_retarget_rejection_leaves_state_unchanged() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "old");
+        let (mut app, _event_hub, workspace_id) = retarget_test_app(&old_path);
+        let before_auto_label = app.state.workspaces[0].cached_auto_label.clone();
+        let before_status_key = app.state.workspaces[0].cached_git_status_key.clone();
+        let before_branch = app.state.workspaces[0].cached_git_branch.clone();
+        let before_ahead_behind = app.state.workspaces[0].cached_git_ahead_behind;
+        let before_git_space = app.state.workspaces[0].cached_git_space.clone();
+        let before_terminal_cwds: Vec<_> = app
+            .state
+            .terminal_ids_for_workspace(0)
+            .iter()
+            .map(|terminal_id| app.state.terminals[terminal_id].cwd.clone())
+            .collect();
+
+        let response = app.handle_api_request(Request {
+            id: "relative".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id,
+                path: "relative/path".into(),
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "workspace_retarget_path_not_absolute");
+        assert_eq!(app.state.workspaces[0].cached_auto_label, before_auto_label);
+        assert_eq!(
+            app.state.workspaces[0].cached_git_status_key,
+            before_status_key
+        );
+        assert_eq!(app.state.workspaces[0].cached_git_branch, before_branch);
+        assert_eq!(
+            app.state.workspaces[0].cached_git_ahead_behind,
+            before_ahead_behind
+        );
+        assert_eq!(app.state.workspaces[0].cached_git_space, before_git_space);
+        let after_terminal_cwds: Vec<_> = app
+            .state
+            .terminal_ids_for_workspace(0)
+            .iter()
+            .map(|terminal_id| app.state.terminals[terminal_id].cwd.clone())
+            .collect();
+        assert_eq!(after_terminal_cwds, before_terminal_cwds);
+        assert!(!app.state.session_dirty);
     }
 
     #[tokio::test]

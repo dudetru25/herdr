@@ -28,6 +28,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::WorkspaceCreate(_)
             | Method::WorkspaceFocus(_)
             | Method::WorkspaceRename(_)
+            | Method::WorkspaceRetarget(_)
             | Method::WorkspaceMove(_)
             | Method::WorkspaceBecomeParent(_)
             | Method::WorkspaceRescanChildren(_)

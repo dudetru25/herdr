@@ -87,6 +87,14 @@ herdr agent list
 
 Creation responses expose the IDs to use next. `workspace create` returns `.result.workspace`, `.result.tab`, and `.result.root_pane`. `tab create` returns `.result.tab` and `.result.root_pane`. `pane split` returns the new pane as `.result.pane`.
 
+If an existing workspace's checkout moved on disk, point it at the caller-supplied absolute path:
+
+```bash
+herdr workspace retarget <workspace_id> <absolute-checkout-path>
+```
+
+The path must already exist and be a usable Git checkout. Herdr rejects missing or non-checkout paths without changing the workspace; it does not discover or guess a replacement. After a successful retarget, inspect the workspace's panes with `herdr pane list --workspace <workspace_id>` to confirm their working-directory state, and use the same command after a server restart to verify the persisted target.
+
 ## Start and coordinate an agent
 
 Default to a sibling pane in the current tab and the current working directory. Do not create a workspace, tab, worktree, or different cwd unless the user explicitly requests that topology or location.

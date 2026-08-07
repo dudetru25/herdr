@@ -26,7 +26,8 @@ pub(crate) use self::{git::git_status_snapshot_for_cwd_with_demand, tab::MovedPa
 pub use self::{
     git::{
         derive_label_from_cwd, fallback_label_from_cwd, git_branch, git_space_metadata,
-        git_status_cache_key, GitSpaceMetadata, GitStatusCacheEntry, GitStatusRefreshDemand,
+        git_status_cache_key, git_worktree_is_bare, GitSpaceMetadata, GitStatusCacheEntry,
+        GitStatusRefreshDemand,
     },
     tab::{NewPane, Tab},
 };

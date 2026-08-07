@@ -91,6 +91,110 @@ fn workspace_and_pane_management_commands_work() {
 }
 
 #[test]
+fn workspace_retarget_moved_checkout_survives_restart() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let old_checkout = base.join("checkout-old");
+    let moved_checkout = base.join("checkout-moved");
+    create_committed_repo(&old_checkout);
+
+    let herdr = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = run_cli_json(
+        &socket_path,
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            old_checkout.to_str().unwrap(),
+        ],
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let before = run_cli_json(
+        &socket_path,
+        &["pane", "list", "--workspace", &workspace_id],
+    );
+    println!(
+        "retarget.before={}",
+        serde_json::to_string(&before).unwrap()
+    );
+    assert_eq!(
+        before["result"]["panes"][0]["cwd"],
+        old_checkout.to_str().unwrap()
+    );
+
+    fs::rename(&old_checkout, &moved_checkout).unwrap();
+    let retargeted = run_cli(
+        &socket_path,
+        &[
+            "workspace",
+            "retarget",
+            &workspace_id,
+            moved_checkout.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        retargeted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&retargeted.stderr)
+    );
+    let retargeted_json: serde_json::Value = serde_json::from_slice(&retargeted.stdout).unwrap();
+    println!(
+        "retarget.response={}",
+        serde_json::to_string(&retargeted_json).unwrap()
+    );
+    let after = run_cli_json(
+        &socket_path,
+        &["pane", "list", "--workspace", &workspace_id],
+    );
+    println!("retarget.after={}", serde_json::to_string(&after).unwrap());
+    assert_eq!(
+        after["result"]["panes"][0]["cwd"],
+        moved_checkout.to_str().unwrap()
+    );
+
+    let session_path = config_home.join(app_dir_name()).join("session.json");
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || fs::read_to_string(&session_path)
+            .map(|contents| contents.contains(moved_checkout.to_str().unwrap()))
+            .unwrap_or(false)
+    ));
+    println!(
+        "retarget.session={}",
+        fs::read_to_string(&session_path).unwrap()
+    );
+
+    let server_pid = herdr.child.process_id().unwrap();
+    drop(herdr);
+    assert!(wait_for_pid_exit(server_pid, Duration::from_secs(5)));
+
+    let restarted = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let restored = run_cli_json(
+        &socket_path,
+        &["pane", "list", "--workspace", &workspace_id],
+    );
+    println!(
+        "retarget.after_restart={}",
+        serde_json::to_string(&restored).unwrap()
+    );
+    assert_eq!(
+        restored["result"]["panes"][0]["cwd"],
+        moved_checkout.to_str().unwrap()
+    );
+
+    cleanup_spawned_herdr(restarted, base);
+}
+
+#[test]
 fn worktree_management_commands_work() {
     let base = unique_test_dir();
     let config_home = base.join("config");

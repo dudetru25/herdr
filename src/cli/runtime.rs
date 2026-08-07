@@ -3,8 +3,8 @@ use crate::api::schema::{
     PaneMoveParams, PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams,
     PaneTarget, PaneZoomParams, Request, TabCreateParams, TabListParams, TabRenameParams,
     TabTarget, WorkspaceCreateParams, WorkspaceParentSpaceParams, WorkspaceRenameParams,
-    WorkspaceTarget, WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams,
-    WorktreeRemoveParams,
+    WorkspaceRetargetParams, WorkspaceTarget, WorktreeCreateParams, WorktreeListParams,
+    WorktreeOpenParams, WorktreeRemoveParams,
 };
 
 fn print_method_response(id: &'static str, method: Method) -> std::io::Result<i32> {
@@ -66,6 +66,10 @@ pub(super) fn workspace_focus(workspace_id: String) -> std::io::Result<i32> {
 
 pub(super) fn workspace_rename(params: WorkspaceRenameParams) -> std::io::Result<i32> {
     print_method_response("cli:workspace:rename", Method::WorkspaceRename(params))
+}
+
+pub(super) fn workspace_retarget(params: WorkspaceRetargetParams) -> std::io::Result<i32> {
+    print_method_response("cli:workspace:retarget", Method::WorkspaceRetarget(params))
 }
 
 pub(super) fn workspace_become_parent(params: WorkspaceParentSpaceParams) -> std::io::Result<i32> {

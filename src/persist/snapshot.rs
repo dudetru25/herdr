@@ -649,6 +649,36 @@ mod tests {
     }
 
     #[test]
+    fn retargeted_workspace_snapshot_round_trip_preserves_target_cwds() {
+        let path =
+            std::env::temp_dir().join(format!("herdr-retarget-snapshot-{}", std::process::id()));
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let mut state = state_with_workspaces(&["retargeted"]);
+        state.retarget_workspace(0, path.clone()).unwrap();
+        let captured = capture_from_state(&state);
+        assert_eq!(captured.workspaces[0].identity_cwd, path);
+        assert!(captured.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .all(|pane| pane.cwd == path));
+
+        let json = serde_json::to_string(&captured).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+        assert_eq!(restored.workspaces[0].identity_cwd, path);
+        assert!(restored.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .all(|pane| pane.cwd == path));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn round_trip_layout_snapshot() {
         let layout = LayoutSnapshot::Split {
             direction: DirectionSnapshot::Horizontal,

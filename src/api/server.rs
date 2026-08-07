@@ -362,6 +362,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::WorkspaceGet(_) => "workspace.get",
         Method::WorkspaceFocus(_) => "workspace.focus",
         Method::WorkspaceRename(_) => "workspace.rename",
+        Method::WorkspaceRetarget(_) => "workspace.retarget",
         Method::WorkspaceMove(_) => "workspace.move",
         Method::WorkspaceBecomeParent(_) => "workspace.become_parent",
         Method::WorkspaceRescanChildren(_) => "workspace.rescan_children",

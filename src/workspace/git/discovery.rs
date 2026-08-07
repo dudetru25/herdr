@@ -60,6 +60,10 @@ pub fn git_space_metadata(cwd: &Path) -> Option<GitSpaceMetadata> {
     Some(git_space_metadata_from_info(&info))
 }
 
+pub fn git_worktree_is_bare(cwd: &Path) -> Option<bool> {
+    git_worktree_info(cwd).map(|info| info.is_bare)
+}
+
 pub(crate) fn automatic_workspace_label(cwd: &Path, repo_root: &Path) -> String {
     repo_root
         .file_name()

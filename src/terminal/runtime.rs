@@ -545,6 +545,10 @@ impl TerminalRuntime {
         self.0.cwd()
     }
 
+    pub fn set_reported_cwd(&self, cwd: std::path::PathBuf) {
+        self.0.set_reported_cwd(cwd);
+    }
+
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
         self.0.follow_cwd()
     }

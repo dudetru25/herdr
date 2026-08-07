@@ -1329,6 +1329,51 @@ impl AppState {
         }
     }
 
+    pub(crate) fn retarget_workspace(
+        &mut self,
+        ws_idx: usize,
+        path: std::path::PathBuf,
+    ) -> Result<(), &'static str> {
+        let Some(workspace) = self.workspaces.get(ws_idx) else {
+            return Err("workspace not found");
+        };
+        if workspace.is_machine() {
+            return Err("machine workspaces cannot be retargeted");
+        }
+
+        let terminal_ids = self.terminal_ids_for_workspace(ws_idx);
+        if terminal_ids
+            .iter()
+            .any(|terminal_id| !self.terminals.contains_key(terminal_id))
+        {
+            return Err("workspace panes are missing terminal state");
+        }
+
+        let (Some(git_space), cached_auto_label, cached_git_status_key) =
+            crate::workspace::discover_workspace_git_identity(&path)
+        else {
+            return Err("retarget path is not a Git checkout");
+        };
+        let cached_git_branch = crate::workspace::git_branch(&path);
+
+        let workspace = &mut self.workspaces[ws_idx];
+        workspace.identity_cwd = path.clone();
+        workspace.cached_identity_cwd = path.clone();
+        workspace.cached_auto_label = cached_auto_label;
+        workspace.cached_git_status_key = cached_git_status_key;
+        workspace.cached_git_branch = cached_git_branch;
+        workspace.cached_git_ahead_behind = None;
+        workspace.cached_git_space = Some(git_space);
+
+        for terminal_id in terminal_ids {
+            if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                terminal.cwd = path.clone();
+            }
+        }
+        self.mark_session_dirty();
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn next_workspace(&mut self) {
         if self.workspaces.is_empty() {

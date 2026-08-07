@@ -212,6 +212,12 @@ fn workspace_command() -> Command {
                 .arg(required("label", "LABEL").num_args(1..)),
         )
         .subcommand(
+            Command::new("retarget")
+                .about("Point a workspace at a checkout path")
+                .arg(required("workspace_id", "WORKSPACE_ID"))
+                .arg(required("path", "PATH")),
+        )
+        .subcommand(
             Command::new("become-parent")
                 .about("Make a workspace a parent space and scan its children")
                 .arg(option("workspace", "ID")),

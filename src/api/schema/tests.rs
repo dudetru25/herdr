@@ -1095,6 +1095,18 @@ fn layout_export_apply_round_trip() {
 
 #[test]
 fn authority_mutation_requests_round_trip() {
+    let workspace_retarget = Request {
+        id: "retarget_ws".into(),
+        method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+            workspace_id: "w1".into(),
+            path: "/tmp/moved-checkout".into(),
+        }),
+    };
+    let json = serde_json::to_value(&workspace_retarget).unwrap();
+    assert_eq!(json["method"], "workspace.retarget");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, workspace_retarget);
+
     let workspace_move = Request {
         id: "move_ws".into(),
         method: Method::WorkspaceMove(WorkspaceMoveParams {

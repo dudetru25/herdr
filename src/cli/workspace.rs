@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::api::schema::{
     Method, WorkspaceCreateParams, WorkspaceParentSpaceParams, WorkspaceRenameParams,
-    WorkspaceReportMetadataParams,
+    WorkspaceReportMetadataParams, WorkspaceRetargetParams,
 };
 
 pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
@@ -17,6 +17,7 @@ pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
         "get" => workspace_get(&args[1..]),
         "focus" => workspace_focus(&args[1..]),
         "rename" => workspace_rename(&args[1..]),
+        "retarget" => workspace_retarget(&args[1..]),
         "become-parent" => workspace_become_parent(&args[1..]),
         "rescan-children" => workspace_rescan_children(&args[1..]),
         "stop-parent" => workspace_stop_parent(&args[1..]),
@@ -155,6 +156,18 @@ fn workspace_rename(args: &[String]) -> std::io::Result<i32> {
     super::runtime::workspace_rename(WorkspaceRenameParams {
         workspace_id: super::normalize_workspace_id(&args[0]),
         label: args[1..].join(" "),
+    })
+}
+
+fn workspace_retarget(args: &[String]) -> std::io::Result<i32> {
+    if args.len() != 2 {
+        eprintln!("usage: herdr workspace retarget <workspace_id> <absolute-checkout-path>");
+        return Ok(2);
+    }
+
+    super::runtime::workspace_retarget(WorkspaceRetargetParams {
+        workspace_id: super::normalize_workspace_id(&args[0]),
+        path: args[1].clone(),
     })
 }
 
@@ -306,6 +319,7 @@ fn print_workspace_help() {
     eprintln!("  herdr workspace get <workspace_id>");
     eprintln!("  herdr workspace focus <workspace_id>");
     eprintln!("  herdr workspace rename <workspace_id> <label>");
+    eprintln!("  herdr workspace retarget <workspace_id> <absolute-checkout-path>");
     eprintln!("  herdr workspace become-parent [--workspace ID]");
     eprintln!("  herdr workspace rescan-children [--workspace ID]");
     eprintln!("  herdr workspace stop-parent [--workspace ID]");
