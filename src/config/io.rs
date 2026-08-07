@@ -1255,6 +1255,7 @@ descrption = "status"
 [ui]
 mouse_capture = false
 mouse_captur = true
+prompt_new_tab_name = false
 "foo.bar" = true
 "foo.?.bar" = false
 
@@ -1278,6 +1279,7 @@ claude = [["terminal_title"]]
                 "unknown config key ui.\"foo.?.bar\"; ignoring key",
                 "unknown config key ui.\"foo.bar\"; ignoring key",
                 "unknown config key ui.mouse_captur; ignoring key",
+                "unknown config key ui.prompt_new_tab_name; ignoring key",
                 "unknown config key ui.toast.delivry; ignoring key",
             ]
         );

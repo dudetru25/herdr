@@ -635,12 +635,6 @@
           "description": "Ask for confirmation before closing a workspace."
         },
         {
-          "key": "ui.prompt_new_tab_name",
-          "type": "boolean",
-          "default": "true",
-          "description": "Ask for a tab name before creating a new tab."
-        },
-        {
           "key": "ui.prompt_new_workspace_name",
           "type": "boolean",
           "default": "false",

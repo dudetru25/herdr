@@ -273,7 +273,6 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn create_tab(&mut self) {
-        let custom_name = self.state.requested_new_tab_name.take();
         let active_before = self.state.active;
         let follow_cwd = self.state.active.and_then(|ws_idx| {
             self.focused_pane_cwd_in_workspace(ws_idx)
@@ -295,16 +294,6 @@ impl App {
                     self.state.active
                 };
                 let tab_idx = if created_workspace { 0 } else { created_idx };
-                if let Some(name) = custom_name {
-                    if let Some(ws) =
-                        ws_idx.and_then(|ws_idx| self.state.workspaces.get_mut(ws_idx))
-                    {
-                        if let Some(tab) = ws.tabs.get_mut(tab_idx) {
-                            tab.set_custom_name(name);
-                        }
-                        self.schedule_session_save();
-                    }
-                }
                 if let Some(ws_idx) = ws_idx {
                     if created_workspace {
                         self.emit_workspace_open_events(ws_idx);

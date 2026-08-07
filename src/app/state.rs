@@ -1759,8 +1759,6 @@ pub struct AppState {
     /// Set when UI interaction requested a clipboard write that must be
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
-    pub creating_new_tab: bool,
-    pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
     pub rename_pane_target: Option<PaneId>,
     pub machine_create: Option<MachineCreateState>,
@@ -1833,7 +1831,6 @@ pub struct AppState {
     pub redraw_on_focus_gained: bool,
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
-    pub prompt_new_tab_name: bool,
     pub prompt_new_workspace_name: bool,
     pub pane_borders: bool,
     pub pane_scrollbars: bool,
@@ -2142,8 +2139,6 @@ impl AppState {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
-            creating_new_tab: false,
-            requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
             rename_pane_target: None,
             machine_create: None,
@@ -2223,7 +2218,6 @@ impl AppState {
             redraw_on_focus_gained: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
-            prompt_new_tab_name: true,
             prompt_new_workspace_name: false,
             pane_borders: true,
             pane_scrollbars: true,

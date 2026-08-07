@@ -533,6 +533,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tab_create_with_label_sets_custom_name() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub);
+        app.state.default_shell = exiting_test_command().into();
+        app.state.shell_mode = ShellModeConfig::NonLogin;
+        app.state.workspaces = vec![Workspace::test_new("tabs")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+
+        let response = app.handle_tab_create(
+            "req".into(),
+            TabCreateParams {
+                workspace_id: None,
+                cwd: None,
+                focus: false,
+                label: Some("ops".into()),
+                env: Default::default(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            &success.result,
+            ResponseResult::TabCreated { tab, .. } if tab.label == "ops"
+        ));
+        assert_eq!(
+            app.state.workspaces[0].tabs[1].custom_name.as_deref(),
+            Some("ops")
+        );
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
     async fn machine_tab_create_uses_current_registry_and_fails_when_removed() {
         let config = Config {
             machines: vec![MachineConfig {

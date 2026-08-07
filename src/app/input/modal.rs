@@ -384,8 +384,6 @@ pub(super) fn open_rename_workspace(
 
 pub(crate) fn open_new_workspace_dialog(state: &mut AppState, cwd: std::path::PathBuf) {
     let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
-    state.creating_new_tab = false;
-    state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = Some(cwd);
     state.rename_pane_target = None;
     state.name_input = suggested_name;
@@ -394,8 +392,6 @@ pub(crate) fn open_new_workspace_dialog(state: &mut AppState, cwd: std::path::Pa
 }
 
 pub(super) fn open_rename_active_tab(state: &mut AppState, replace_on_type: bool) {
-    state.creating_new_tab = false;
-    state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = None;
     state.rename_pane_target = None;
     if let Some(ws) = state.active.and_then(|i| state.workspaces.get(i)) {
@@ -415,8 +411,6 @@ pub(super) fn open_rename_pane(state: &mut AppState, pane_id: crate::layout::Pan
         return;
     };
     let terminal = state.terminals.get(&pane.attached_terminal_id);
-    state.creating_new_tab = false;
-    state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = None;
     state.rename_pane_target = Some(pane_id);
     state.name_input = terminal
@@ -429,24 +423,6 @@ pub(super) fn open_rename_pane(state: &mut AppState, pane_id: crate::layout::Pan
 fn workspace_create_label(input: &str, suggested_name: &str) -> Option<String> {
     let name = input.trim();
     (!name.is_empty() && name != suggested_name).then(|| name.to_string())
-}
-
-fn next_new_tab_default_name(state: &AppState) -> String {
-    state
-        .active
-        .and_then(|i| state.workspaces.get(i))
-        .map(|ws| (ws.tabs.len() + 1).to_string())
-        .unwrap_or_else(|| "1".to_string())
-}
-
-pub(super) fn open_new_tab_dialog(state: &mut AppState) {
-    state.creating_new_tab = true;
-    state.requested_new_tab_name = None;
-    state.pending_workspace_create_cwd = None;
-    state.rename_pane_target = None;
-    state.name_input = next_new_tab_default_name(state);
-    state.name_input_replace_on_type = true;
-    state.mode = Mode::RenameTab;
 }
 
 pub(super) fn leave_modal(state: &mut AppState) {
@@ -599,16 +575,6 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
                     crate::logging::workspace_renamed(&workspace_id);
                     state.mark_session_dirty();
                 }
-                Mode::RenameTab if state.creating_new_tab => {
-                    state.request_new_tab = true;
-                    let default_name = next_new_tab_default_name(state);
-                    state.requested_new_tab_name =
-                        if new_name.is_empty() || new_name == default_name {
-                            None
-                        } else {
-                            Some(new_name)
-                        };
-                }
                 Mode::RenameTab => {
                     if let Some(ws_idx) = state.active {
                         if let Some(ws) = state.workspaces.get_mut(ws_idx) {
@@ -656,7 +622,6 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
                 }
                 _ => {}
             }
-            state.creating_new_tab = false;
             state.pending_workspace_create_cwd = None;
             state.rename_pane_target = None;
             state.name_input.clear();
@@ -668,8 +633,6 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
             state.name_input_replace_on_type = false;
         }
         ModalAction::Cancel => {
-            state.creating_new_tab = false;
-            state.requested_new_tab_name = None;
             state.pending_workspace_create_cwd = None;
             state.rename_pane_target = None;
             state.name_input.clear();
@@ -940,7 +903,8 @@ pub(super) fn apply_context_menu_action(
             state.selected = ws_idx;
             state.active = Some(ws_idx);
             state.switch_tab(tab_idx);
-            open_new_tab_dialog(state);
+            state.request_new_tab = true;
+            leave_modal(state);
         }
         (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Rename")) => {
             state.selected = ws_idx;
@@ -1358,24 +1322,6 @@ impl App {
                     );
                 }
             }
-            Mode::RenameTab if self.state.creating_new_tab => {
-                let default_name = next_new_tab_default_name(&self.state);
-                let label = if new_name.is_empty() || new_name == default_name {
-                    None
-                } else {
-                    Some(new_name)
-                };
-                self.runtime_tab_create(
-                    "tui.tab.create_named",
-                    crate::api::schema::TabCreateParams {
-                        workspace_id: None,
-                        cwd: None,
-                        focus: true,
-                        label,
-                        env: Default::default(),
-                    },
-                );
-            }
             Mode::RenameTab if !new_name.is_empty() => {
                 let Some(ws_idx) = self.state.active else {
                     cancel_rename_modal(&mut self.state);
@@ -1614,7 +1560,17 @@ impl App {
             (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("New tab")) => {
                 self.focus_workspace_idx_via_api(ws_idx);
                 self.focus_tab_idx_via_api(tab_idx);
-                open_new_tab_dialog(&mut self.state);
+                self.runtime_tab_create(
+                    "tui.context_menu.tab.create",
+                    crate::api::schema::TabCreateParams {
+                        workspace_id: None,
+                        cwd: None,
+                        focus: true,
+                        label: None,
+                        env: Default::default(),
+                    },
+                );
+                leave_modal(&mut self.state);
             }
             (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Rename")) => {
                 self.focus_workspace_idx_via_api(ws_idx);
@@ -1726,8 +1682,6 @@ impl App {
 }
 
 fn cancel_rename_modal(state: &mut AppState) {
-    state.creating_new_tab = false;
-    state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = None;
     state.rename_pane_target = None;
     state.name_input.clear();
@@ -1791,32 +1745,6 @@ mod tests {
         app
     }
 
-    #[cfg(unix)]
-    fn with_missing_current_dir(test: impl FnOnce()) {
-        struct RestoreCurrentDir(std::path::PathBuf);
-
-        impl Drop for RestoreCurrentDir {
-            fn drop(&mut self) {
-                std::env::set_current_dir(&self.0).unwrap();
-            }
-        }
-
-        let _guard = config_env_lock().lock().unwrap();
-        let original = std::env::current_dir().unwrap();
-        let missing = temp_config_path("missing-interactive-cwd")
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        std::fs::create_dir_all(&missing).unwrap();
-        std::env::set_current_dir(&missing).unwrap();
-        let restore = RestoreCurrentDir(original);
-        std::fs::remove_dir(&missing).unwrap();
-
-        test();
-
-        drop(restore);
-    }
-
     #[test]
     fn workspace_create_label_preserves_auto_name_for_suggestion_or_blank() {
         assert_eq!(workspace_create_label("project", "project"), None);
@@ -1847,26 +1775,6 @@ mod tests {
         assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
         assert_eq!(toast.title, "workspace creation failed");
         assert!(!toast.context.is_empty());
-        assert!(app.toast_deadline.is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tui_named_tab_cwd_resolution_error_is_visible() {
-        let mut app = app_with_test_workspaces(&["test"]);
-        app.state.new_terminal_cwd = crate::config::NewTerminalCwdConfig::Current;
-        open_new_tab_dialog(&mut app.state);
-        app.state.name_input = "logs".into();
-
-        with_missing_current_dir(|| {
-            app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        });
-
-        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
-        let toast = app.state.toast.as_ref().unwrap();
-        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
-        assert_eq!(toast.title, "tab creation failed");
-        assert!(toast.context.contains("tab_create_failed"));
         assert!(app.toast_deadline.is_some());
     }
 
@@ -2653,7 +2561,7 @@ mod tests {
     }
 
     #[test]
-    fn open_rename_active_tab_can_prefill_default_new_tab_name() {
+    fn open_rename_active_tab_prefills_auto_name() {
         let mut state = state_with_workspaces(&["test"]);
         state.workspaces[0].test_add_tab(None);
         state.workspaces[0].switch_tab(1);
@@ -2666,80 +2574,24 @@ mod tests {
     }
 
     #[test]
-    fn cancel_new_tab_dialog_leaves_workspace_unchanged() {
+    fn tab_context_menu_rename_opens_rename_dialog() {
         let mut state = state_with_workspaces(&["test"]);
-        open_new_tab_dialog(&mut state);
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 0,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(1),
+        };
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
 
-        handle_rename_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
-        );
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 1);
 
-        assert_eq!(state.mode, Mode::Terminal);
-        assert!(!state.creating_new_tab);
-        assert!(!state.request_new_tab);
-        assert!(state.requested_new_tab_name.is_none());
-        assert_eq!(state.workspaces[0].tabs.len(), 1);
-    }
-
-    #[test]
-    fn saving_new_tab_dialog_requests_creation_with_name() {
-        let mut state = state_with_workspaces(&["test"]);
-        open_new_tab_dialog(&mut state);
-        state.name_input = "logs".into();
-        state.name_input_replace_on_type = false;
-
-        handle_rename_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-        );
-
-        assert_eq!(state.mode, Mode::Terminal);
-        assert!(!state.creating_new_tab);
-        assert!(state.request_new_tab);
-        assert_eq!(state.requested_new_tab_name.as_deref(), Some("logs"));
-    }
-
-    #[test]
-    fn saving_new_tab_dialog_with_default_name_keeps_tab_auto_named() {
-        let mut state = state_with_workspaces(&["test"]);
-        open_new_tab_dialog(&mut state);
-
-        handle_rename_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-        );
-
-        assert_eq!(state.mode, Mode::Terminal);
-        assert!(!state.creating_new_tab);
-        assert!(state.request_new_tab);
-        assert!(state.requested_new_tab_name.is_none());
-    }
-
-    #[test]
-    fn closing_first_auto_tab_compacts_remaining_auto_tab_label_and_next_prompt() {
-        let mut state = state_with_workspaces(&["test"]);
-        open_new_tab_dialog(&mut state);
-        handle_rename_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-        );
-
-        state.workspaces[0].test_add_tab(state.requested_new_tab_name.as_deref());
-        state.request_new_tab = false;
-        state.requested_new_tab_name = None;
-
-        state.workspaces[0].close_tab(0);
-        state.workspaces[0].switch_tab(0);
-
-        assert_eq!(
-            state.workspaces[0].tab_display_name(0).as_deref(),
-            Some("1")
-        );
-        assert!(state.workspaces[0].tabs[0].custom_name.is_none());
-
-        open_new_tab_dialog(&mut state);
-        assert_eq!(state.name_input, "2");
+        assert_eq!(state.mode, Mode::RenameTab);
+        assert_eq!(state.name_input, "1");
+        assert!(!state.name_input_replace_on_type);
     }
 
     #[test]

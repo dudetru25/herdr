@@ -569,8 +569,6 @@ impl App {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
-            creating_new_tab: false,
-            requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
             rename_pane_target: None,
             machine_create: None,
@@ -659,7 +657,6 @@ impl App {
             redraw_on_focus_gained: config.ui.redraw_on_focus_gained,
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
-            prompt_new_tab_name: config.ui.prompt_new_tab_name,
             prompt_new_workspace_name: config.ui.prompt_new_workspace_name,
             pane_borders: config.ui.pane_borders,
             pane_scrollbars: config.ui.pane_scrollbars,
@@ -1034,14 +1031,13 @@ impl App {
 
             if self.state.request_new_tab {
                 self.state.request_new_tab = false;
-                let label = self.state.requested_new_tab_name.take();
                 self.runtime_tab_create(
                     "tui.tab.create",
                     crate::api::schema::TabCreateParams {
                         workspace_id: None,
                         cwd: None,
                         focus: true,
-                        label,
+                        label: None,
                         env: Default::default(),
                     },
                 );
@@ -1520,7 +1516,6 @@ impl App {
                 self.state.right_click_passthrough_modifiers =
                     config.ui.right_click_passthrough_modifiers();
                 self.state.confirm_close = config.ui.confirm_close;
-                self.state.prompt_new_tab_name = config.ui.prompt_new_tab_name;
                 self.state.prompt_new_workspace_name = config.ui.prompt_new_workspace_name;
                 self.state.pane_borders = config.ui.pane_borders;
                 self.state.pane_scrollbars = config.ui.pane_scrollbars;

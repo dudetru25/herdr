@@ -288,21 +288,17 @@ impl App {
             }
             NavigateAction::NewTab => {
                 if self.state.active.is_some() {
-                    if self.state.prompt_new_tab_name {
-                        super::modal::open_new_tab_dialog(&mut self.state);
-                    } else {
-                        self.runtime_tab_create(
-                            "tui.key.tab.create",
-                            crate::api::schema::TabCreateParams {
-                                workspace_id: None,
-                                cwd: None,
-                                focus: true,
-                                label: None,
-                                env: Default::default(),
-                            },
-                        );
-                        leave_navigate_mode(&mut self.state);
-                    }
+                    self.runtime_tab_create(
+                        "tui.key.tab.create",
+                        crate::api::schema::TabCreateParams {
+                            workspace_id: None,
+                            cwd: None,
+                            focus: true,
+                            label: None,
+                            env: Default::default(),
+                        },
+                    );
+                    leave_navigate_mode(&mut self.state);
                 }
             }
             NavigateAction::RenameTab => {
@@ -1670,12 +1666,8 @@ pub(super) fn execute_navigate_action_in_context(
         }
         NavigateAction::NewTab => {
             if state.active.is_some() {
-                if state.prompt_new_tab_name {
-                    super::modal::open_new_tab_dialog(state);
-                } else {
-                    state.request_new_tab = true;
-                    leave_navigate_mode(state);
-                }
+                state.request_new_tab = true;
+                leave_navigate_mode(state);
             }
         }
         NavigateAction::RenameTab => super::modal::open_rename_active_tab(state, false),
@@ -2175,7 +2167,6 @@ mod tests {
     fn tui_new_tab_cwd_resolution_error_is_visible() {
         let mut app = app_with_test_workspaces(&["test"]);
         app.state.new_terminal_cwd = crate::config::NewTerminalCwdConfig::Current;
-        app.state.prompt_new_tab_name = false;
         app.state.mode = Mode::Navigate;
 
         with_missing_current_dir(|| {
@@ -3190,7 +3181,6 @@ navigate_pane_down = "ctrl+j"
         );
 
         assert_eq!(state.mode, Mode::Navigate);
-        assert!(!state.creating_new_tab);
         assert!(!state.request_new_tab);
         assert!(state.workspaces.is_empty());
     }
@@ -3547,30 +3537,14 @@ navigate_pane_down = "ctrl+j"
     }
 
     #[test]
-    fn new_tab_action_opens_dialog_without_creating_tab() {
+    fn new_tab_action_requests_terminal_tab_without_dialog() {
         let mut state = state_with_workspaces(&["test"]);
-
-        execute_navigate_action(&mut state, NavigateAction::NewTab);
-
-        assert_eq!(state.mode, Mode::RenameTab);
-        assert!(state.creating_new_tab);
-        assert_eq!(state.name_input, "2");
-        assert!(state.name_input_replace_on_type);
-        assert!(!state.request_new_tab);
-        assert_eq!(state.workspaces[0].tabs.len(), 1);
-    }
-
-    #[test]
-    fn new_tab_action_can_skip_rename_dialog() {
-        let mut state = state_with_workspaces(&["test"]);
-        state.prompt_new_tab_name = false;
 
         execute_navigate_action(&mut state, NavigateAction::NewTab);
 
         assert_eq!(state.mode, Mode::Terminal);
-        assert!(!state.creating_new_tab);
         assert!(state.request_new_tab);
-        assert!(state.requested_new_tab_name.is_none());
+        assert_eq!(state.workspaces[0].tabs.len(), 1);
     }
 
     #[test]

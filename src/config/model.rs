@@ -1077,8 +1077,6 @@ pub struct UiConfig {
     pub mouse_scroll_lines: Option<NonZeroUsize>,
     /// Ask for confirmation before closing a workspace. Default: true.
     pub confirm_close: bool,
-    /// Ask for a tab name before creating a new tab. Default: true.
-    pub prompt_new_tab_name: bool,
     /// Ask for a workspace name before interactive creation. Default: false.
     pub prompt_new_workspace_name: bool,
     /// Draw borders around split panes. Default: true.
@@ -1289,7 +1287,6 @@ impl Default for UiConfig {
             redraw_on_focus_gained: true,
             mouse_scroll_lines: None,
             confirm_close: true,
-            prompt_new_tab_name: true,
             prompt_new_workspace_name: false,
             pane_borders: true,
             pane_scrollbars: true,
@@ -1797,19 +1794,6 @@ directory = "~/Projects/herdr-worktrees"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.worktrees.directory, "~/Projects/herdr-worktrees");
-    }
-
-    #[test]
-    fn prompt_new_tab_name_defaults_on_and_parses() {
-        let default_config = Config::default();
-        assert!(default_config.ui.prompt_new_tab_name);
-
-        let toml = r#"
-[ui]
-prompt_new_tab_name = false
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(!config.ui.prompt_new_tab_name);
     }
 
     #[test]

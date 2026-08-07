@@ -19,7 +19,7 @@ use super::WheelRouting;
 use super::{
     modal::{
         apply_global_menu_action, confirm_close_cancel, global_menu_actions, leave_modal,
-        modal_action_from_buttons, open_global_menu, open_new_tab_dialog, ModalAction,
+        modal_action_from_buttons, open_global_menu, ModalAction,
     },
     settings::SettingsAction,
     ScrollbarClickTarget, TAB_DRAG_THRESHOLD, WORKSPACE_DRAG_THRESHOLD,
@@ -624,12 +624,8 @@ impl AppState {
                     return None;
                 }
                 if self.on_new_tab_button(mouse.column, mouse.row) {
-                    if self.prompt_new_tab_name {
-                        open_new_tab_dialog(self);
-                    } else {
-                        self.request_new_tab = true;
-                        self.mode = Mode::Terminal;
-                    }
+                    self.request_new_tab = true;
+                    self.mode = Mode::Terminal;
                     return None;
                 }
 
@@ -1320,12 +1316,8 @@ impl AppState {
                 return MobileMouseResult::Action(MouseAction::FocusWorkspace { ws_idx });
             }
             Some(crate::ui::MobileSwitcherTarget::NewTab) => {
-                if self.prompt_new_tab_name {
-                    open_new_tab_dialog(self);
-                } else {
-                    self.request_new_tab = true;
-                    self.mode = Mode::Terminal;
-                }
+                self.request_new_tab = true;
+                self.mode = Mode::Terminal;
             }
             Some(crate::ui::MobileSwitcherTarget::Tab(tab_idx)) => {
                 self.mode = Mode::Terminal;
@@ -4249,6 +4241,37 @@ mod tests {
     }
 
     #[test]
+    fn clicking_tab_context_menu_rename_opens_dialog() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let first_tab = app.state.view.tab_hit_areas[0];
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            first_tab.x + 1,
+            first_tab.y,
+        ));
+
+        let menu = app
+            .state
+            .context_menu_rect()
+            .expect("tab context menu rect");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            menu.x + 2,
+            menu.y + 2,
+        ));
+
+        assert_eq!(app.state.mode, Mode::RenameTab);
+        assert_eq!(app.state.name_input, "1");
+        assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
     fn clicking_pane_context_menu_close_leaves_context_menu_mode() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("one");
@@ -4661,7 +4684,7 @@ mod tests {
     }
 
     #[test]
-    fn mobile_switcher_new_tab_opens_dialog_when_enabled() {
+    fn mobile_switcher_new_tab_creates_terminal_without_dialog() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("one");
         ws.test_add_tab(Some("logs"));
@@ -4678,55 +4701,22 @@ mod tests {
             switch.y + 1,
         ));
         let viewport = crate::ui::mobile_switcher_areas(&app.state).viewport;
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            viewport.x + 2,
-            viewport.y + 5,
-        ));
-
-        assert_eq!(app.state.mode, Mode::RenameTab);
-        assert!(app.state.creating_new_tab);
-    }
-
-    #[test]
-    fn mobile_switcher_new_tab_skips_dialog_when_prompt_disabled() {
-        let mut app = app_for_mouse_test();
-        let mut ws = Workspace::test_new("one");
-        ws.test_add_tab(Some("logs"));
-        app.state.workspaces = vec![ws];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.prompt_new_tab_name = false;
-
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 44, 20));
-        let switch = app.state.view.mobile_menu_hit_area;
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            switch.x + 1,
-            switch.y + 1,
-        ));
-        let viewport = crate::ui::mobile_switcher_areas(&app.state).viewport;
-
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             viewport.x + 2,
             viewport.y + 5,
         ));
         assert_eq!(app.state.mode, Mode::Terminal);
-        assert!(!app.state.creating_new_tab);
         assert!(app.state.request_new_tab);
-        assert!(app.state.requested_new_tab_name.is_none());
     }
 
     #[test]
-    fn desktop_new_tab_button_skips_dialog_when_prompt_disabled() {
+    fn desktop_new_tab_button_left_click_creates_terminal_without_dialog() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.prompt_new_tab_name = false;
 
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
         let new_tab_area = app.state.view.new_tab_hit_area;
@@ -4737,9 +4727,7 @@ mod tests {
         ));
 
         assert_eq!(app.state.mode, Mode::Terminal);
-        assert!(!app.state.creating_new_tab);
         assert!(app.state.request_new_tab);
-        assert!(app.state.requested_new_tab_name.is_none());
     }
 
     #[test]
@@ -4777,7 +4765,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::RenameTab;
-        app.state.creating_new_tab = true;
         app.state.name_input = "new tab".into();
 
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 44, 20));
@@ -4789,7 +4776,6 @@ mod tests {
         ));
 
         assert_eq!(app.state.mode, Mode::Terminal);
-        assert!(!app.state.creating_new_tab);
         assert!(!app.state.request_new_tab);
     }
 

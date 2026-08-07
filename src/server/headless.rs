@@ -893,8 +893,7 @@ impl HeadlessServer {
 
         if self.app.state.request_new_tab {
             self.app.state.request_new_tab = false;
-            let label = self.app.state.requested_new_tab_name.take();
-            let response = self.headless_tab_create("headless.tab.create", label);
+            let response = self.headless_tab_create("headless.tab.create");
             if let Err(error) = response {
                 error!(
                     code = %error.code,
@@ -1005,18 +1004,14 @@ impl HeadlessServer {
         )
     }
 
-    fn headless_tab_create(
-        &mut self,
-        id: &'static str,
-        label: Option<String>,
-    ) -> Result<(), api::schema::ErrorBody> {
+    fn headless_tab_create(&mut self, id: &'static str) -> Result<(), api::schema::ErrorBody> {
         self.dispatch_headless_runtime_mutation(
             id,
             api::schema::Method::TabCreate(api::schema::TabCreateParams {
                 workspace_id: None,
                 cwd: None,
                 focus: true,
-                label,
+                label: None,
                 env: Default::default(),
             }),
         )
@@ -5370,7 +5365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn headless_deferred_named_tab_create_uses_runtime_events() {
+    async fn headless_deferred_tab_create_uses_runtime_events() {
         let event_hub = api::EventHub::default();
         let mut server = test_headless_server_with_event_hub(event_hub.clone());
         server
@@ -5380,11 +5375,9 @@ mod tests {
         let after_setup = event_hub.current_sequence();
 
         server.app.state.request_new_tab = true;
-        server.app.state.requested_new_tab_name = Some("ops".into());
 
         assert!(server.handle_deferred_requests_headless());
         assert!(!server.app.state.request_new_tab);
-        assert_eq!(server.app.state.requested_new_tab_name, None);
         let events = event_hub.events_after(after_setup);
         assert_eq!(
             events
@@ -5404,7 +5397,7 @@ mod tests {
                 _ => None,
             })
             .expect("tab created event");
-        assert_eq!(tab_created.label, "ops");
+        assert_eq!(tab_created.label, "2");
         shutdown_test_runtimes(&mut server);
     }
 
