@@ -8337,10 +8337,10 @@ next_tab = ""
         );
         assert!(!mobile_surface.contains("background"));
 
-        let foreground_terminal_area = Rect::new(26, 1, 94, 39);
+        let foreground_terminal_area = Rect::new(26, 1, 66, 39);
         let expected_pane_size = (
             foreground_terminal_area.height,
-            foreground_terminal_area.width.saturating_sub(1),
+            120u16.saturating_sub(26).saturating_sub(1),
         );
         assert_eq!(
             server.app.state.view.layout,
@@ -8399,7 +8399,14 @@ next_tab = ""
         server.resize_shared_runtime_to_effective_size();
 
         let terminal_area = server.app.state.view.terminal_area;
-        let expected = (terminal_area.height, terminal_area.width.saturating_sub(1));
+        let expected = (
+            terminal_area.height,
+            server
+                .effective_size
+                .0
+                .saturating_sub(server.app.state.view.sidebar_rect.width)
+                .saturating_sub(1),
+        );
         assert_eq!(
             server
                 .app

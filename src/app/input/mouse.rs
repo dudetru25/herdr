@@ -193,6 +193,16 @@ impl AppState {
             && mouse.column < sidebar.x + sidebar.width
             && mouse.row >= sidebar.y
             && mouse.row < sidebar.y + sidebar.height;
+        let in_file_tree = rect_contains(self.view.file_tree_rect, mouse.column, mouse.row);
+
+        if in_file_tree {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && self.on_file_tree_toggle(mouse.column, mouse.row)
+            {
+                self.file_tree_collapsed = !self.file_tree_collapsed;
+            }
+            return None;
+        }
 
         if self.handle_right_click_passthrough(terminal_runtimes, mouse, in_sidebar) {
             return None;
@@ -1670,6 +1680,14 @@ impl AppState {
         self.active
             .and_then(|i| self.runtime_for_pane_in_workspace(terminal_runtimes, i, pane_id))
             .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
+    }
+
+    pub(super) fn on_file_tree_toggle(&self, col: u16, row: u16) -> bool {
+        rect_contains(
+            crate::ui::file_tree_toggle_rect(self.view.file_tree_rect, self.file_tree_collapsed),
+            col,
+            row,
+        )
     }
 
     fn handle_right_click_passthrough(
@@ -3836,6 +3854,239 @@ mod tests {
         };
 
         assert_eq!(wheel_routing(input_state), WheelRouting::MouseReport);
+    }
+
+    #[tokio::test]
+    async fn file_tree_collapse_and_restore_preserve_pane_ids_and_content() {
+        let mut app = app_for_mouse_test();
+        let mut workspace = Workspace::test_new("test");
+        let pane_id = workspace.tabs[0].root_pane;
+        let second_pane = workspace.test_split(Direction::Horizontal);
+        workspace.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(40, 10, b"PERSISTENT"),
+        );
+        workspace.insert_test_runtime(
+            second_pane,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(40, 10, b"SECOND"),
+        );
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let area = Rect::new(0, 0, 120, 20);
+        crate::ui::compute_view(&mut app.state, area);
+        let before_ids = app.state.workspaces[0].tabs[0]
+            .panes
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let before_content = [
+            (
+                pane_id,
+                app.state
+                    .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+                    .expect("first test runtime")
+                    .visible_text(),
+            ),
+            (
+                second_pane,
+                app.state
+                    .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, second_pane)
+                    .expect("second test runtime")
+                    .visible_text(),
+            ),
+        ];
+
+        let expanded_toggle =
+            crate::ui::file_tree_toggle_rect(app.state.view.file_tree_rect, false);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            expanded_toggle.x,
+            expanded_toggle.y,
+        ));
+        assert!(app.state.file_tree_collapsed);
+        crate::ui::compute_view(&mut app.state, area);
+
+        let collapsed_toggle =
+            crate::ui::file_tree_toggle_rect(app.state.view.file_tree_rect, true);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            collapsed_toggle.x,
+            collapsed_toggle.y,
+        ));
+        assert!(!app.state.file_tree_collapsed);
+        crate::ui::compute_view(&mut app.state, area);
+
+        let after_ids = app.state.workspaces[0].tabs[0]
+            .panes
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let after_content = [
+            (
+                pane_id,
+                app.state
+                    .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+                    .expect("first test runtime after restore")
+                    .visible_text(),
+            ),
+            (
+                second_pane,
+                app.state
+                    .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, second_pane)
+                    .expect("second test runtime after restore")
+                    .visible_text(),
+            ),
+        ];
+        assert_eq!(after_ids, before_ids);
+        assert_eq!(after_content, before_content);
+    }
+
+    #[test]
+    fn file_tree_directory_row_click_does_not_expand() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-file-tree-row-click-{}-{}",
+            std::process::id(),
+            crate::terminal::TerminalId::alloc()
+        ));
+        std::fs::create_dir_all(root.join("src")).expect("checkout directory");
+        std::fs::write(root.join("src/nested.txt"), "nested").expect("nested file");
+
+        let mut workspace = Workspace::test_new("test");
+        workspace.identity_cwd = root.clone();
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let area = Rect::new(0, 0, 120, 20);
+        crate::ui::compute_view(&mut app.state, area);
+        let entries = match &app.state.file_tree.projection {
+            crate::app::state::FileTreeProjection::Ready { entries, .. } => entries,
+            other => panic!("expected checkout projection, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "src");
+
+        let file_tree = app.state.view.file_tree_rect;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            file_tree.x.saturating_add(2),
+            file_tree.y.saturating_add(2),
+        ));
+
+        let entries = match &app.state.file_tree.projection {
+            crate::app::state::FileTreeProjection::Ready { entries, .. } => entries,
+            other => panic!("expected checkout projection after row click, got {other:?}"),
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "src");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn mouse_space_switch_then_file_tree_collapse_preserves_selected_space_pane() {
+        let first_root = std::env::temp_dir().join(format!(
+            "herdr-file-tree-mouse-first-{}-{}",
+            std::process::id(),
+            crate::terminal::TerminalId::alloc()
+        ));
+        let second_root = std::env::temp_dir().join(format!(
+            "herdr-file-tree-mouse-second-{}-{}",
+            std::process::id(),
+            crate::terminal::TerminalId::alloc()
+        ));
+        std::fs::create_dir_all(&first_root).expect("first checkout");
+        std::fs::write(first_root.join("first.txt"), "first").expect("first file");
+        std::fs::create_dir_all(&second_root).expect("second checkout");
+        std::fs::write(second_root.join("second.txt"), "second").expect("second file");
+
+        let mut first = Workspace::test_new("first");
+        first.identity_cwd = first_root.clone();
+        let mut second = Workspace::test_new("second");
+        let second_pane = second.tabs[0].root_pane;
+        second.identity_cwd = second_root.clone();
+        second.insert_test_runtime(
+            second_pane,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(40, 10, b"SECOND-PANE"),
+        );
+
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![first, second];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let area = Rect::new(0, 0, 120, 20);
+        crate::ui::compute_view(&mut app.state, area);
+        let target_row = app.state.view.workspace_card_areas[1].rect.y;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            2,
+            target_row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, target_row));
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.selected, 1);
+
+        crate::ui::compute_view(&mut app.state, area);
+        assert!(matches!(
+            &app.state.file_tree.projection,
+            crate::app::state::FileTreeProjection::Ready { root, entries }
+                if root == &second_root
+                    && entries.iter().any(|entry| entry.name == "second.txt")
+                    && entries.iter().all(|entry| entry.name != "first.txt")
+        ));
+        let before_ids = app.state.workspaces[1].tabs[0]
+            .panes
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let before_content = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 1, second_pane)
+            .expect("selected space test runtime")
+            .visible_text();
+
+        let expanded_toggle =
+            crate::ui::file_tree_toggle_rect(app.state.view.file_tree_rect, false);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            expanded_toggle.x,
+            expanded_toggle.y,
+        ));
+        assert!(app.state.file_tree_collapsed);
+        crate::ui::compute_view(&mut app.state, area);
+
+        let collapsed_toggle =
+            crate::ui::file_tree_toggle_rect(app.state.view.file_tree_rect, true);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            collapsed_toggle.x,
+            collapsed_toggle.y,
+        ));
+        assert!(!app.state.file_tree_collapsed);
+        crate::ui::compute_view(&mut app.state, area);
+
+        let after_ids = app.state.workspaces[1].tabs[0]
+            .panes
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let after_content = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 1, second_pane)
+            .expect("selected space test runtime after restore")
+            .visible_text();
+        assert_eq!(after_ids, before_ids);
+        assert_eq!(after_content, before_content);
+
+        let _ = std::fs::remove_dir_all(first_root);
+        let _ = std::fs::remove_dir_all(second_root);
     }
 
     #[test]

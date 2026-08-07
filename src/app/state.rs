@@ -887,6 +887,164 @@ pub(crate) fn text_matches_query(query: &str, text: &str) -> bool {
         .all(|needle| haystack.contains(needle))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTreeEntryKind {
+    Directory,
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTreeEntry {
+    pub name: String,
+    pub kind: FileTreeEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileTreeError {
+    NoSelectedSpace,
+    NoCheckout,
+    RemoteSpace,
+    CheckoutMissing {
+        path: std::path::PathBuf,
+    },
+    CheckoutNotDirectory {
+        path: std::path::PathBuf,
+    },
+    ReadDirectory {
+        path: std::path::PathBuf,
+        message: String,
+    },
+    ReadEntry {
+        path: std::path::PathBuf,
+        message: String,
+    },
+    InvalidEntryName {
+        path: std::path::PathBuf,
+    },
+}
+
+impl std::fmt::Display for FileTreeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSelectedSpace => f.write_str("no space selected"),
+            Self::NoCheckout => f.write_str("selected space has no local checkout"),
+            Self::RemoteSpace => f.write_str("selected space has no local checkout"),
+            Self::CheckoutMissing { path } => {
+                write!(f, "checkout is unavailable: {}", path.display())
+            }
+            Self::CheckoutNotDirectory { path } => {
+                write!(f, "checkout is not a directory: {}", path.display())
+            }
+            Self::ReadDirectory { path, message } => {
+                write!(f, "cannot read checkout {}: {message}", path.display())
+            }
+            Self::ReadEntry { path, message } => {
+                write!(f, "cannot read entry {}: {message}", path.display())
+            }
+            Self::InvalidEntryName { path } => {
+                write!(f, "checkout contains a non-text entry: {}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for FileTreeError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileTreeProjection {
+    Ready {
+        root: std::path::PathBuf,
+        entries: Vec<FileTreeEntry>,
+    },
+    Unavailable {
+        error: FileTreeError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTreeState {
+    pub selected_space_id: Option<String>,
+    pub checkout_path: Option<std::path::PathBuf>,
+    pub projection: FileTreeProjection,
+}
+
+impl Default for FileTreeState {
+    fn default() -> Self {
+        Self {
+            selected_space_id: None,
+            checkout_path: None,
+            projection: FileTreeProjection::Unavailable {
+                error: FileTreeError::NoSelectedSpace,
+            },
+        }
+    }
+}
+
+fn read_file_tree_directory(root: &std::path::Path) -> Result<Vec<FileTreeEntry>, FileTreeError> {
+    let metadata = std::fs::metadata(root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            FileTreeError::CheckoutMissing {
+                path: root.to_path_buf(),
+            }
+        } else {
+            FileTreeError::ReadDirectory {
+                path: root.to_path_buf(),
+                message: error.to_string(),
+            }
+        }
+    })?;
+    if !metadata.is_dir() {
+        return Err(FileTreeError::CheckoutNotDirectory {
+            path: root.to_path_buf(),
+        });
+    }
+
+    let mut entries = Vec::new();
+    let directory = std::fs::read_dir(root).map_err(|error| FileTreeError::ReadDirectory {
+        path: root.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    for entry in directory {
+        let entry = entry.map_err(|error| FileTreeError::ReadDirectory {
+            path: root.to_path_buf(),
+            message: error.to_string(),
+        })?;
+        let path = entry.path();
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| FileTreeError::InvalidEntryName { path: path.clone() })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| FileTreeError::ReadEntry {
+                path: path.clone(),
+                message: error.to_string(),
+            })?;
+        entries.push(FileTreeEntry {
+            name,
+            kind: if file_type.is_dir() {
+                FileTreeEntryKind::Directory
+            } else {
+                FileTreeEntryKind::File
+            },
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        let left_kind = matches!(left.kind, FileTreeEntryKind::File);
+        let right_kind = matches!(right.kind, FileTreeEntryKind::File);
+        left_kind
+            .cmp(&right_kind)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(entries)
+}
+
+fn read_file_tree_root(root: &std::path::Path) -> Result<Vec<FileTreeEntry>, FileTreeError> {
+    read_file_tree_directory(root)
+}
+
 /// Computed view geometry — derived from AppState + terminal size.
 /// Updated before each render, consumed by render and mouse handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -898,6 +1056,7 @@ pub enum ViewLayout {
 pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
+    pub file_tree_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
@@ -1655,6 +1814,8 @@ pub struct AppState {
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
     pub sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
+    pub file_tree_collapsed: bool,
+    pub file_tree: FileTreeState,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
     pub agent_panel_sort: AgentPanelSort,
@@ -2007,6 +2168,7 @@ impl AppState {
             view: ViewState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
+                file_tree_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
@@ -2046,6 +2208,8 @@ impl AppState {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
+            file_tree_collapsed: false,
+            file_tree: FileTreeState::default(),
             sidebar_section_split: 0.5,
             agent_panel_sort: AgentPanelSort::Spaces,
             agent_view_override: None,
@@ -2469,6 +2633,83 @@ impl AppState {
     }
 }
 
+impl AppState {
+    pub(crate) fn refresh_selected_space_file_tree(
+        &mut self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ) {
+        let selected_space = self.workspaces.get(self.selected).map(|workspace| {
+            let checkout_path = if workspace.is_machine() {
+                None
+            } else {
+                workspace
+                    .worktree_space()
+                    .map(|space| space.checkout_path.clone())
+                    .or_else(|| workspace.git_space().map(|space| space.repo_root.clone()))
+                    .or_else(|| {
+                        workspace.resolved_identity_cwd_from(&self.terminals, terminal_runtimes)
+                    })
+            };
+            (workspace.id.clone(), workspace.is_machine(), checkout_path)
+        });
+
+        let Some((workspace_id, is_machine, checkout_path)) = selected_space else {
+            if self.file_tree.selected_space_id.is_none()
+                && self.file_tree.checkout_path.is_none()
+                && matches!(
+                    &self.file_tree.projection,
+                    FileTreeProjection::Unavailable {
+                        error: FileTreeError::NoSelectedSpace
+                    }
+                )
+            {
+                return;
+            }
+            self.file_tree = FileTreeState::default();
+            return;
+        };
+
+        let checkout_is_usable = match checkout_path.as_deref() {
+            Some(path) => match std::fs::metadata(path) {
+                Ok(metadata) => metadata.is_dir(),
+                Err(_) => false,
+            },
+            None => true,
+        };
+        if self.file_tree.selected_space_id.as_deref() == Some(workspace_id.as_str())
+            && self.file_tree.checkout_path == checkout_path
+            && checkout_is_usable
+        {
+            return;
+        }
+
+        let projection = if is_machine {
+            FileTreeProjection::Unavailable {
+                error: FileTreeError::RemoteSpace,
+            }
+        } else {
+            match checkout_path.as_deref() {
+                Some(path) => match read_file_tree_root(path) {
+                    Ok(entries) => FileTreeProjection::Ready {
+                        root: path.to_path_buf(),
+                        entries,
+                    },
+                    Err(error) => FileTreeProjection::Unavailable { error },
+                },
+                None => FileTreeProjection::Unavailable {
+                    error: FileTreeError::NoCheckout,
+                },
+            }
+        };
+
+        self.file_tree = FileTreeState {
+            selected_space_id: Some(workspace_id),
+            checkout_path,
+            projection,
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2770,5 +3011,69 @@ mod tests {
             manage.items(),
             vec!["Rename", "Close", "Re-scan sub-spaces", "Stop being parent"]
         );
+    }
+
+    #[test]
+    fn selected_space_file_tree_retargets_and_clears_previous_files_for_unavailable_checkout() {
+        let first_root = std::env::temp_dir().join(format!(
+            "herdr-file-tree-first-{}-{}",
+            std::process::id(),
+            crate::terminal::TerminalId::alloc()
+        ));
+        let second_root = std::env::temp_dir().join(format!(
+            "herdr-file-tree-second-{}-{}",
+            std::process::id(),
+            crate::terminal::TerminalId::alloc()
+        ));
+        std::fs::create_dir_all(&first_root).expect("first checkout");
+        std::fs::write(first_root.join("first.txt"), "first").expect("first file");
+        std::fs::create_dir_all(&second_root).expect("second checkout");
+        std::fs::write(second_root.join("second.txt"), "second").expect("second file");
+
+        let mut first = crate::workspace::Workspace::test_new("first");
+        first.identity_cwd = first_root.clone();
+        let mut second = crate::workspace::Workspace::test_new("second");
+        second.identity_cwd = second_root.clone();
+
+        let mut app = AppState::test_new();
+        app.workspaces = vec![first, second];
+        app.active = Some(0);
+        app.selected = 0;
+        app.ensure_test_terminals();
+        app.refresh_selected_space_file_tree(&crate::terminal::TerminalRuntimeRegistry::new());
+
+        let first_projection = match &app.file_tree.projection {
+            FileTreeProjection::Ready { root, entries } => (root.clone(), entries.clone()),
+            other => panic!("expected first checkout projection, got {other:?}"),
+        };
+        assert_eq!(first_projection.0, first_root);
+        assert!(first_projection
+            .1
+            .iter()
+            .any(|entry| entry.name == "first.txt"));
+
+        app.selected = 1;
+        app.refresh_selected_space_file_tree(&crate::terminal::TerminalRuntimeRegistry::new());
+        assert!(matches!(
+            &app.file_tree.projection,
+            FileTreeProjection::Ready { root, entries }
+                if root == &second_root
+                    && entries.iter().any(|entry| entry.name == "second.txt")
+                    && entries.iter().all(|entry| entry.name != "first.txt")
+        ));
+
+        std::fs::remove_dir_all(&second_root).expect("remove second checkout");
+        app.refresh_selected_space_file_tree(&crate::terminal::TerminalRuntimeRegistry::new());
+        assert!(matches!(
+            &app.file_tree.projection,
+            FileTreeProjection::Unavailable { .. }
+        ));
+        assert_eq!(
+            app.file_tree.selected_space_id.as_deref(),
+            Some(app.workspaces[1].id.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(first_root);
+        let _ = std::fs::remove_dir_all(second_root);
     }
 }
