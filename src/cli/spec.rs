@@ -243,6 +243,11 @@ fn machine_command() -> Command {
     Command::new("machine")
         .about("Inspect configured SSH machines")
         .subcommand(Command::new("list").about("List configured SSH machines"))
+        .subcommand(
+            Command::new("ssh-hosts")
+                .about("List importable SSH hosts from the user config")
+                .arg(json_flag()),
+        )
 }
 
 fn worktree_command() -> Command {
@@ -1138,6 +1143,27 @@ mod tests {
                 .map(crate::integration::integration_target_label)
                 .map(str::to_string)
         );
+    }
+
+    #[test]
+    fn spec_includes_machine_ssh_hosts_json_flag() {
+        let root = super::command();
+        let command = command_path(&root, &["machine", "ssh-hosts"]);
+        assert!(has_option(command, "json"));
+        let mut help = Vec::new();
+        super::write_requested_help(
+            &[
+                "herdr".to_string(),
+                "machine".to_string(),
+                "ssh-hosts".to_string(),
+                "--help".to_string(),
+            ],
+            &mut help,
+        )
+        .unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("Usage: herdr machine ssh-hosts [OPTIONS]"));
+        assert!(help.contains("--json"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use super::events::EventEnvelope;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
 };
-use super::machines::MachineInfo;
+use super::machines::{MachineInfo, SshHostInfo};
 use super::panes::{
     LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
     PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult, PaneResizeResult,
@@ -69,6 +69,9 @@ pub enum ResponseResult {
     },
     MachineList {
         machines: Vec<MachineInfo>,
+    },
+    MachineSshHosts {
+        hosts: Vec<SshHostInfo>,
     },
     MachineAdded {
         machine: MachineInfo,

@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::api::schema::{MachineAddParams, MachineInfo, ResponseResult};
+use crate::api::schema::{MachineAddParams, MachineInfo, ResponseResult, SshHostInfo};
 use crate::app::App;
 use crate::config::{MachineConfig, MachineConfigEditError};
 
@@ -149,6 +149,34 @@ impl App {
         )
     }
 
+    pub(super) fn handle_machine_ssh_hosts(&mut self, id: String) -> String {
+        let path = match crate::ssh_config::user_config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                return encode_error(id, "ssh_config_unavailable", error.to_string());
+            }
+        };
+        let hosts = match crate::ssh_config::parse_file(&path) {
+            Ok(hosts) => hosts,
+            Err(error) => {
+                return encode_error(id, "ssh_config_unavailable", error.to_string());
+            }
+        };
+        let hosts = hosts
+            .into_iter()
+            .map(|host| SshHostInfo {
+                already_configured: self
+                    .state
+                    .machines
+                    .iter()
+                    .any(|machine| machine.name == host.alias || machine.target == host.alias),
+                alias: host.alias,
+                target: host.target_hint,
+            })
+            .collect();
+        encode_success(id, ResponseResult::MachineSshHosts { hosts })
+    }
+
     pub(super) fn handle_machine_add(&mut self, id: String, params: MachineAddParams) -> String {
         let machine = MachineConfig {
             name: params.name.trim().to_string(),
@@ -200,9 +228,25 @@ impl App {
 mod tests {
     use super::*;
     use crate::{
-        api::schema::{ErrorResponse, MachineAddParams, SuccessResponse},
+        api::schema::{ErrorResponse, MachineAddParams, ResponseResult, SuccessResponse},
         config::{Config, MachineConfig},
     };
+
+    fn with_test_ssh_home<T>(home: &std::path::Path, operation: impl FnOnce() -> T) -> T {
+        let _guard = crate::ssh_config::test_env_lock().lock().unwrap();
+        #[cfg(windows)]
+        let variable = "USERPROFILE";
+        #[cfg(not(windows))]
+        let variable = "HOME";
+        let previous = std::env::var_os(variable);
+        std::env::set_var(variable, home);
+        let result = operation();
+        match previous {
+            Some(value) => std::env::set_var(variable, value),
+            None => std::env::remove_var(variable),
+        }
+        result
+    }
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir()
@@ -240,6 +284,73 @@ mod tests {
             panic!("expected machine list");
         };
         assert_eq!(machines[0].target, "replacement");
+    }
+
+    #[test]
+    fn machine_ssh_hosts_marks_configured_aliases_from_live_registry() {
+        let home =
+            std::env::temp_dir().join(format!("herdr-machine-ssh-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(
+            home.join(".ssh/config"),
+            "Host build\n  HostName build.example.test\nHost fresh\n  HostName fresh.example.test\n",
+        )
+        .unwrap();
+        let config = Config {
+            machines: vec![MachineConfig {
+                name: "build".into(),
+                target: "build".into(),
+                cwd: None,
+            }],
+            ..Config::default()
+        };
+
+        with_test_ssh_home(&home, || {
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+            let response = app.handle_machine_ssh_hosts("ssh-hosts".into());
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::MachineSshHosts { hosts } = success.result else {
+                panic!("expected ssh host list: {response}");
+            };
+
+            assert_eq!(hosts.len(), 2);
+            assert_eq!(hosts[0].alias, "build");
+            assert_eq!(hosts[0].target, "build.example.test");
+            assert!(hosts[0].already_configured);
+            assert_eq!(hosts[1].alias, "fresh");
+            assert_eq!(hosts[1].target, "fresh.example.test");
+            assert!(!hosts[1].already_configured);
+        });
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn machine_ssh_hosts_reports_missing_config_as_api_error() {
+        let home = std::env::temp_dir().join(format!(
+            "herdr-machine-ssh-hosts-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+
+        with_test_ssh_home(&home, || {
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(
+                &Config::default(),
+                true,
+                None,
+                api_rx,
+                crate::api::EventHub::default(),
+            );
+            let response = app.handle_machine_ssh_hosts("ssh-hosts-missing".into());
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "ssh_config_unavailable");
+            assert!(error.error.message.contains(".ssh/config"));
+        });
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

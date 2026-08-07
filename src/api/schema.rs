@@ -71,6 +71,8 @@ pub enum Method {
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "machine.list")]
     MachineList(EmptyParams),
+    #[serde(rename = "machine.ssh_hosts")]
+    MachineSshHosts(EmptyParams),
     #[serde(rename = "machine.add")]
     MachineAdd(MachineAddParams),
     #[serde(rename = "workspace.list")]

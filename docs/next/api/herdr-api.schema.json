@@ -5084,6 +5084,22 @@
         {
           "properties": {
             "method": {
+              "const": "machine.ssh_hosts",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "machine.add",
               "type": "string"
             },
@@ -9378,6 +9394,25 @@
             },
             {
               "properties": {
+                "hosts": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/SshHostInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "machine_ssh_hosts",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "hosts"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "machine": {
                   "$ref": "#/schemas/success_response/$defs/MachineInfo"
                 },
@@ -10571,6 +10606,25 @@
             "down"
           ],
           "type": "string"
+        },
+        "SshHostInfo": {
+          "properties": {
+            "alias": {
+              "type": "string"
+            },
+            "already_configured": {
+              "type": "boolean"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "alias",
+            "target",
+            "already_configured"
+          ],
+          "type": "object"
         },
         "TabInfo": {
           "properties": {

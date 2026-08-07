@@ -355,6 +355,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::SessionSnapshot(_) => "session.snapshot",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::MachineList(_) => "machine.list",
+        Method::MachineSshHosts(_) => "machine.ssh_hosts",
         Method::MachineAdd(_) => "machine.add",
         Method::WorkspaceList(_) => "workspace.list",
         Method::WorkspaceGet(_) => "workspace.get",

@@ -16,6 +16,13 @@ pub struct MachineInfo {
     pub cwd: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SshHostInfo {
+    pub alias: String,
+    pub target: String,
+    pub already_configured: bool,
+}
+
 impl From<&crate::config::MachineConfig> for MachineInfo {
     fn from(machine: &crate::config::MachineConfig) -> Self {
         Self {
@@ -29,7 +36,7 @@ impl From<&crate::config::MachineConfig> for MachineInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::schema::{Method, Request, ResponseResult};
+    use crate::api::schema::{EmptyParams, Method, Request, ResponseResult};
 
     #[test]
     fn machine_add_request_and_response_round_trip() {
@@ -55,6 +62,32 @@ mod tests {
                 target: "builder@example.test".to_string(),
                 cwd: Some("~/src/herdr".to_string()),
             },
+        };
+        let encoded = serde_json::to_string(&result).unwrap();
+        let decoded: ResponseResult = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn machine_ssh_hosts_request_and_response_round_trip() {
+        let request = Request {
+            id: "ssh-hosts".to_string(),
+            method: Method::MachineSshHosts(EmptyParams::default()),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["method"],
+            "machine.ssh_hosts"
+        );
+
+        let result = ResponseResult::MachineSshHosts {
+            hosts: vec![SshHostInfo {
+                alias: "build".to_string(),
+                target: "builder@example.test:2222".to_string(),
+                already_configured: true,
+            }],
         };
         let encoded = serde_json::to_string(&result).unwrap();
         let decoded: ResponseResult = serde_json::from_str(&encoded).unwrap();
