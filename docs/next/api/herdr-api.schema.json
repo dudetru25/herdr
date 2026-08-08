@@ -1098,6 +1098,15 @@
               "minimum": 0,
               "type": "integer"
             },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "tab_count": {
               "format": "uint",
               "minimum": 0,
@@ -1135,7 +1144,8 @@
             "pane_count",
             "tab_count",
             "active_tab_id",
-            "agent_status"
+            "agent_status",
+            "stale"
           ],
           "type": "object"
         },
@@ -11125,6 +11135,15 @@
               "minimum": 0,
               "type": "integer"
             },
+            "stale": {
+              "type": "boolean"
+            },
+            "stale_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "tab_count": {
               "format": "uint",
               "minimum": 0,
@@ -11162,7 +11181,8 @@
             "pane_count",
             "tab_count",
             "active_tab_id",
-            "agent_status"
+            "agent_status",
+            "stale"
           ],
           "type": "object"
         },

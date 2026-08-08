@@ -185,6 +185,8 @@ pub struct Workspace {
     pub machine: Option<String>,
     /// Fallback workspace identity source for tests, old snapshots, or missing runtimes.
     pub identity_cwd: PathBuf,
+    /// Whether the last explicit identity-path check found the workspace path missing.
+    pub(crate) stale: bool,
     /// CWD from which the cached automatic label and Git metadata were derived.
     pub(crate) cached_identity_cwd: PathBuf,
     /// Automatic workspace label cached outside the render path.
@@ -256,11 +258,13 @@ impl Workspace {
         public_pane_numbers.insert(root_pane, 1);
         let (cached_git_space, cached_auto_label, cached_git_status_key) =
             discover_workspace_git_identity(&identity_cwd);
+        let stale = identity_cwd.canonicalize().is_err();
         Self {
             id,
             custom_name: label,
             machine: None,
             identity_cwd: identity_cwd.clone(),
+            stale,
             cached_identity_cwd: identity_cwd.clone(),
             cached_auto_label,
             cached_git_status_key,
@@ -509,6 +513,7 @@ impl Workspace {
                 custom_name: machine.clone(),
                 machine,
                 identity_cwd: initial_cwd.clone(),
+                stale: false,
                 cached_identity_cwd: initial_cwd.clone(),
                 cached_auto_label,
                 cached_git_status_key,
@@ -1218,6 +1223,17 @@ impl Workspace {
         self.machine.is_some()
     }
 
+    pub fn is_stale(&self) -> bool {
+        self.stale
+    }
+
+    pub(crate) fn refresh_stale_state(&mut self) -> bool {
+        let stale = !self.is_machine() && self.identity_cwd.canonicalize().is_err();
+        let changed = self.stale != stale;
+        self.stale = stale;
+        changed
+    }
+
     #[cfg(test)]
     pub fn resolved_identity_cwd(&self) -> Option<PathBuf> {
         Some(self.identity_cwd.clone())
@@ -1439,6 +1455,7 @@ impl Workspace {
             custom_name: Some(name.to_string()),
             machine: None,
             identity_cwd: identity_cwd.clone(),
+            stale: false,
             cached_identity_cwd: identity_cwd.clone(),
             cached_auto_label: fallback_label_from_cwd(&identity_cwd),
             cached_git_status_key: identity_cwd.clone(),
@@ -1887,6 +1904,26 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove cwd after cache admission");
 
         assert_eq!(ws.display_name(), "cached-repo");
+    }
+
+    #[test]
+    fn missing_identity_path_is_reported_as_stale_after_an_explicit_refresh() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let stale_path = std::env::temp_dir().join(format!(
+            "herdr-workspace-stale-{}-{stamp}",
+            std::process::id()
+        ));
+        let mut ws = Workspace::test_new("stale");
+        ws.identity_cwd = stale_path.clone();
+
+        assert!(!ws.is_stale());
+        assert!(ws.refresh_stale_state());
+        assert!(ws.is_stale());
+        assert!(!ws.refresh_stale_state());
+        assert_eq!(ws.identity_cwd, stale_path);
     }
 
     #[test]

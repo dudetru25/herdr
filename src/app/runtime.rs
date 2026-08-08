@@ -7,7 +7,7 @@ use crossterm::terminal;
 
 use super::{
     background_update_check_enabled, App, AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL,
-    RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
+    RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL, WORKSPACE_STALENESS_REFRESH_INTERVAL,
 };
 fn retain_custom_command_after_wait(
     pid: u32,
@@ -277,6 +277,23 @@ impl App {
         false
     }
 
+    pub(crate) fn refresh_workspace_staleness_if_due(&mut self, now: Instant) -> bool {
+        if now < self.next_workspace_staleness_refresh {
+            return false;
+        }
+
+        self.next_workspace_staleness_refresh = now + WORKSPACE_STALENESS_REFRESH_INTERVAL;
+        self.state.refresh_workspace_staleness()
+    }
+
+    fn workspace_staleness_refresh_deadline(&self) -> Option<Instant> {
+        self.state
+            .workspaces
+            .iter()
+            .any(|workspace| !workspace.is_machine())
+            .then_some(self.next_workspace_staleness_refresh)
+    }
+
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
         let mut resized = false;
@@ -351,6 +368,7 @@ impl App {
 
         changed |= self.clear_due_selection_highlight(now);
 
+        changed |= self.refresh_workspace_staleness_if_due(now);
         self.start_git_status_refresh_if_due(now);
 
         if self
@@ -592,6 +610,9 @@ impl App {
             self.copy_feedback_deadline,
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
+                .flatten(),
+            include_git_refresh
+                .then(|| self.workspace_staleness_refresh_deadline())
                 .flatten(),
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,

@@ -13,6 +13,7 @@ use super::responses::{encode_error, encode_success};
 
 impl App {
     pub(super) fn handle_workspace_list(&mut self, id: String) -> String {
+        self.state.refresh_workspace_staleness();
         encode_success(
             id,
             ResponseResult::WorkspaceList {
@@ -28,6 +29,7 @@ impl App {
         let Some(_) = self.state.workspaces.get(index) else {
             return workspace_not_found(id, &target.workspace_id);
         };
+        self.state.refresh_workspace_staleness();
 
         encode_success(
             id,
@@ -614,6 +616,91 @@ mod tests {
         app
     }
 
+    #[test]
+    fn workspace_reads_refresh_staleness_after_checkout_removal_and_retarget() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "old");
+        let new_path = test_git_checkout(&fixture.root, "new");
+        let (mut app, _event_hub, workspace_id) = retarget_test_app(&old_path);
+
+        std::fs::remove_dir_all(&old_path).unwrap();
+
+        let get_response = app.handle_api_request(Request {
+            id: "get-stale".into(),
+            method: Method::WorkspaceGet(WorkspaceTarget {
+                workspace_id: workspace_id.clone(),
+            }),
+        });
+        let get_success: SuccessResponse = serde_json::from_str(&get_response).unwrap();
+        let ResponseResult::WorkspaceInfo {
+            workspace: get_workspace,
+        } = get_success.result
+        else {
+            panic!("expected workspace.get response");
+        };
+        assert!(get_workspace.stale);
+        assert_eq!(
+            get_workspace.stale_path.as_deref(),
+            Some(old_path.to_str().unwrap())
+        );
+
+        let list_response = app.handle_api_request(Request {
+            id: "list-stale".into(),
+            method: Method::WorkspaceList(crate::api::schema::EmptyParams::default()),
+        });
+        let list_success: SuccessResponse = serde_json::from_str(&list_response).unwrap();
+        let ResponseResult::WorkspaceList { workspaces } = list_success.result else {
+            panic!("expected workspace.list response");
+        };
+        assert_eq!(workspaces.len(), 1);
+        assert!(workspaces[0].stale);
+        assert_eq!(
+            workspaces[0].stale_path.as_deref(),
+            Some(old_path.to_str().unwrap())
+        );
+
+        let retarget_response = app.handle_api_request(Request {
+            id: "retarget-valid".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id: workspace_id.clone(),
+                path: new_path.display().to_string(),
+            }),
+        });
+        let retarget_success: SuccessResponse = serde_json::from_str(&retarget_response).unwrap();
+        let ResponseResult::WorkspaceInfo {
+            workspace: retarget_workspace,
+        } = retarget_success.result
+        else {
+            panic!("expected workspace.retarget response");
+        };
+        assert!(!retarget_workspace.stale);
+        assert!(retarget_workspace.stale_path.is_none());
+
+        let get_response = app.handle_api_request(Request {
+            id: "get-current".into(),
+            method: Method::WorkspaceGet(WorkspaceTarget { workspace_id }),
+        });
+        let get_success: SuccessResponse = serde_json::from_str(&get_response).unwrap();
+        let ResponseResult::WorkspaceInfo { workspace } = get_success.result else {
+            panic!("expected workspace.get response");
+        };
+        assert!(!workspace.stale);
+        assert!(workspace.stale_path.is_none());
+
+        let list_response = app.handle_api_request(Request {
+            id: "list-current".into(),
+            method: Method::WorkspaceList(crate::api::schema::EmptyParams::default()),
+        });
+        let list_success: SuccessResponse = serde_json::from_str(&list_response).unwrap();
+        let ResponseResult::WorkspaceList { workspaces } = list_success.result else {
+            panic!("expected workspace.list response");
+        };
+        assert_eq!(workspaces.len(), 1);
+        assert!(!workspaces[0].stale);
+        assert!(workspaces[0].stale_path.is_none());
+        assert!(app.state.session_dirty);
+    }
+
     fn test_git_checkout(root: &Path, name: &str) -> PathBuf {
         let checkout = root.join(name);
         let output = std::process::Command::new("git")
@@ -895,6 +982,7 @@ mod tests {
         ));
         assert_eq!(app.state.workspaces[0].identity_cwd, new_path);
         assert_eq!(app.state.workspaces[0].cached_identity_cwd, new_path);
+        assert!(!app.state.workspaces[0].is_stale());
         assert!(app
             .state
             .terminal_ids_for_workspace(0)

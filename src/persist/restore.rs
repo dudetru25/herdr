@@ -454,6 +454,7 @@ fn restore_workspace(
             custom_name: snap.custom_name.clone().or_else(|| snap.machine.clone()),
             machine: snap.machine.clone(),
             identity_cwd: identity_cwd.clone(),
+            stale: false,
             cached_identity_cwd: identity_cwd,
             cached_auto_label,
             cached_git_status_key,

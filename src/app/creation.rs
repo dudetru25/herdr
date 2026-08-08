@@ -452,6 +452,7 @@ impl App {
         self.state.terminals.insert(terminal.id.clone(), terminal);
         self.state.workspaces.push(ws);
         let idx = self.state.workspaces.len() - 1;
+        self.state.workspaces[idx].refresh_stale_state();
         self.state
             .remove_alias_shadowed_by_new_pane(self.state.workspaces[idx].tabs[0].root_pane);
         let workspace_id = self.state.workspaces[idx].id.clone();
@@ -683,6 +684,7 @@ impl App {
     pub(super) fn workspace_info(&self, index: usize) -> crate::api::schema::WorkspaceInfo {
         let ws = &self.state.workspaces[index];
         let (agg_state, seen) = ws.aggregate_state(&self.state.terminals);
+        let stale_path = ws.is_stale().then(|| ws.identity_cwd.display().to_string());
         crate::api::schema::WorkspaceInfo {
             workspace_id: self.public_workspace_id(index),
             number: index + 1,
@@ -695,6 +697,8 @@ impl App {
             }),
             agent_status: pane_agent_status(agg_state, seen),
             machine: ws.machine.clone(),
+            stale: ws.is_stale(),
+            stale_path,
             tokens: ws.metadata_tokens.values(),
             worktree: ws
                 .worktree_space()

@@ -151,7 +151,11 @@ fn collect_agent_panel_entries_with_runtimes(
         .enumerate()
         .flat_map(|(ws_idx, ws)| {
             let multi_tab = ws.tabs.len() > 1;
-            let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
+            let workspace_label = if ws.is_stale() {
+                format!("stale: {}", ws.identity_cwd.display())
+            } else {
+                ws.display_name_from(&app.terminals, terminal_runtimes)
+            };
             ws.pane_details(&app.terminals)
                 .into_iter()
                 .map(move |detail| {
@@ -211,7 +215,9 @@ fn worktree_member_is_folder_placed(ws: &crate::workspace::Workspace) -> bool {
 fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, _indent: u8) -> u16 {
     let (state, seen) = ws.aggregate_state(&app.terminals);
     let suppress_git_details = suppress_grouped_git_details(ws);
-    let label = if suppress_git_details {
+    let label = if ws.is_stale() {
+        format!("stale: {}", ws.identity_cwd.display())
+    } else if suppress_git_details {
         grouped_child_display_label(
             &ws.display_name_from_terminals(&app.terminals),
             ws.branch().as_deref(),
@@ -1564,7 +1570,9 @@ fn render_workspace_list(
 
         let label = ws.display_name_from(&app.terminals, terminal_runtimes);
         let suppress_git_details = suppress_grouped_git_details(ws);
-        let display_label = if suppress_git_details {
+        let display_label = if ws.is_stale() {
+            format!("stale: {}", ws.identity_cwd.display())
+        } else if suppress_git_details {
             grouped_child_display_label(&label, ws.branch().as_deref(), ws.custom_name.is_some())
         } else {
             label
@@ -2018,6 +2026,53 @@ rows = [[{ token = "workspace", bold = false }, { token = "agent", dim = false }
             .add_modifier
             .intersects(Modifier::BOLD | Modifier::DIM));
         assert_eq!(inactive.bg, Some(ratatui::style::Color::Reset));
+    }
+
+    #[test]
+    fn scheduled_refresh_makes_removed_checkout_visible_as_stale() {
+        let mut workspace = Workspace::test_new("stale");
+        let checkout = std::env::temp_dir().join(format!(
+            "herdr-sidebar-stale-{}-{}",
+            std::process::id(),
+            workspace.id
+        ));
+        std::fs::create_dir_all(&checkout).expect("test checkout should be created");
+        workspace.identity_cwd = checkout.clone();
+        workspace.cached_identity_cwd = checkout.clone();
+        assert!(!workspace.is_stale());
+
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.mode = Mode::Terminal;
+
+        std::fs::remove_dir_all(&checkout).expect("test checkout should be removed");
+        app.handle_scheduled_tasks(
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+            false,
+        );
+
+        assert!(
+            app.state.workspaces[0].is_stale(),
+            "the scheduled TUI update should observe a removed checkout"
+        );
+
+        let area = Rect::new(0, 0, 42, 20);
+        app.state.view.workspace_card_areas = compute_workspace_card_areas(&app.state, area);
+        let row = app.state.view.workspace_card_areas[0].rect.y;
+        let mut terminal = Terminal::new(TestBackend::new(42, 20)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app.state, &app.terminal_runtimes, frame, area))
+            .unwrap();
+
+        let rendered = row_text(terminal.backend().buffer(), row, 41);
+        assert!(rendered.contains("stale:"), "rendered row: {rendered:?}");
     }
 
     #[test]

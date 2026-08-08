@@ -1311,6 +1311,14 @@ impl AppState {
         self.visible_workspace_order().get(position).copied()
     }
 
+    pub(crate) fn refresh_workspace_staleness(&mut self) -> bool {
+        let mut changed = false;
+        for workspace in &mut self.workspaces {
+            changed |= workspace.refresh_stale_state();
+        }
+        changed
+    }
+
     pub(crate) fn move_selected_workspace_by_visible_delta(&mut self, delta: isize) {
         if self.workspaces.is_empty() {
             return;
@@ -1358,6 +1366,7 @@ impl AppState {
 
         let workspace = &mut self.workspaces[ws_idx];
         workspace.identity_cwd = path.clone();
+        workspace.refresh_stale_state();
         workspace.cached_identity_cwd = path.clone();
         workspace.cached_auto_label = cached_auto_label;
         workspace.cached_git_status_key = cached_git_status_key;

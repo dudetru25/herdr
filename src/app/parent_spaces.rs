@@ -317,12 +317,14 @@ impl App {
         ws_idx: usize,
         create_parent: bool,
     ) -> Result<ParentSpaceActionOutcome, ParentSpaceActionError> {
-        let Some(workspace) = self.state.workspaces.get(ws_idx) else {
+        if self.state.workspaces.get(ws_idx).is_none() {
             return Err(ParentSpaceActionError::new(
                 "workspace_not_found",
                 "workspace not found",
             ));
-        };
+        }
+        self.state.refresh_workspace_staleness();
+        let workspace = &self.state.workspaces[ws_idx];
         let parent_workspace_id = workspace.id.clone();
         let membership = if create_parent {
             let root = workspace.identity_cwd.canonicalize().map_err(|err| {
@@ -532,6 +534,13 @@ mod tests {
         stale.identity_cwd = fixture.root.join("removed-workspace");
         let mut state = AppState::test_new();
         state.workspaces = vec![parent, stale];
+        let workspace_ids = state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        state.refresh_workspace_staleness();
+        assert!(state.workspaces[1].is_stale());
 
         let directories = immediate_subdirectories(&fixture.root).unwrap();
         let plan = state.plan_parent_space_scan(0, &directories).unwrap();
@@ -540,6 +549,18 @@ mod tests {
         assert_eq!(
             plan.missing_directories,
             vec![child_path.canonicalize().unwrap()]
+        );
+        assert_eq!(
+            state
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect::<Vec<_>>(),
+            workspace_ids
+        );
+        assert_eq!(
+            state.workspaces[1].identity_cwd,
+            fixture.root.join("removed-workspace")
         );
     }
 
