@@ -301,9 +301,6 @@ impl App {
                     leave_navigate_mode(&mut self.state);
                 }
             }
-            NavigateAction::RenameTab => {
-                super::modal::open_rename_active_tab(&mut self.state, false)
-            }
             NavigateAction::PreviousTab => {
                 if let Some(tab_idx) = self.relative_tab(-1) {
                     self.focus_tab_idx_via_api(tab_idx);
@@ -1342,7 +1339,6 @@ pub(crate) enum NavigateAction {
     PreviousAgent,
     NextAgent,
     NewTab,
-    RenameTab,
     PreviousTab,
     NextTab,
     CloseTab,
@@ -1483,7 +1479,6 @@ fn non_indexed_action_for_key(
         (&kb.previous_agent, NavigateAction::PreviousAgent),
         (&kb.next_agent, NavigateAction::NextAgent),
         (&kb.new_tab, NavigateAction::NewTab),
-        (&kb.rename_tab, NavigateAction::RenameTab),
         (&kb.previous_tab, NavigateAction::PreviousTab),
         (&kb.next_tab, NavigateAction::NextTab),
         (&kb.close_tab, NavigateAction::CloseTab),
@@ -1670,7 +1665,6 @@ pub(super) fn execute_navigate_action_in_context(
                 leave_navigate_mode(state);
             }
         }
-        NavigateAction::RenameTab => super::modal::open_rename_active_tab(state, false),
         NavigateAction::PreviousTab => {
             state.previous_tab();
             leave_navigate_mode(state);
@@ -2665,6 +2659,19 @@ last_pane = "prefix+tab"
         );
 
         assert_eq!(pane_action, Some(NavigateAction::LastPane));
+    }
+
+    #[test]
+    fn retired_rename_tab_prefix_binding_has_no_navigation_action() {
+        let state = state_with_workspaces(&["test"]);
+
+        let action = action_for_key(
+            &state,
+            TerminalKey::new(KeyCode::Char('t'), KeyModifiers::SHIFT),
+            BindingDispatch::Prefix,
+        );
+
+        assert_eq!(action, None);
     }
 
     #[test]

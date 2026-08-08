@@ -368,12 +368,6 @@
           "description": "Create a new tab in the active workspace."
         },
         {
-          "key": "keys.rename_tab",
-          "type": "keybinding",
-          "default": "\"prefix+shift+t\"",
-          "description": "Rename the active tab."
-        },
-        {
           "key": "keys.previous_tab",
           "type": "keybinding",
           "default": "\"prefix+p\"",

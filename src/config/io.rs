@@ -1246,6 +1246,7 @@ scrollback_lines = 42
 [keys]
 fullscreen = "prefix+z"
 new_tabb = "prefix+t"
+rename_tab = "prefix+shift+t"
 
 [[keys.command]]
 key = "prefix+g"
@@ -1276,6 +1277,7 @@ claude = [["terminal_title"]]
                 "unknown config key theme.custom.accentt; ignoring key",
                 "unknown config key keys.command.0.descrption; ignoring key",
                 "unknown config key keys.new_tabb; ignoring key",
+                "unknown config key keys.rename_tab; ignoring key",
                 "unknown config key ui.\"foo.?.bar\"; ignoring key",
                 "unknown config key ui.\"foo.bar\"; ignoring key",
                 "unknown config key ui.mouse_captur; ignoring key",
