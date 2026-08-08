@@ -294,7 +294,7 @@ mod tests {
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
         std::fs::write(
             home.join(".ssh/config"),
-            "Host build\n  HostName build.example.test\nHost fresh\n  HostName fresh.example.test\n",
+            "Host build\n  HostName build.example.test\nHost fresh\nMatch all\n  HostName %h.example.test\n  User deploy\n  Port 2222\n",
         )
         .unwrap();
         let config = Config {
@@ -317,10 +317,10 @@ mod tests {
 
             assert_eq!(hosts.len(), 2);
             assert_eq!(hosts[0].alias, "build");
-            assert_eq!(hosts[0].target, "build.example.test");
+            assert_eq!(hosts[0].target, "deploy@build.example.test:2222");
             assert!(hosts[0].already_configured);
             assert_eq!(hosts[1].alias, "fresh");
-            assert_eq!(hosts[1].target, "fresh.example.test");
+            assert_eq!(hosts[1].target, "deploy@fresh.example.test:2222");
             assert!(!hosts[1].already_configured);
         });
 

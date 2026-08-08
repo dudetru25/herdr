@@ -232,7 +232,15 @@ fn process_line(
                     message: "Match requires at least one condition".into(),
                 });
             }
-            *context = ParseContext::Match;
+            if values.len() == 1 && values[0].eq_ignore_ascii_case("all") {
+                state.blocks.push(HostBlock {
+                    patterns: vec!["*".into()],
+                    options: HashMap::new(),
+                });
+                *context = ParseContext::Host(state.blocks.len() - 1);
+            } else {
+                *context = ParseContext::Match;
+            }
         }
         "include" => {
             if values.is_empty() {
@@ -862,34 +870,40 @@ mod tests {
     }
 
     #[test]
-    fn match_blocks_do_not_modify_the_preceding_host() {
+    fn match_all_supplies_unset_options_without_overriding_host_options() {
         let directory = fixture_dir("match-context");
         let config = directory.join("config");
         write_fixture(
             &config,
-            "Host valid\n  User actual\nMatch all\n  User conditional\n  HostName conditional.example.test\n  Port 2200\n",
+            "Host explicit-user\n  User actual\nHost inherited\nMatch all\n  User conditional\n  HostName %h.example.test\n  Port 2200\n",
         );
 
         let hosts = parse_file(&config).unwrap();
 
         assert_eq!(
             hosts,
-            vec![SshHost {
-                alias: "valid".into(),
-                target_hint: "actual@valid".into(),
-            }]
+            vec![
+                SshHost {
+                    alias: "explicit-user".into(),
+                    target_hint: "actual@explicit-user.example.test:2200".into(),
+                },
+                SshHost {
+                    alias: "inherited".into(),
+                    target_hint: "conditional@inherited.example.test:2200".into(),
+                },
+            ]
         );
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
-    fn include_inside_match_does_not_modify_the_preceding_host() {
+    fn include_inside_conditional_match_does_not_modify_the_preceding_host() {
         let directory = fixture_dir("match-include-context");
         let config = directory.join("config");
         write_fixture(&directory.join("conditional.conf"), "User conditional\n");
         write_fixture(
             &config,
-            "Host valid\n  User actual\nMatch all\n  Include conditional.conf\n",
+            "Host valid\n  User actual\nMatch host valid\n  Include conditional.conf\n",
         );
 
         let hosts = parse_file(&config).unwrap();
