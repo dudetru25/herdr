@@ -30,6 +30,7 @@ impl ParentSpaceActionError {
 
 struct ParentSpaceScanPlan {
     adopted_indices: Vec<usize>,
+    released_indices: Vec<usize>,
     missing_directories: Vec<PathBuf>,
 }
 
@@ -94,14 +95,19 @@ impl AppState {
     fn plan_parent_space_scan(
         &self,
         parent_idx: usize,
+        membership: &ParentSpaceMembership,
         directories: &[PathBuf],
     ) -> Result<ParentSpaceScanPlan, ParentSpaceActionError> {
-        if self.workspaces.get(parent_idx).is_none() {
+        let Some(parent) = self.workspaces.get(parent_idx) else {
             return Err(ParentSpaceActionError::new(
                 "workspace_not_found",
                 "workspace not found",
             ));
-        }
+        };
+        let previous_parent_key = parent
+            .parent_space()
+            .filter(|membership| membership.is_parent)
+            .map(|membership| membership.key.clone());
 
         let existing_paths = self
             .workspaces
@@ -136,8 +142,32 @@ impl AppState {
             };
             adopted_indices.push(existing_idx);
         }
+        let directory_paths = directories.iter().collect::<HashSet<_>>();
+        let adopted = adopted_indices.iter().copied().collect::<HashSet<_>>();
+        let mut released_indices = Vec::new();
+        if let Some(previous_parent_key) = previous_parent_key.as_ref() {
+            for (ws_idx, workspace) in self.workspaces.iter().enumerate() {
+                if ws_idx == parent_idx
+                    || adopted.contains(&ws_idx)
+                    || !workspace.parent_space().is_some_and(|previous| {
+                        !previous.is_parent && previous.key == *previous_parent_key
+                    })
+                {
+                    continue;
+                }
+                let resolved_path = existing_paths
+                    .iter()
+                    .find_map(|(existing_idx, path)| (*existing_idx == ws_idx).then_some(path));
+                let parent_moved = previous_parent_key != &membership.key;
+                if parent_moved || resolved_path.is_some_and(|path| !directory_paths.contains(path))
+                {
+                    released_indices.push(ws_idx);
+                }
+            }
+        }
         Ok(ParentSpaceScanPlan {
             adopted_indices,
+            released_indices,
             missing_directories,
         })
     }
@@ -152,6 +182,7 @@ impl AppState {
             || plan
                 .adopted_indices
                 .iter()
+                .chain(&plan.released_indices)
                 .any(|index| self.workspaces.get(*index).is_none())
         {
             return Err(ParentSpaceActionError::new(
@@ -159,7 +190,15 @@ impl AppState {
                 "workspace disappeared while applying parent-space scan",
             ));
         }
+        let previous_parent_key = self.workspaces[parent_idx]
+            .parent_space()
+            .filter(|previous| previous.is_parent)
+            .map(|previous| previous.key.clone());
         self.workspaces[parent_idx].parent_space = Some(membership.clone());
+
+        for &released_idx in &plan.released_indices {
+            self.workspaces[released_idx].parent_space = None;
+        }
 
         for &existing_idx in &plan.adopted_indices {
             let previous_parent_key = self.workspaces[existing_idx]
@@ -190,6 +229,13 @@ impl AppState {
             let workspace = &mut self.workspaces[existing_idx];
             if workspace.parent_space.as_ref() != Some(&child_membership) {
                 workspace.parent_space = Some(child_membership);
+            }
+        }
+        if let Some(previous_parent_key) = previous_parent_key {
+            if previous_parent_key != membership.key
+                && self.collapsed_space_keys.remove(&previous_parent_key)
+            {
+                self.collapsed_space_keys.insert(membership.key.clone());
             }
         }
         self.mark_session_dirty();
@@ -326,43 +372,41 @@ impl App {
         self.state.refresh_workspace_staleness();
         let workspace = &self.state.workspaces[ws_idx];
         let parent_workspace_id = workspace.id.clone();
-        let membership = if create_parent {
-            let root = workspace.identity_cwd.canonicalize().map_err(|err| {
-                ParentSpaceActionError::new(
-                    "parent_space_invalid_root",
-                    format!(
-                        "failed to resolve parent-space root {}: {err}",
-                        workspace.identity_cwd.display()
-                    ),
-                )
-            })?;
-            if !root.is_dir() {
-                return Err(ParentSpaceActionError::new(
-                    "parent_space_invalid_root",
-                    format!("parent-space root {} is not a directory", root.display()),
-                ));
-            }
-            ParentSpaceMembership {
-                key: parent_space_key(&root),
-                root,
-                is_parent: true,
-            }
-        } else {
-            let Some(membership) = workspace
+        if !create_parent
+            && !workspace
                 .parent_space()
-                .filter(|membership| membership.is_parent)
-                .cloned()
-            else {
-                return Err(ParentSpaceActionError::new(
-                    "not_parent_space",
-                    "workspace is not a parent space",
-                ));
-            };
-            membership
+                .is_some_and(|membership| membership.is_parent)
+        {
+            return Err(ParentSpaceActionError::new(
+                "not_parent_space",
+                "workspace is not a parent space",
+            ));
+        }
+        let root = workspace.identity_cwd.canonicalize().map_err(|err| {
+            ParentSpaceActionError::new(
+                "parent_space_invalid_root",
+                format!(
+                    "failed to resolve parent-space root {}: {err}",
+                    workspace.identity_cwd.display()
+                ),
+            )
+        })?;
+        if !root.is_dir() {
+            return Err(ParentSpaceActionError::new(
+                "parent_space_invalid_root",
+                format!("parent-space root {} is not a directory", root.display()),
+            ));
+        }
+        let membership = ParentSpaceMembership {
+            key: parent_space_key(&root),
+            root,
+            is_parent: true,
         };
 
         let directories = immediate_subdirectories(&membership.root)?;
-        let plan = self.state.plan_parent_space_scan(ws_idx, &directories)?;
+        let plan = self
+            .state
+            .plan_parent_space_scan(ws_idx, &membership, &directories)?;
         let mut prepared_children = Vec::with_capacity(plan.missing_directories.len());
         for path in &plan.missing_directories {
             let prepared = self
@@ -460,6 +504,29 @@ mod tests {
         )
     }
 
+    fn test_git_checkout(path: &Path) -> PathBuf {
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        path.canonicalize().unwrap()
+    }
+
+    fn app_with_workspaces(workspaces: Vec<Workspace>) -> App {
+        let mut app = test_app();
+        app.state.workspaces = workspaces;
+        app.state.selected = 0;
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app
+    }
+
     #[test]
     fn scan_adopts_existing_workspace_and_rescan_only_returns_missing_directories() {
         let fixture = TempFixture::new();
@@ -491,7 +558,9 @@ mod tests {
                 alpha.canonicalize().unwrap()
             ]
         );
-        let plan = state.plan_parent_space_scan(0, &directories).unwrap();
+        let plan = state
+            .plan_parent_space_scan(0, &membership, &directories)
+            .unwrap();
         state
             .apply_parent_space_scan(0, &membership, &plan)
             .unwrap();
@@ -513,7 +582,11 @@ mod tests {
         let beta = fixture.root.join("beta");
         std::fs::create_dir(&beta).unwrap();
         let plan = state
-            .plan_parent_space_scan(0, &immediate_subdirectories(&fixture.root).unwrap())
+            .plan_parent_space_scan(
+                0,
+                &membership,
+                &immediate_subdirectories(&fixture.root).unwrap(),
+            )
             .unwrap();
         state
             .apply_parent_space_scan(0, &membership, &plan)
@@ -527,11 +600,18 @@ mod tests {
         let fixture = TempFixture::new();
         let child_path = fixture.root.join("child");
         std::fs::create_dir(&child_path).unwrap();
+        let membership = ParentSpaceMembership {
+            key: parent_space_key(&fixture.root),
+            root: fixture.root.clone(),
+            is_parent: true,
+        };
 
         let mut parent = Workspace::test_new("parent");
         parent.identity_cwd = fixture.root.clone();
+        parent.parent_space = Some(membership.clone());
         let mut stale = Workspace::test_new("stale");
         stale.identity_cwd = fixture.root.join("removed-workspace");
+        stale.parent_space = Some(child_membership(&membership));
         let mut state = AppState::test_new();
         state.workspaces = vec![parent, stale];
         let workspace_ids = state
@@ -543,9 +623,15 @@ mod tests {
         assert!(state.workspaces[1].is_stale());
 
         let directories = immediate_subdirectories(&fixture.root).unwrap();
-        let plan = state.plan_parent_space_scan(0, &directories).unwrap();
+        let plan = state
+            .plan_parent_space_scan(0, &membership, &directories)
+            .unwrap();
+        state
+            .apply_parent_space_scan(0, &membership, &plan)
+            .unwrap();
 
         assert!(plan.adopted_indices.is_empty());
+        assert!(plan.released_indices.is_empty());
         assert_eq!(
             plan.missing_directories,
             vec![child_path.canonicalize().unwrap()]
@@ -562,6 +648,126 @@ mod tests {
             state.workspaces[1].identity_cwd,
             fixture.root.join("removed-workspace")
         );
+        assert_eq!(
+            state.workspaces[1].parent_space(),
+            Some(&child_membership(&membership))
+        );
+    }
+
+    #[test]
+    fn rescan_adopts_a_retargeted_standalone_workspace_once() {
+        let fixture = TempFixture::new();
+        let parent_path = test_git_checkout(&fixture.root.join("parent"));
+        let standalone_path = test_git_checkout(&fixture.root.join("standalone"));
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = parent_path.clone();
+        let mut standalone = Workspace::test_new("standalone");
+        standalone.identity_cwd = standalone_path.clone();
+        let standalone_id = standalone.id.clone();
+        let mut app = app_with_workspaces(vec![parent, standalone]);
+
+        let initial = app
+            .apply_parent_space_action(0, ParentSpaceAction::Become)
+            .unwrap();
+        assert!(initial.child_workspace_ids.is_empty());
+
+        let nested_path = parent_path.join("nested");
+        std::fs::rename(&standalone_path, &nested_path).unwrap();
+        app.state
+            .retarget_workspace(1, nested_path.canonicalize().unwrap())
+            .unwrap();
+
+        let outcome = app
+            .apply_parent_space_action(0, ParentSpaceAction::Rescan)
+            .unwrap();
+
+        assert_eq!(outcome.child_workspace_ids, vec![standalone_id]);
+        assert_eq!(app.state.workspaces.len(), 2);
+        let parent_membership = app.state.workspaces[0].parent_space().unwrap().clone();
+        assert_eq!(
+            app.state.workspaces[1].parent_space(),
+            Some(&child_membership(&parent_membership))
+        );
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn rescan_releases_a_child_retargeted_outside_the_parent() {
+        let fixture = TempFixture::new();
+        let parent_path = test_git_checkout(&fixture.root.join("parent"));
+        let child_path = test_git_checkout(&parent_path.join("child"));
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = parent_path.clone();
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = child_path.clone();
+        let mut app = app_with_workspaces(vec![parent, child]);
+        app.apply_parent_space_action(0, ParentSpaceAction::Become)
+            .unwrap();
+        assert!(app.state.workspaces[1].parent_space().is_some());
+
+        let detached_path = fixture.root.join("detached");
+        std::fs::rename(&child_path, &detached_path).unwrap();
+        app.state
+            .retarget_workspace(1, detached_path.canonicalize().unwrap())
+            .unwrap();
+
+        let outcome = app
+            .apply_parent_space_action(0, ParentSpaceAction::Rescan)
+            .unwrap();
+
+        assert!(outcome.child_workspace_ids.is_empty());
+        assert!(app.state.workspaces[1].parent_space().is_none());
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn rescan_rekeys_a_retargeted_parent_and_its_child() {
+        let fixture = TempFixture::new();
+        let old_parent_path = test_git_checkout(&fixture.root.join("old-parent"));
+        let old_child_path = test_git_checkout(&old_parent_path.join("child"));
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = old_parent_path.clone();
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = old_child_path;
+        let child_id = child.id.clone();
+        let mut app = app_with_workspaces(vec![parent, child]);
+        app.apply_parent_space_action(0, ParentSpaceAction::Become)
+            .unwrap();
+        let old_membership = app.state.workspaces[0].parent_space().unwrap().clone();
+        app.state
+            .collapsed_space_keys
+            .insert(old_membership.key.clone());
+
+        let new_parent_path = fixture.root.join("new-parent");
+        std::fs::rename(&old_parent_path, &new_parent_path).unwrap();
+        let new_parent_path = new_parent_path.canonicalize().unwrap();
+        let new_child_path = new_parent_path.join("child").canonicalize().unwrap();
+        app.state
+            .retarget_workspace(0, new_parent_path.clone())
+            .unwrap();
+        app.state.retarget_workspace(1, new_child_path).unwrap();
+
+        let outcome = app
+            .apply_parent_space_action(0, ParentSpaceAction::Rescan)
+            .unwrap();
+
+        let new_membership = ParentSpaceMembership {
+            key: parent_space_key(&new_parent_path),
+            root: new_parent_path,
+            is_parent: true,
+        };
+        assert_eq!(outcome.child_workspace_ids, vec![child_id]);
+        assert_eq!(
+            app.state.workspaces[0].parent_space(),
+            Some(&new_membership)
+        );
+        assert_eq!(
+            app.state.workspaces[1].parent_space(),
+            Some(&child_membership(&new_membership))
+        );
+        assert!(!app.state.collapsed_space_keys.contains(&old_membership.key));
+        assert!(app.state.collapsed_space_keys.contains(&new_membership.key));
+        app.state.assert_invariants_for_test();
     }
 
     #[tokio::test]
@@ -594,6 +800,56 @@ mod tests {
             .iter()
             .all(|workspace| workspace.parent_space().is_none()));
         assert_eq!(app.terminal_runtimes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn moved_parent_child_creation_failure_preserves_the_old_group() {
+        let fixture = TempFixture::new();
+        let old_parent_path = test_git_checkout(&fixture.root.join("old-parent"));
+        let old_child_path = test_git_checkout(&old_parent_path.join("child"));
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = old_parent_path.clone();
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = old_child_path;
+        let mut app = app_with_workspaces(vec![parent, child]);
+        app.apply_parent_space_action(0, ParentSpaceAction::Become)
+            .unwrap();
+        let old_membership = app.state.workspaces[0].parent_space().unwrap().clone();
+        app.state
+            .collapsed_space_keys
+            .insert(old_membership.key.clone());
+
+        let new_parent_path = fixture.root.join("new-parent");
+        std::fs::rename(&old_parent_path, &new_parent_path).unwrap();
+        let new_parent_path = new_parent_path.canonicalize().unwrap();
+        let new_child_path = new_parent_path.join("child").canonicalize().unwrap();
+        app.state
+            .retarget_workspace(0, new_parent_path.clone())
+            .unwrap();
+        app.state.retarget_workspace(1, new_child_path).unwrap();
+        std::fs::create_dir(new_parent_path.join("missing-child")).unwrap();
+        app.state.default_shell = fixture.root.join("missing-shell").display().to_string();
+
+        let err = app
+            .apply_parent_space_action(0, ParentSpaceAction::Rescan)
+            .unwrap_err();
+
+        assert_eq!(err.code, "parent_space_child_create_failed");
+        assert_eq!(
+            app.state.workspaces[0].parent_space(),
+            Some(&old_membership)
+        );
+        assert_eq!(
+            app.state.workspaces[1].parent_space(),
+            Some(&child_membership(&old_membership))
+        );
+        assert!(app.state.collapsed_space_keys.contains(&old_membership.key));
+        assert!(!app
+            .state
+            .collapsed_space_keys
+            .contains(&parent_space_key(&new_parent_path)));
+        assert_eq!(app.state.workspaces.len(), 2);
+        app.state.assert_invariants_for_test();
     }
 
     #[cfg(unix)]
