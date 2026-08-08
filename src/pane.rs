@@ -2928,18 +2928,6 @@ impl PaneRuntime {
         crate::platform::process_cwd(pid)
     }
 
-    /// Replace the cached working directory after the workspace is retargeted.
-    pub fn set_reported_cwd(&self, cwd: std::path::PathBuf) {
-        let Ok(mut reported_cwd) = self.reported_cwd.lock() else {
-            warn!(
-                pane = self.pane_id.raw(),
-                "failed to retarget cached pane cwd"
-            );
-            return;
-        };
-        *reported_cwd = Some(cwd);
-    }
-
     pub fn child_pid(&self) -> Option<u32> {
         let pid = self.child_pid.load(Ordering::Acquire);
         (pid > 0).then_some(pid)

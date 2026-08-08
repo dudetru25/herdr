@@ -41,6 +41,7 @@ fn remote_ssh_client_environment() -> Vec<(String, String)> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeExitAction {
+    RestartRetargetedPane,
     RespawnShell,
     ClosePane,
 }
@@ -552,12 +553,21 @@ impl App {
                 self.close_popup_pane();
                 return;
             }
+            let intentional_restart =
+                self.runtime_exit_action(*pane_id) == RuntimeExitAction::RestartRetargetedPane;
             let previous_toast = self.state.toast.clone();
             if let Some(update) = self.state.publish_pane_process_exit_if_agent(*pane_id) {
                 self.sync_full_lifecycle_authority_detection_pauses();
                 self.refresh_new_herdr_toast_context_for_update(&update, &previous_toast);
                 self.emit_pane_state_update(&update);
                 self.emit_terminal_or_system_agent_notifications(std::slice::from_ref(&update));
+            }
+            if intentional_restart {
+                let _ = self.respawn_shell_for_launch_pane(*pane_id);
+                self.overlay_panes.remove(pane_id);
+                self.render_dirty.request_generic();
+                self.render_notify.notify_one();
+                return;
             }
             if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
                 && self.respawn_shell_for_launch_pane(*pane_id)
@@ -850,6 +860,9 @@ impl App {
     }
 
     fn runtime_exit_action(&self, pane_id: crate::layout::PaneId) -> RuntimeExitAction {
+        if self.intentional_pane_restarts.contains_key(&pane_id) {
+            return RuntimeExitAction::RestartRetargetedPane;
+        }
         let Some((_, pane_state)) = self.find_pane(pane_id) else {
             return RuntimeExitAction::ClosePane;
         };
@@ -891,23 +904,43 @@ impl App {
     }
 
     fn respawn_shell_for_launch_pane(&mut self, pane_id: crate::layout::PaneId) -> bool {
+        let intentional_restart = self.intentional_pane_restarts.remove(&pane_id);
         let Some((ws_idx, pane_state)) = self.find_pane(pane_id) else {
             return false;
         };
         let terminal_id = pane_state.attached_terminal_id.clone();
+        if intentional_restart
+            .as_ref()
+            .is_some_and(|restart| restart.terminal_id != terminal_id)
+        {
+            tracing::warn!(
+                pane = pane_id.raw(),
+                "retarget restart terminal identity changed"
+            );
+            return false;
+        }
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return false;
         };
 
         let cwd = terminal.cwd.clone();
-        let (rows, cols) = self
-            .terminal_runtimes
-            .get(&terminal_id)
-            .map(|runtime| runtime.current_size())
+        let (rows, cols) = intentional_restart
+            .as_ref()
+            .map(|restart| (restart.rows, restart.cols))
+            .or_else(|| {
+                self.terminal_runtimes
+                    .get(&terminal_id)
+                    .map(|runtime| runtime.current_size())
+            })
             .unwrap_or_else(|| self.state.estimate_pane_size());
         let Some(launch_env) = self.pane_launch_env(ws_idx, pane_id, Vec::new()) else {
             return false;
         };
+        if intentional_restart.is_some() {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.clear_agent_runtime_identity_after_respawn();
+            }
+        }
         let runtime = match crate::terminal::TerminalRuntime::spawn(
             pane_id,
             rows,
@@ -935,10 +968,14 @@ impl App {
         };
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
-        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.clear_agent_runtime_identity_after_respawn();
+        if intentional_restart.is_none() {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.clear_agent_runtime_identity_after_respawn();
+            }
         }
-        self.state.focus_pane_in_workspace(ws_idx, pane_id);
+        if intentional_restart.is_none() {
+            self.state.focus_pane_in_workspace(ws_idx, pane_id);
+        }
         self.schedule_session_save();
         true
     }

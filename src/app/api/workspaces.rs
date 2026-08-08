@@ -5,7 +5,7 @@ use crate::api::schema::{
     WorkspaceMoveBlockParams, WorkspaceMoveParams, WorkspaceParentSpaceParams,
     WorkspaceRenameParams, WorkspaceReportMetadataParams, WorkspaceRetargetParams, WorkspaceTarget,
 };
-use crate::app::App;
+use crate::app::{App, IntentionalPaneRestart};
 
 use super::super::api_helpers::{normalize_metadata_source, normalize_metadata_ttl};
 use super::super::state::ParentSpaceAction;
@@ -162,15 +162,64 @@ impl App {
             Ok(path) => path,
             Err((code, message)) => return encode_error(id, code, message),
         };
-        let terminal_ids = self.state.terminal_ids_for_workspace(index);
         let pane_ids = self.state.pane_ids_for_workspace(index);
+        let mut restarts = Vec::new();
+        for pane_id in &pane_ids {
+            if self.intentional_pane_restarts.contains_key(pane_id) {
+                return encode_error(
+                    id,
+                    "workspace_retarget_restart_pending",
+                    "workspace has a pane restart already in progress",
+                );
+            }
+            let Some((pane_ws_idx, pane)) = self.find_pane(*pane_id) else {
+                return encode_error(
+                    id,
+                    "workspace_retarget_state_invalid",
+                    "workspace pane is missing",
+                );
+            };
+            if pane_ws_idx != index {
+                return encode_error(
+                    id,
+                    "workspace_retarget_state_invalid",
+                    "workspace pane identity changed",
+                );
+            }
+            let terminal_id = pane.attached_terminal_id.clone();
+            if !self.state.terminals.contains_key(&terminal_id) {
+                return encode_error(
+                    id,
+                    "workspace_retarget_state_invalid",
+                    "workspace pane terminal is missing",
+                );
+            }
+            if let Some(runtime) = self.terminal_runtimes.get(&terminal_id) {
+                if self.pane_launch_env(index, *pane_id, Vec::new()).is_none() {
+                    return encode_error(
+                        id,
+                        "workspace_retarget_state_invalid",
+                        "workspace pane launch identity is invalid",
+                    );
+                }
+                let (rows, cols) = runtime.current_size();
+                restarts.push((
+                    *pane_id,
+                    IntentionalPaneRestart {
+                        terminal_id,
+                        rows,
+                        cols,
+                    },
+                ));
+            }
+        }
         if let Err(message) = self.state.retarget_workspace(index, path.clone()) {
             return encode_error(id, "workspace_retarget_state_invalid", message);
         }
-        for terminal_id in terminal_ids {
-            if let Some(runtime) = self.terminal_runtimes.get(&terminal_id) {
-                runtime.set_reported_cwd(path.clone());
-            }
+        for (pane_id, restart) in restarts {
+            let terminal_id = restart.terminal_id.clone();
+            self.intentional_pane_restarts.insert(pane_id, restart);
+            self.shutdown_terminal_runtime(terminal_id);
         }
         self.schedule_session_save();
         self.emit_event(EventEnvelope {
@@ -661,6 +710,40 @@ mod tests {
         (app, event_hub, workspace_id)
     }
 
+    #[cfg(unix)]
+    fn install_live_shell_runtime(
+        app: &mut App,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        cwd: &Path,
+    ) -> (crate::terminal::TerminalId, u32) {
+        let terminal_id = app.state.workspaces[ws_idx]
+            .terminal_id(pane_id)
+            .cloned()
+            .expect("test pane should have a terminal");
+        let launch_env = app
+            .pane_launch_env(ws_idx, pane_id, Vec::new())
+            .expect("test pane should have launch identity");
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            pane_id,
+            24,
+            80,
+            cwd.to_path_buf(),
+            app.state.pane_scrollback_limit_bytes,
+            app.state.host_terminal_theme,
+            app.state.host_terminal_appearance,
+            crate::pane::PaneShellConfig::new(&app.state.default_shell, app.state.shell_mode),
+            &launch_env,
+            app.event_tx.clone(),
+            app.render_notify.clone(),
+            app.render_dirty.clone(),
+        )
+        .expect("test shell should spawn");
+        let child_pid = runtime.child_pid().expect("test shell should have a pid");
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        (terminal_id, child_pid)
+    }
+
     fn assert_retarget_rejection(app: &App, old_path: &Path, response: &str, expected_code: &str) {
         let error: ErrorResponse = serde_json::from_str(response).unwrap();
         assert_eq!(error.error.code, expected_code);
@@ -834,6 +917,354 @@ mod tests {
                 .count(),
             2
         );
+        assert!(app.intentional_pane_restarts.is_empty());
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn workspace_retarget_preserves_adversarial_identity_without_live_runtimes() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "identity-old");
+        let new_path = test_git_checkout(&fixture.root, "identity-new");
+        let mut state = crate::app::AppState::test_with_adversarial_identity_state();
+        state.workspaces[0].identity_cwd = old_path.clone();
+        state.workspaces[0].cached_identity_cwd = old_path.clone();
+        for terminal_id in state.terminal_ids_for_workspace(0) {
+            state.terminals.get_mut(&terminal_id).unwrap().cwd = old_path.clone();
+        }
+        let workspace_id = state.workspaces[0].id.clone();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state = state;
+        let identity_before: Vec<_> = app
+            .state
+            .pane_ids_for_workspace(0)
+            .into_iter()
+            .map(|pane_id| {
+                (
+                    pane_id,
+                    app.public_pane_id(0, pane_id).unwrap(),
+                    app.state.workspaces[0]
+                        .terminal_id(pane_id)
+                        .unwrap()
+                        .clone(),
+                )
+            })
+            .collect();
+        let layout_before: Vec<_> = app.state.workspaces[0]
+            .tabs
+            .iter()
+            .map(|tab| (tab.root_pane, tab.layout.focused()))
+            .collect();
+
+        let response = app.handle_api_request(Request {
+            id: "identity-retarget".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id,
+                path: new_path.display().to_string(),
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        let identity_after: Vec<_> = app
+            .state
+            .pane_ids_for_workspace(0)
+            .into_iter()
+            .map(|pane_id| {
+                (
+                    pane_id,
+                    app.public_pane_id(0, pane_id).unwrap(),
+                    app.state.workspaces[0]
+                        .terminal_id(pane_id)
+                        .unwrap()
+                        .clone(),
+                )
+            })
+            .collect();
+        let layout_after: Vec<_> = app.state.workspaces[0]
+            .tabs
+            .iter()
+            .map(|tab| (tab.root_pane, tab.layout.focused()))
+            .collect();
+        assert_eq!(identity_after, identity_before);
+        assert_eq!(layout_after, layout_before);
+        assert!(app.intentional_pane_restarts.is_empty());
+        app.state.assert_invariants_for_test();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_retarget_restarts_live_child_in_new_checkout() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "live-old");
+        let new_path = test_git_checkout(&fixture.root, "live-new");
+        let other_path = test_git_checkout(&fixture.root, "live-other");
+        let (mut app, event_hub, workspace_id) = retarget_test_app(&old_path);
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let split_pane_id = app.state.workspaces[0].test_split(Direction::Horizontal);
+        let mut other_workspace = Workspace::test_new("other");
+        other_workspace.identity_cwd = other_path.clone();
+        other_workspace.cached_identity_cwd = other_path.clone();
+        let other_pane_id = other_workspace.tabs[0].root_pane;
+        app.state.workspaces.push(other_workspace);
+        app.state.ensure_test_terminals();
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let public_split_pane_id = app.public_pane_id(0, split_pane_id).unwrap();
+        let focused_pane_id = app.state.workspaces[0].tabs[0].layout.focused();
+        let (terminal_id, old_pid) = install_live_shell_runtime(&mut app, 0, pane_id, &old_path);
+        let (split_terminal_id, old_split_pid) =
+            install_live_shell_runtime(&mut app, 0, split_pane_id, &old_path);
+        let (other_terminal_id, other_pid) =
+            install_live_shell_runtime(&mut app, 1, other_pane_id, &other_path);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.manual_label = Some("manual label".into());
+        terminal.launch_argv = Some(vec!["agent".into(), "--resume".into()]);
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Working,
+        );
+        let session_ref = crate::agent_resume::AgentSessionRef::path(
+            fixture.root.join("pi-session.jsonl").display().to_string(),
+        )
+        .unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: session_ref.clone(),
+        });
+        terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                crate::detect::AgentState::Working,
+                None,
+                Some(session_ref.clone()),
+                Some(1),
+            )
+            .expect("full-lifecycle hook authority should be accepted");
+        assert!(terminal.full_lifecycle_hook_authority_active());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref,
+        });
+
+        let response = app.handle_api_request(Request {
+            id: "live-retarget".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id,
+                path: new_path.display().to_string(),
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        let restart_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !app.intentional_pane_restarts.is_empty()
+            && std::time::Instant::now() < restart_deadline
+        {
+            app.drain_internal_events();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let runtime = app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("retargeted runtime should stay attached");
+        let new_pid = runtime
+            .child_pid()
+            .expect("retargeted shell should have a pid");
+        assert_ne!(new_pid, old_pid, "retarget should replace the live child");
+        let new_split_pid = app
+            .terminal_runtimes
+            .get(&split_terminal_id)
+            .expect("retargeted split runtime")
+            .child_pid()
+            .expect("retargeted split should have a pid");
+        assert_ne!(new_split_pid, old_split_pid);
+        assert_eq!(
+            app.terminal_runtimes
+                .get(&other_terminal_id)
+                .and_then(|runtime| runtime.child_pid()),
+            Some(other_pid)
+        );
+
+        let expected_cwd = std::fs::canonicalize(&new_path).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::platform::process_cwd(new_pid).and_then(|cwd| std::fs::canonicalize(cwd).ok())
+            != Some(expected_cwd.clone())
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            crate::platform::process_cwd(new_pid).and_then(|cwd| std::fs::canonicalize(cwd).ok()),
+            Some(expected_cwd)
+        );
+        assert_eq!(
+            crate::platform::process_cwd(new_split_pid)
+                .and_then(|cwd| std::fs::canonicalize(cwd).ok()),
+            Some(std::fs::canonicalize(&new_path).unwrap())
+        );
+        assert_eq!(
+            crate::platform::process_cwd(other_pid).and_then(|cwd| std::fs::canonicalize(cwd).ok()),
+            Some(std::fs::canonicalize(&other_path).unwrap())
+        );
+        assert_eq!(
+            app.public_pane_id(0, pane_id).as_deref(),
+            Some(public_pane_id.as_str())
+        );
+        assert_eq!(
+            app.public_pane_id(0, split_pane_id).as_deref(),
+            Some(public_split_pane_id.as_str())
+        );
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane_id);
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.focused(),
+            focused_pane_id
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].manual_label.as_deref(),
+            Some("manual label")
+        );
+        assert!(app.state.terminals[&terminal_id].launch_argv.is_none());
+        assert!(app.state.terminals[&terminal_id]
+            .persisted_agent_session
+            .is_none());
+        assert!(!app.state.terminals[&terminal_id].full_lifecycle_hook_authority_active());
+        app.state.assert_invariants_for_test();
+        assert!(event_hub.events_after(0).iter().any(|(_, event)| matches!(
+            &event.data,
+            EventData::PaneAgentDetected {
+                pane_id: released_pane_id,
+                released: true,
+                ..
+            } if released_pane_id == &public_pane_id
+        )));
+        assert!(!event_hub.events_after(0).iter().any(|(_, event)| matches!(
+            event.event,
+            EventKind::PaneCreated | EventKind::PaneClosed | EventKind::PaneExited
+        )));
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        app.drain_all_internal_events();
+        assert_eq!(
+            app.terminal_runtimes
+                .get(&terminal_id)
+                .and_then(|runtime| runtime.child_pid()),
+            Some(new_pid),
+            "a delayed event from the killed child must not close the replacement"
+        );
+        assert!(app.find_pane(pane_id).is_some());
+
+        super::super::test_support::shutdown_test_runtimes(&mut app);
+    }
+
+    #[test]
+    fn workspace_retarget_restart_preparation_failure_is_atomic() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "pending-old");
+        let new_path = test_git_checkout(&fixture.root, "pending-new");
+        let (mut app, _event_hub, workspace_id) = retarget_test_app(&old_path);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        app.intentional_pane_restarts.insert(
+            pane_id,
+            IntentionalPaneRestart {
+                terminal_id,
+                rows: 24,
+                cols: 80,
+            },
+        );
+
+        let response = app.handle_api_request(Request {
+            id: "pending-retarget".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id,
+                path: new_path.display().to_string(),
+            }),
+        });
+
+        assert_retarget_rejection(
+            &app,
+            &old_path,
+            &response,
+            "workspace_retarget_restart_pending",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_retarget_spawn_failure_keeps_inert_pane() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_path = test_git_checkout(&fixture.root, "failure-old");
+        let new_path = test_git_checkout(&fixture.root, "failure-new");
+        let (mut app, event_hub, workspace_id) = retarget_test_app(&old_path);
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (terminal_id, _pid) = install_live_shell_runtime(&mut app, 0, pane_id, &old_path);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .manual_label = Some("keep me".into());
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .launch_argv = Some(vec!["agent".into()]);
+        app.state.default_shell = fixture.root.join("missing-shell").display().to_string();
+
+        let response = app.handle_api_request(Request {
+            id: "failed-spawn-retarget".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id,
+                path: new_path.display().to_string(),
+            }),
+        });
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !app.intentional_pane_restarts.is_empty() && std::time::Instant::now() < deadline {
+            app.drain_internal_events();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(app.intentional_pane_restarts.is_empty());
+        assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane_id);
+        assert_eq!(app.state.terminals[&terminal_id].cwd, new_path);
+        assert_eq!(
+            app.state.terminals[&terminal_id].manual_label.as_deref(),
+            Some("keep me")
+        );
+        assert!(app.state.terminals[&terminal_id].launch_argv.is_none());
+        app.state.assert_invariants_for_test();
+        assert!(!event_hub.events_after(0).iter().any(|(_, event)| matches!(
+            event.event,
+            EventKind::PaneCreated | EventKind::PaneClosed | EventKind::PaneExited
+        )));
     }
 
     #[test]

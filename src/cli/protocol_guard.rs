@@ -65,7 +65,7 @@ mod tests {
     fn older_server_error_preserves_request_id_and_guidance() {
         let response = mismatch_response(
             "cli:agent:wait",
-            crate::protocol::PROTOCOL_VERSION - 1,
+            19,
             "Run the session stop command, then restart.",
         )
         .unwrap();
@@ -76,10 +76,10 @@ mod tests {
             "client protocol {}",
             crate::protocol::PROTOCOL_VERSION
         )));
-        assert!(response.error.message.contains(&format!(
-            "server protocol {}",
-            crate::protocol::PROTOCOL_VERSION - 1
-        )));
+        assert!(response
+            .error
+            .message
+            .contains(&format!("server protocol {}", 19)));
         assert!(response.error.message.contains("restart"));
     }
 

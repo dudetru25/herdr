@@ -86,6 +86,13 @@ pub(crate) struct PaneClickState {
     at: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct IntentionalPaneRestart {
+    terminal_id: crate::terminal::TerminalId,
+    rows: u16,
+    cols: u16,
+}
+
 impl PaneClickState {
     fn is_double_click_for(self, next: Self) -> bool {
         self.pane_id == next.pane_id
@@ -147,6 +154,7 @@ pub struct App {
     pub(crate) render_dirty: Arc<crate::render_signal::RenderSignal>,
     pub(crate) full_redraw_pending: bool,
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
+    pub(crate) intentional_pane_restarts: HashMap<crate::layout::PaneId, IntentionalPaneRestart>,
     pub(crate) local_terminal_notifications: bool,
     /// Whether this process applies `AppEvent::PrefixInputSource` to the host input source.
     /// The headless server sets this to false: the switch belongs to the foreground client,
@@ -796,6 +804,7 @@ impl App {
             render_dirty,
             full_redraw_pending: false,
             overlay_panes: HashMap::new(),
+            intentional_pane_restarts: HashMap::new(),
             local_terminal_notifications: true,
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
