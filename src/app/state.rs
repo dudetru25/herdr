@@ -1471,9 +1471,19 @@ pub enum ParentSpaceMenu {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabCreatePluginTarget {
+    pub plugin_id: String,
+    pub entrypoint: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuKind {
     WorkspaceCreateTarget {
         machines: Vec<String>,
+    },
+    TabCreateTarget {
+        plugin_panes: Vec<TabCreatePluginTarget>,
     },
     Workspace {
         ws_idx: usize,
@@ -1514,6 +1524,9 @@ impl ContextMenuState {
                 .chain(machines.iter().map(String::as_str))
                 .chain(machines.is_empty().then_some("No machines registered"))
                 .chain(std::iter::once("Add remote machine…"))
+                .collect(),
+            ContextMenuKind::TabCreateTarget { plugin_panes } => std::iter::once("Terminal")
+                .chain(plugin_panes.iter().map(|pane| pane.title.as_str()))
                 .collect(),
             ContextMenuKind::Workspace { .. } => vec!["Rename", "Close"],
             ContextMenuKind::GitWorkspace {
@@ -1916,6 +1929,32 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn tab_create_plugin_targets(&self) -> Vec<TabCreatePluginTarget> {
+        let mut targets = self
+            .installed_plugins
+            .values()
+            .flat_map(|plugin| {
+                plugin
+                    .panes
+                    .iter()
+                    .filter(|pane| {
+                        crate::app::api::plugins::ensure_plugin_pane_openable(plugin, pane).is_ok()
+                    })
+                    .map(|pane| TabCreatePluginTarget {
+                        plugin_id: plugin.plugin_id.clone(),
+                        entrypoint: pane.id.clone(),
+                        title: pane.title.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|left, right| {
+            left.plugin_id
+                .cmp(&right.plugin_id)
+                .then_with(|| left.entrypoint.cmp(&right.entrypoint))
+        });
+        targets
+    }
+
     pub(crate) fn machine_ssh_argv_for_workspace(
         &self,
         ws_idx: usize,
@@ -2580,6 +2619,7 @@ impl AppState {
         if let Some(menu) = &self.context_menu {
             match &menu.kind {
                 ContextMenuKind::WorkspaceCreateTarget { .. } => {}
+                ContextMenuKind::TabCreateTarget { .. } => {}
                 ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                     assert_workspace_index(*ws_idx, "context menu workspace")
@@ -3069,5 +3109,126 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(first_root);
         let _ = std::fs::remove_dir_all(second_root);
+    }
+
+    fn installed_plugin_with_tab_pane(
+        plugin_id: &str,
+        title: &str,
+    ) -> crate::api::schema::InstalledPluginInfo {
+        crate::api::schema::InstalledPluginInfo {
+            plugin_id: plugin_id.into(),
+            name: title.into(),
+            version: "0.1.0".into(),
+            min_herdr_version: "0.8.0".into(),
+            description: None,
+            manifest_path: format!("/tmp/{plugin_id}/herdr-plugin.toml"),
+            plugin_root: format!("/tmp/{plugin_id}"),
+            enabled: true,
+            platforms: None,
+            build: Vec::new(),
+            startup: Vec::new(),
+            actions: Vec::new(),
+            events: Vec::new(),
+            panes: vec![crate::api::schema::PluginManifestPane {
+                id: "pane".into(),
+                title: title.into(),
+                description: None,
+                platforms: None,
+                placement: crate::api::schema::PluginPanePlacement::Tab,
+                width: None,
+                height: None,
+                command: vec!["pane".into()],
+            }],
+            link_handlers: Vec::new(),
+            source: crate::api::schema::PluginSourceInfo::default(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn unsupported_plugin_platform() -> crate::api::schema::PluginPlatform {
+        if cfg!(target_os = "linux") {
+            crate::api::schema::PluginPlatform::Macos
+        } else {
+            crate::api::schema::PluginPlatform::Linux
+        }
+    }
+
+    #[test]
+    fn tab_create_target_menu_has_terminal_without_plugins() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::TabCreateTarget {
+                plugin_panes: Vec::new(),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        assert_eq!(menu.items(), vec!["Terminal"]);
+    }
+
+    #[test]
+    fn tab_create_target_menu_lists_enabled_installed_plugin_panes() {
+        let mut state = AppState::test_new();
+        let mut plugin = installed_plugin_with_tab_pane("example.logs", "Logs");
+        plugin.panes[0].id = "logs".into();
+        state
+            .installed_plugins
+            .insert("example.logs".into(), plugin);
+
+        let plugin_panes = state.tab_create_plugin_targets();
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::TabCreateTarget {
+                plugin_panes: plugin_panes.clone(),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let items = menu.items();
+        println!(
+            "installed_plugins={:?}; tab_create_menu_items={items:?}",
+            state.installed_plugins.keys().collect::<Vec<_>>()
+        );
+
+        assert_eq!(plugin_panes.len(), 1);
+        assert_eq!(plugin_panes[0].plugin_id, "example.logs");
+        assert_eq!(plugin_panes[0].entrypoint, "logs");
+        assert_eq!(items, vec!["Terminal", "Logs"]);
+    }
+
+    #[test]
+    fn tab_create_targets_skip_unavailable_plugin_manifests() {
+        let mut state = AppState::test_new();
+        let mut plugin = installed_plugin_with_tab_pane("example.stale", "Stale");
+        plugin.warnings.push(format!(
+            "{}missing manifest",
+            crate::persist::plugin_registry::MANIFEST_UNAVAILABLE_WARNING_PREFIX
+        ));
+        state
+            .installed_plugins
+            .insert(plugin.plugin_id.clone(), plugin);
+
+        assert!(state.tab_create_plugin_targets().is_empty());
+    }
+
+    #[test]
+    fn tab_create_targets_skip_platform_incompatible_plugin_panes() {
+        let mut state = AppState::test_new();
+        let unsupported = unsupported_plugin_platform();
+
+        let mut inherited = installed_plugin_with_tab_pane("example.inherited", "Inherited");
+        inherited.platforms = Some(vec![unsupported]);
+        state
+            .installed_plugins
+            .insert(inherited.plugin_id.clone(), inherited);
+
+        let mut overridden = installed_plugin_with_tab_pane("example.overridden", "Overridden");
+        overridden.panes[0].platforms = Some(vec![unsupported]);
+        state
+            .installed_plugins
+            .insert(overridden.plugin_id.clone(), overridden);
+
+        assert!(state.tab_create_plugin_targets().is_empty());
     }
 }

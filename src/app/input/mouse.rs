@@ -1214,6 +1214,21 @@ impl AppState {
 
             MouseEventKind::Down(MouseButton::Right)
                 if !self.mode_bar_covers_tab_row(mouse.column, mouse.row)
+                    && self.on_new_tab_button(mouse.column, mouse.row) =>
+            {
+                self.context_menu = Some(ContextMenuState {
+                    kind: ContextMenuKind::TabCreateTarget {
+                        plugin_panes: self.tab_create_plugin_targets(),
+                    },
+                    x: mouse.column,
+                    y: mouse.row,
+                    list: MenuListState::new(0),
+                });
+                self.mode = Mode::ContextMenu;
+            }
+
+            MouseEventKind::Down(MouseButton::Right)
+                if !self.mode_bar_covers_tab_row(mouse.column, mouse.row)
                     && self.tab_at(mouse.column, mouse.row).is_some() =>
             {
                 if let (Some(ws_idx), Some(tab_idx)) =
@@ -4728,6 +4743,115 @@ mod tests {
 
         assert_eq!(app.state.mode, Mode::Terminal);
         assert!(app.state.request_new_tab);
+    }
+
+    #[test]
+    fn right_click_new_tab_button_opens_tab_type_menu() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
+        let new_tab_area = app.state.view.new_tab_hit_area;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            new_tab_area.x + 1,
+            new_tab_area.y,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("tab type menu");
+        assert!(matches!(
+            menu.kind,
+            ContextMenuKind::TabCreateTarget { ref plugin_panes } if plugin_panes.is_empty()
+        ));
+        assert_eq!(menu.items(), vec!["Terminal"]);
+    }
+
+    #[test]
+    fn right_click_new_tab_button_lists_installed_plugin_panes() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.installed_plugins.insert(
+            "example.logs".into(),
+            crate::api::schema::InstalledPluginInfo {
+                plugin_id: "example.logs".into(),
+                name: "Logs".into(),
+                version: "0.1.0".into(),
+                min_herdr_version: "0.8.0".into(),
+                description: None,
+                manifest_path: "/tmp/example-logs/herdr-plugin.toml".into(),
+                plugin_root: "/tmp/example-logs".into(),
+                enabled: true,
+                platforms: None,
+                build: Vec::new(),
+                startup: Vec::new(),
+                actions: Vec::new(),
+                events: Vec::new(),
+                panes: vec![crate::api::schema::PluginManifestPane {
+                    id: "logs".into(),
+                    title: "Logs".into(),
+                    description: None,
+                    platforms: None,
+                    placement: crate::api::schema::PluginPanePlacement::Tab,
+                    width: None,
+                    height: None,
+                    command: vec!["logs".into()],
+                }],
+                link_handlers: Vec::new(),
+                source: crate::api::schema::PluginSourceInfo::default(),
+                warnings: Vec::new(),
+            },
+        );
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
+        let new_tab_area = app.state.view.new_tab_hit_area;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            new_tab_area.x + 1,
+            new_tab_area.y,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("tab type menu");
+        assert!(matches!(
+            menu.kind,
+            ContextMenuKind::TabCreateTarget { ref plugin_panes }
+                if plugin_panes.len() == 1
+                    && plugin_panes[0].plugin_id == "example.logs"
+                    && plugin_panes[0].entrypoint == "logs"
+        ));
+        assert_eq!(menu.items(), vec!["Terminal", "Logs"]);
+    }
+
+    #[tokio::test]
+    async fn clicking_terminal_entry_from_tab_type_menu_creates_terminal_tab() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 40));
+        let new_tab_area = app.state.view.new_tab_hit_area;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            new_tab_area.x + 1,
+            new_tab_area.y,
+        ));
+        let menu = app.state.context_menu_rect().expect("tab type menu rect");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            menu.x + 2,
+            menu.y + 1,
+        ));
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.context_menu.is_none());
     }
 
     #[test]

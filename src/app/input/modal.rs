@@ -805,6 +805,13 @@ pub(super) fn apply_context_menu_action(
     menu: ContextMenuState,
     idx: usize,
 ) {
+    if let ContextMenuKind::TabCreateTarget { .. } = &menu.kind {
+        if idx == 0 {
+            state.request_new_tab = true;
+        }
+        leave_modal(state);
+        return;
+    }
     if let ContextMenuKind::WorkspaceCreateTarget { machines } = &menu.kind {
         if idx == 0 {
             state.request_new_workspace = true;
@@ -1463,6 +1470,22 @@ impl App {
     }
 
     pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
+        if let ContextMenuKind::TabCreateTarget { .. } = &menu.kind {
+            if idx == 0 {
+                self.runtime_tab_create(
+                    "tui.tab.create",
+                    crate::api::schema::TabCreateParams {
+                        workspace_id: None,
+                        cwd: None,
+                        focus: true,
+                        label: None,
+                        env: Default::default(),
+                    },
+                );
+            }
+            leave_modal(&mut self.state);
+            return;
+        }
         if let ContextMenuKind::WorkspaceCreateTarget { machines } = &menu.kind {
             if idx == 0 {
                 self.begin_tui_local_workspace_create("tui.workspace.create_local");
@@ -2592,6 +2615,45 @@ mod tests {
         assert_eq!(state.mode, Mode::RenameTab);
         assert_eq!(state.name_input, "1");
         assert!(!state.name_input_replace_on_type);
+    }
+
+    #[test]
+    fn tab_type_terminal_selection_requests_terminal_tab() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::TabCreateTarget {
+                plugin_panes: Vec::new(),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 0);
+
+        assert!(state.request_new_tab);
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[tokio::test]
+    async fn api_tab_type_terminal_selection_creates_terminal_tab() {
+        let mut app = app_with_test_workspaces(&["test"]);
+        app.state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::TabCreateTarget {
+                plugin_panes: Vec::new(),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        app.apply_context_menu_action_via_api(menu, 0);
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
     }
 
     #[test]

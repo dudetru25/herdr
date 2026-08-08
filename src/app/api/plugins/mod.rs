@@ -359,19 +359,8 @@ impl App {
         let Some(plugin) = self.state.installed_plugins.get(&plugin_id).cloned() else {
             return encode_error(id, "plugin_not_found", "plugin not found");
         };
-        if !plugin_manifest_available(&plugin) {
-            return encode_error(
-                id,
-                "plugin_manifest_unavailable",
-                format!("plugin {plugin_id} manifest is unavailable"),
-            );
-        }
-        if !plugin.enabled {
-            return encode_error(
-                id,
-                "plugin_disabled",
-                format!("plugin {plugin_id} is disabled"),
-            );
+        if let Err((code, message)) = ensure_plugin_available_for_open(&plugin) {
+            return encode_error(id, code, message);
         }
         let Some(entrypoint) = normalize_action_id(&params.entrypoint) else {
             return encode_error(id, "invalid_plugin_entrypoint", "invalid entrypoint id");
@@ -388,10 +377,7 @@ impl App {
                 format!("plugin pane entrypoint '{entrypoint}' not found"),
             );
         };
-        if let Err((code, message)) = ensure_platform_supported(
-            effective_platforms(&pane.platforms, &plugin.platforms),
-            "plugin pane",
-        ) {
+        if let Err((code, message)) = ensure_plugin_pane_openable(&plugin, &pane) {
             return encode_error(id, code, message);
         }
         let placement = params.placement.unwrap_or(pane.placement);
@@ -684,6 +670,35 @@ fn plugin_manifest_available(plugin: &InstalledPluginInfo) -> bool {
     })
 }
 
+fn ensure_plugin_available_for_open(
+    plugin: &InstalledPluginInfo,
+) -> Result<(), (&'static str, String)> {
+    if !plugin_manifest_available(plugin) {
+        return Err((
+            "plugin_manifest_unavailable",
+            format!("plugin {} manifest is unavailable", plugin.plugin_id),
+        ));
+    }
+    if !plugin.enabled {
+        return Err((
+            "plugin_disabled",
+            format!("plugin {} is disabled", plugin.plugin_id),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_plugin_pane_openable(
+    plugin: &InstalledPluginInfo,
+    pane: &crate::api::schema::PluginManifestPane,
+) -> Result<(), (&'static str, String)> {
+    ensure_plugin_available_for_open(plugin)?;
+    ensure_platform_supported(
+        effective_platforms(&pane.platforms, &plugin.platforms),
+        "plugin pane",
+    )
+}
+
 fn manifest_action_info(
     plugin_id: &str,
     plugin_platforms: &Option<Vec<crate::api::schema::PluginPlatform>>,
@@ -837,6 +852,44 @@ action = "bootstrap"
             result.contains("plugin_linked"),
             "expected plugin_linked: {result}"
         );
+    }
+
+    fn current_plugin_platform_for_test() -> crate::api::schema::PluginPlatform {
+        if cfg!(target_os = "linux") {
+            crate::api::schema::PluginPlatform::Linux
+        } else if cfg!(target_os = "macos") {
+            crate::api::schema::PluginPlatform::Macos
+        } else {
+            crate::api::schema::PluginPlatform::Windows
+        }
+    }
+
+    fn unsupported_plugin_platform_for_test() -> crate::api::schema::PluginPlatform {
+        if cfg!(target_os = "linux") {
+            crate::api::schema::PluginPlatform::Macos
+        } else {
+            crate::api::schema::PluginPlatform::Linux
+        }
+    }
+
+    fn open_test_plugin_pane(app: &mut App, entrypoint: &str) -> serde_json::Value {
+        let response = app.handle_api_request(Request {
+            id: "pane-open-platform".into(),
+            method: Method::PluginPaneOpen(PluginPaneOpenParams {
+                plugin_id: "example.worktree-bootstrap".into(),
+                entrypoint: entrypoint.into(),
+                placement: Some(PluginPanePlacement::Split),
+                width: None,
+                height: None,
+                workspace_id: None,
+                target_pane_id: None,
+                direction: None,
+                cwd: None,
+                focus: false,
+                env: std::collections::HashMap::new(),
+            }),
+        });
+        serde_json::from_str(&response).unwrap()
     }
 
     #[test]
@@ -1374,6 +1427,102 @@ platforms = ["linux", "macos"]
         });
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["error"]["code"], "plugin_not_found");
+    }
+
+    #[test]
+    fn plugin_pane_open_inherits_plugin_level_platform_mismatch() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-pane-platform-inherited");
+        write_manifest(&root);
+        link_manifest(&mut app, &root);
+        let plugin = app
+            .state
+            .installed_plugins
+            .get_mut("example.worktree-bootstrap")
+            .unwrap();
+        plugin.platforms = Some(vec![unsupported_plugin_platform_for_test()]);
+        plugin.panes[0].platforms = None;
+
+        let value = open_test_plugin_pane(&mut app, "board");
+
+        assert_eq!(value["error"]["code"], "platform_unsupported");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_pane_open_honors_pane_platform_override_and_rejects_mismatch() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-pane-platform-override");
+        write_manifest(&root);
+        link_manifest(&mut app, &root);
+        let plugin = app
+            .state
+            .installed_plugins
+            .get_mut("example.worktree-bootstrap")
+            .unwrap();
+        plugin.platforms = Some(vec![unsupported_plugin_platform_for_test()]);
+        plugin.panes[0].platforms = Some(vec![current_plugin_platform_for_test()]);
+
+        let supported_override = open_test_plugin_pane(&mut app, "board");
+        assert_eq!(supported_override["error"]["code"], "no_active_pane");
+
+        app.state
+            .installed_plugins
+            .get_mut("example.worktree-bootstrap")
+            .unwrap()
+            .panes[0]
+            .platforms = Some(vec![unsupported_plugin_platform_for_test()]);
+        let mismatched_override = open_test_plugin_pane(&mut app, "board");
+        assert_eq!(mismatched_override["error"]["code"], "platform_unsupported");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_pane_open_preserves_eligibility_error_ordering() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-pane-eligibility-order");
+        write_manifest(&root);
+        link_manifest(&mut app, &root);
+        let plugin = app
+            .state
+            .installed_plugins
+            .get_mut("example.worktree-bootstrap")
+            .unwrap();
+        plugin.enabled = false;
+        plugin.warnings.push(format!(
+            "{}missing manifest",
+            crate::persist::plugin_registry::MANIFEST_UNAVAILABLE_WARNING_PREFIX
+        ));
+        plugin.platforms = Some(vec![unsupported_plugin_platform_for_test()]);
+
+        let unavailable = open_test_plugin_pane(&mut app, "");
+        assert_eq!(unavailable["error"]["code"], "plugin_manifest_unavailable");
+
+        app.state
+            .installed_plugins
+            .get_mut("example.worktree-bootstrap")
+            .unwrap()
+            .warnings
+            .clear();
+        let disabled = open_test_plugin_pane(&mut app, "");
+        assert_eq!(disabled["error"]["code"], "plugin_disabled");
+
+        app.state
+            .installed_plugins
+            .get_mut("example.worktree-bootstrap")
+            .unwrap()
+            .enabled = true;
+        let invalid_entrypoint = open_test_plugin_pane(&mut app, "");
+        assert_eq!(
+            invalid_entrypoint["error"]["code"],
+            "invalid_plugin_entrypoint"
+        );
+
+        let missing_entrypoint = open_test_plugin_pane(&mut app, "missing");
+        assert_eq!(missing_entrypoint["error"]["code"], "plugin_pane_not_found");
+        let platform_mismatch = open_test_plugin_pane(&mut app, "board");
+        assert_eq!(platform_mismatch["error"]["code"], "platform_unsupported");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
