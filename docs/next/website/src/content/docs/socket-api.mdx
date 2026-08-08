@@ -100,7 +100,7 @@ Raw socket method names use dot notation:
 | Notification | `notification.show` |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
-| Machine | `machine.list`, `machine.add` |
+| Machine | `machine.list`, `machine.ssh_hosts`, `machine.add`, `machine.import` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
@@ -128,7 +128,7 @@ worktree discovery remains `worktree.list`.
 From the CLI, `herdr api snapshot` prints the live `session.snapshot` response
 as JSON for clients and agents that want a simple bootstrap command.
 
-`machine.list` returns the live configured registry as `name`, `target`, and optional `cwd` records. `machine.add` accepts `name`, `target`, and optional `cwd`, persists one new entry to `config.toml`, reloads the live registry, and returns the added machine:
+`machine.list` returns the live configured registry as `name`, `target`, and optional `cwd` records. `machine.ssh_hosts` lists the aliases discovered from the user's SSH config. `machine.add` accepts `name`, `target`, and optional `cwd`, persists one new entry to `config.toml`, reloads the live registry, and returns the added machine:
 
 ```json
 {"id":"req_machine_list","method":"machine.list","params":{}}
@@ -138,6 +138,18 @@ as JSON for clients and agents that want a simple bootstrap command.
 ```
 
 `machine.add` trims the submitted fields. It rejects an empty name or target, a target beginning with `-`, a blank provided `cwd`, or a duplicate machine name. These failures return `invalid_machine` or `machine_already_exists`; config persistence and reload failures return `config_update_failed` or `config_reload_failed`. Every error leaves the live registry unchanged, and persistence failures do not replace the existing config. If the new machine applies while an unrelated config section reports a diagnostic, the method returns success and leaves that diagnostic visible in Herdr. The method does not probe SSH connectivity and does not create a workspace; call `workspace.create` with the returned machine name when you want to open one.
+
+`machine.import` accepts an `aliases` array. It validates every alias, reports
+`added`, `already_exists`, or `failed` with a reason for each alias, and writes
+all valid new machines in one atomic config update before reloading the live
+registry. Imported machines use the alias as both `name` and `target`, with no
+`cwd`. An undiscovered alias is reported as `failed` without preventing other
+aliases from being imported:
+
+```json
+{"id":"req_machine_import","method":"machine.import","params":{"aliases":["build","deploy"]}}
+{"id":"req_machine_import","result":{"type":"machine_imported","outcomes":[{"status":"added","alias":"build"},{"status":"already_exists","alias":"deploy"}]}}
+```
 
 For `workspace.create`, `machine` and `cwd` are mutually exclusive. Workspace records persist and expose the optional machine registry name; the SSH target is resolved from live config on every future pane launch.
 

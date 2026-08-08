@@ -144,10 +144,19 @@ A workspace is the top-level project or work context. Creating one also creates 
 
 ```bash
 herdr machine list
+herdr machine add --name NAME --target TARGET [--cwd PATH]
+herdr machine import <ALIAS>...
+herdr machine import --all
+herdr machine ssh-hosts [--json]
 herdr workspace create --machine build
 ```
 
-`machine list` prints the live `[[machines]]` registry. `workspace create --machine NAME` creates an SSH-backed workspace; `--machine` and `--cwd` are mutually exclusive.
+`machine list` prints the live `[[machines]]` registry. `machine add` saves one
+machine without opening a workspace. `machine import` saves discovered SSH
+host aliases as machines; `--all` imports every alias returned by the user's
+SSH config. Each imported machine uses the alias as both its name and target
+and leaves `cwd` unset. `workspace create --machine NAME` creates an SSH-backed
+workspace; `--machine` and `--cwd` are mutually exclusive.
 
 ## Worktrees
 

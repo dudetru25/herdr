@@ -241,8 +241,26 @@ fn workspace_command() -> Command {
 
 fn machine_command() -> Command {
     Command::new("machine")
-        .about("Inspect configured SSH machines")
+        .about("Manage configured SSH machines")
         .subcommand(Command::new("list").about("List configured SSH machines"))
+        .subcommand(
+            Command::new("add")
+                .about("Add one SSH machine")
+                .arg(option("name", "NAME").required(true))
+                .arg(option("target", "TARGET").required(true))
+                .arg(path_option("cwd", "PATH")),
+        )
+        .subcommand(
+            Command::new("import")
+                .about("Import discovered SSH hosts as machines")
+                .arg(
+                    clap::Arg::new("alias")
+                        .value_name("ALIAS")
+                        .num_args(1..)
+                        .required_unless_present("all"),
+                )
+                .arg(flag("all").conflicts_with("alias")),
+        )
         .subcommand(
             Command::new("ssh-hosts")
                 .about("List importable SSH hosts from the user config")
@@ -1164,6 +1182,27 @@ mod tests {
         let help = String::from_utf8(help).unwrap();
         assert!(help.contains("Usage: herdr machine ssh-hosts [OPTIONS]"));
         assert!(help.contains("--json"));
+    }
+
+    #[test]
+    fn spec_includes_machine_import_command() {
+        let root = super::command();
+        let command = command_path(&root, &["machine", "import"]);
+        assert!(has_option(command, "all"));
+        let mut help = Vec::new();
+        super::write_requested_help(
+            &[
+                "herdr".to_string(),
+                "machine".to_string(),
+                "import".to_string(),
+                "--help".to_string(),
+            ],
+            &mut help,
+        )
+        .unwrap();
+        let help = String::from_utf8(help).unwrap();
+        assert!(help.contains("Usage: herdr machine import [OPTIONS]"));
+        assert!(help.contains("--all"));
     }
 
     #[test]

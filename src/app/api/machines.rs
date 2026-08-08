@@ -4,7 +4,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::api::schema::{MachineAddParams, MachineInfo, ResponseResult, SshHostInfo};
+use crate::api::schema::{
+    MachineAddParams, MachineImportOutcome, MachineImportParams, MachineInfo, ResponseResult,
+    SshHostInfo,
+};
 use crate::app::App;
 use crate::config::{MachineConfig, MachineConfigEditError};
 
@@ -139,6 +142,63 @@ fn encode_machine_add_after_reload(
     )
 }
 
+fn discover_ssh_hosts(app: &App) -> Result<Vec<SshHostInfo>, String> {
+    let path = crate::ssh_config::user_config_path().map_err(|error| error.to_string())?;
+    let hosts = crate::ssh_config::parse_file(&path).map_err(|error| error.to_string())?;
+    Ok(hosts
+        .into_iter()
+        .map(|host| SshHostInfo {
+            already_configured: app
+                .state
+                .machines
+                .iter()
+                .any(|machine| machine.name == host.alias || machine.target == host.alias),
+            alias: host.alias,
+            target: host.target_hint,
+        })
+        .collect())
+}
+
+fn encode_machine_import_after_reload(
+    app: &App,
+    id: String,
+    outcomes: Vec<MachineImportOutcome>,
+    report: crate::config::ConfigReloadReport,
+) -> String {
+    if report.status == crate::config::ConfigReloadStatus::Failed {
+        let details = report.diagnostics.join("; ");
+        return encode_error(
+            id,
+            "config_reload_failed",
+            if details.is_empty() {
+                "saved imported machines but failed to reload config".to_string()
+            } else {
+                format!("saved imported machines but failed to reload config: {details}")
+            },
+        );
+    }
+
+    for outcome in &outcomes {
+        let MachineImportOutcome::Added { alias } = outcome else {
+            continue;
+        };
+        let present = app.state.machines.iter().any(|machine| {
+            machine.name == *alias && machine.target == *alias && machine.cwd.is_none()
+        });
+        if !present {
+            return encode_error(
+                id,
+                "config_reload_failed",
+                format!(
+                    "saved imported machine {alias:?} but it did not appear in the live registry"
+                ),
+            );
+        }
+    }
+
+    encode_success(id, ResponseResult::MachineImported { outcomes })
+}
+
 impl App {
     pub(super) fn handle_machine_list(&mut self, id: String) -> String {
         encode_success(
@@ -150,30 +210,10 @@ impl App {
     }
 
     pub(super) fn handle_machine_ssh_hosts(&mut self, id: String) -> String {
-        let path = match crate::ssh_config::user_config_path() {
-            Ok(path) => path,
-            Err(error) => {
-                return encode_error(id, "ssh_config_unavailable", error.to_string());
-            }
-        };
-        let hosts = match crate::ssh_config::parse_file(&path) {
+        let hosts = match discover_ssh_hosts(self) {
             Ok(hosts) => hosts,
-            Err(error) => {
-                return encode_error(id, "ssh_config_unavailable", error.to_string());
-            }
+            Err(error) => return encode_error(id, "ssh_config_unavailable", error),
         };
-        let hosts = hosts
-            .into_iter()
-            .map(|host| SshHostInfo {
-                already_configured: self
-                    .state
-                    .machines
-                    .iter()
-                    .any(|machine| machine.name == host.alias || machine.target == host.alias),
-                alias: host.alias,
-                target: host.target_hint,
-            })
-            .collect();
         encode_success(id, ResponseResult::MachineSshHosts { hosts })
     }
 
@@ -221,6 +261,95 @@ impl App {
 
         let report = self.apply_config_from_disk(false);
         encode_machine_add_after_reload(self, id, &machine, report)
+    }
+
+    pub(super) fn handle_machine_import(
+        &mut self,
+        id: String,
+        params: MachineImportParams,
+    ) -> String {
+        let hosts = match discover_ssh_hosts(self) {
+            Ok(hosts) => hosts,
+            Err(error) => return encode_error(id, "ssh_config_unavailable", error),
+        };
+        let discovered_hosts = hosts
+            .into_iter()
+            .map(|host| (host.alias, host.already_configured))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        let path = crate::config::config_path();
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return encode_error(
+                    id,
+                    "config_update_failed",
+                    format!("failed to read {}: {err}", path.display()),
+                )
+            }
+        };
+
+        let mut updated = content.clone();
+        let mut outcomes = Vec::with_capacity(params.aliases.len());
+        for raw_alias in params.aliases {
+            let alias = raw_alias.trim().to_string();
+            let machine = MachineConfig {
+                name: alias.clone(),
+                target: alias.clone(),
+                cwd: None,
+            };
+
+            if let Err(error) = crate::config::append_machine_config("", &machine) {
+                outcomes.push(MachineImportOutcome::Failed {
+                    alias,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+
+            let Some(already_configured) = discovered_hosts.get(&machine.name) else {
+                outcomes.push(MachineImportOutcome::Failed {
+                    alias,
+                    reason: "SSH host alias was not discovered".to_string(),
+                });
+                continue;
+            };
+            if *already_configured {
+                outcomes.push(MachineImportOutcome::AlreadyExists { alias });
+                continue;
+            }
+
+            match crate::config::append_machine_config(&updated, &machine) {
+                Ok(next) => {
+                    updated = next;
+                    outcomes.push(MachineImportOutcome::Added { alias });
+                }
+                Err(MachineConfigEditError::MachineAlreadyExists { .. }) => {
+                    outcomes.push(MachineImportOutcome::AlreadyExists { alias });
+                }
+                Err(error) => outcomes.push(MachineImportOutcome::Failed {
+                    alias,
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        if updated == content {
+            return encode_success(id, ResponseResult::MachineImported { outcomes });
+        }
+
+        if let Err(err) = write_config_atomically(&path, &updated) {
+            crate::logging::config_write_failed(&path, "machine import", &err.to_string());
+            return encode_error(
+                id,
+                "config_update_failed",
+                format!("failed to write {}: {err}", path.display()),
+            );
+        }
+
+        let report = self.apply_config_from_disk(false);
+        encode_machine_import_after_reload(self, id, outcomes, report)
     }
 }
 
@@ -524,6 +653,264 @@ mod tests {
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "config_reload_failed");
         assert!(error.error.message.contains("config read failed"));
+    }
+
+    #[test]
+    fn machine_import_writes_valid_aliases_once_and_reports_each_outcome() {
+        let _config_guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = temp_config_path("import-batch");
+        let home =
+            std::env::temp_dir().join(format!("herdr-machine-import-ssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(
+            home.join(".ssh/config"),
+            "Host build\n  HostName build.example.test\nHost deploy\n  HostName deploy.example.test\n",
+        )
+        .unwrap();
+        std::fs::write(&path, "# keep this\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        with_test_ssh_home(&home, || {
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(
+                &Config::default(),
+                true,
+                None,
+                api_rx,
+                crate::api::EventHub::default(),
+            );
+            let response = app.handle_machine_import(
+                "import".into(),
+                MachineImportParams {
+                    aliases: vec![
+                        "build".into(),
+                        "deploy".into(),
+                        "missing".into(),
+                        "build".into(),
+                    ],
+                },
+            );
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::MachineImported { outcomes } = success.result else {
+                panic!("expected machine import response: {response}");
+            };
+            assert_eq!(outcomes.len(), 4);
+            assert!(matches!(
+                &outcomes[0],
+                MachineImportOutcome::Added { alias } if alias == "build"
+            ));
+            assert!(matches!(
+                &outcomes[1],
+                MachineImportOutcome::Added { alias } if alias == "deploy"
+            ));
+            assert!(matches!(
+                &outcomes[2],
+                MachineImportOutcome::Failed { alias, reason }
+                    if alias == "missing" && reason.contains("not discovered")
+            ));
+            assert!(matches!(
+                &outcomes[3],
+                MachineImportOutcome::AlreadyExists { alias } if alias == "build"
+            ));
+            assert_eq!(
+                app.state.machines,
+                vec![
+                    MachineConfig {
+                        name: "build".into(),
+                        target: "build".into(),
+                        cwd: None,
+                    },
+                    MachineConfig {
+                        name: "deploy".into(),
+                        target: "deploy".into(),
+                        cwd: None,
+                    },
+                ]
+            );
+            let saved = std::fs::read_to_string(&path).unwrap();
+            assert!(saved.starts_with("# keep this\n"));
+            assert_eq!(saved.matches("[[machines]]").count(), 2);
+            assert!(saved.contains("name = \"build\""));
+            assert!(saved.contains("target = \"build\""));
+            assert!(saved.contains("name = \"deploy\""));
+            assert!(saved.contains("target = \"deploy\""));
+        });
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn machine_import_treats_an_existing_target_alias_as_already_configured() {
+        let _config_guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = temp_config_path("import-existing-target");
+        let home = std::env::temp_dir().join(format!(
+            "herdr-machine-import-existing-target-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(
+            home.join(".ssh/config"),
+            "Host build\n  HostName build.example.test\n",
+        )
+        .unwrap();
+        let original = "# keep this\n[[machines]]\nname = \"prod\"\ntarget = \"build\"\n";
+        std::fs::write(&path, original).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let config = Config {
+            machines: vec![MachineConfig {
+                name: "prod".into(),
+                target: "build".into(),
+                cwd: None,
+            }],
+            ..Config::default()
+        };
+
+        with_test_ssh_home(&home, || {
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+            let response = app.handle_machine_import(
+                "import-existing-target".into(),
+                MachineImportParams {
+                    aliases: vec!["build".into()],
+                },
+            );
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::MachineImported { outcomes } = success.result else {
+                panic!("expected machine import response: {response}");
+            };
+
+            assert!(matches!(
+                outcomes.as_slice(),
+                [MachineImportOutcome::AlreadyExists { alias }] if alias == "build"
+            ));
+            assert_eq!(app.state.machines, config.machines);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        });
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn machine_import_keeps_valid_aliases_when_one_alias_fails_validation() {
+        let _config_guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = temp_config_path("import-validation");
+        let home = std::env::temp_dir().join(format!(
+            "herdr-machine-import-validation-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(
+            home.join(".ssh/config"),
+            "Host valid\n  HostName valid.example.test\nHost -bad\n  HostName bad.example.test\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        with_test_ssh_home(&home, || {
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(
+                &Config::default(),
+                true,
+                None,
+                api_rx,
+                crate::api::EventHub::default(),
+            );
+            let response = app.handle_machine_import(
+                "import-validation".into(),
+                MachineImportParams {
+                    aliases: vec!["-bad".into(), "valid".into()],
+                },
+            );
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::MachineImported { outcomes } = success.result else {
+                panic!("expected machine import response: {response}");
+            };
+            assert!(matches!(
+                &outcomes[0],
+                MachineImportOutcome::Failed { alias, reason }
+                    if alias == "-bad" && reason.contains("must not start with '-'")
+            ));
+            assert!(matches!(
+                &outcomes[1],
+                MachineImportOutcome::Added { alias } if alias == "valid"
+            ));
+            assert_eq!(app.state.machines.len(), 1);
+            assert_eq!(app.state.machines[0].name, "valid");
+        });
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn machine_import_applies_empty_name_and_option_like_target_validation() {
+        let _config_guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = temp_config_path("import-invalid-input");
+        let home = std::env::temp_dir().join(format!(
+            "herdr-machine-import-invalid-input-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(
+            home.join(".ssh/config"),
+            "Host valid\n  HostName valid.example.test\nHost -bad\n  HostName bad.example.test\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        with_test_ssh_home(&home, || {
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(
+                &Config::default(),
+                true,
+                None,
+                api_rx,
+                crate::api::EventHub::default(),
+            );
+            let response = app.handle_machine_import(
+                "import-invalid-input".into(),
+                MachineImportParams {
+                    aliases: vec!["".into(), "-bad".into()],
+                },
+            );
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::MachineImported { outcomes } = success.result else {
+                panic!("expected machine import response: {response}");
+            };
+            assert!(matches!(
+                &outcomes[0],
+                MachineImportOutcome::Failed { alias, reason }
+                    if alias.is_empty() && reason.contains("name must not be empty")
+            ));
+            assert!(matches!(
+                &outcomes[1],
+                MachineImportOutcome::Failed { alias, reason }
+                    if alias == "-bad" && reason.contains("must not start with '-'")
+            ));
+            assert!(app.state.machines.is_empty());
+            assert!(!path.exists());
+        });
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

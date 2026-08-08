@@ -1,9 +1,10 @@
 use crate::api::schema::{
-    EmptyParams, Method, PaneFocusDirectionParams, PaneMoveParams, PaneRenameParams,
-    PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget, PaneZoomParams, Request,
-    TabCreateParams, TabListParams, TabRenameParams, TabTarget, WorkspaceCreateParams,
-    WorkspaceParentSpaceParams, WorkspaceRenameParams, WorkspaceTarget, WorktreeCreateParams,
-    WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    EmptyParams, MachineAddParams, MachineImportParams, Method, PaneFocusDirectionParams,
+    PaneMoveParams, PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams,
+    PaneTarget, PaneZoomParams, Request, TabCreateParams, TabListParams, TabRenameParams,
+    TabTarget, WorkspaceCreateParams, WorkspaceParentSpaceParams, WorkspaceRenameParams,
+    WorkspaceTarget, WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams,
+    WorktreeRemoveParams,
 };
 
 fn print_method_response(id: &'static str, method: Method) -> std::io::Result<i32> {
@@ -32,6 +33,17 @@ pub(super) fn machine_ssh_hosts() -> std::io::Result<serde_json::Value> {
         id: "cli:machine:ssh-hosts".into(),
         method: Method::MachineSshHosts(EmptyParams::default()),
     })
+}
+
+pub(super) fn machine_add(params: MachineAddParams) -> std::io::Result<i32> {
+    print_method_response("cli:machine:add", Method::MachineAdd(params))
+}
+
+pub(super) fn machine_import(aliases: Vec<String>) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:machine:import",
+        Method::MachineImport(MachineImportParams { aliases }),
+    )
 }
 
 pub(super) fn workspace_create(params: WorkspaceCreateParams) -> std::io::Result<i32> {

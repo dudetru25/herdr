@@ -1352,6 +1352,7 @@ impl App {
             Method::MachineList(_) => return self.handle_machine_list(request.id),
             Method::MachineSshHosts(_) => return self.handle_machine_ssh_hosts(request.id),
             Method::MachineAdd(params) => return self.handle_machine_add(request.id, params),
+            Method::MachineImport(params) => return self.handle_machine_import(request.id, params),
             Method::WorkspaceFocus(target) => {
                 return self.handle_workspace_focus(request.id, target)
             }

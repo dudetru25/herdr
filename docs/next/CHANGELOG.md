@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Added non-interactive `herdr machine add` and `herdr machine import` commands, including `--all` import from discovered SSH host aliases and per-alias import outcomes.
+
 ## [0.8.0] - 2026-08-03
 
 ### Added

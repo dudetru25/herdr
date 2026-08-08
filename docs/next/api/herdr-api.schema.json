@@ -2321,6 +2321,20 @@
           ],
           "type": "object"
         },
+        "MachineImportParams": {
+          "properties": {
+            "aliases": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "aliases"
+          ],
+          "type": "object"
+        },
         "NotificationShowParams": {
           "properties": {
             "body": {
@@ -5105,6 +5119,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/MachineAddParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "machine.import",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/MachineImportParams"
             }
           },
           "required": [
@@ -7921,6 +7951,62 @@
             }
           ]
         },
+        "MachineImportOutcome": {
+          "oneOf": [
+            {
+              "properties": {
+                "alias": {
+                  "type": "string"
+                },
+                "status": {
+                  "const": "added",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "alias"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "alias": {
+                  "type": "string"
+                },
+                "status": {
+                  "const": "already_exists",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "alias"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "alias": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "status": {
+                  "const": "failed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "alias",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "MachineInfo": {
           "properties": {
             "cwd": {
@@ -9424,6 +9510,25 @@
               "required": [
                 "type",
                 "machine"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "outcomes": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/MachineImportOutcome"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "machine_imported",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "outcomes"
               ],
               "type": "object"
             },
