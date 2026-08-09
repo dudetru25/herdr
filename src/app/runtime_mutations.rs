@@ -1,7 +1,7 @@
 use crate::api::schema::{
-    EmptyParams, LayoutSetSplitRatioParams, MachineAddParams, Method, PaneFocusDirectionParams,
-    PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget,
-    PaneZoomParams, TabCreateParams, TabMoveParams, TabRenameParams, TabTarget,
+    EmptyParams, LayoutSetSplitRatioParams, MachineAddParams, MachineImportParams, Method,
+    PaneFocusDirectionParams, PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams,
+    PaneTarget, PaneZoomParams, TabCreateParams, TabMoveParams, TabRenameParams, TabTarget,
     WorkspaceCreateParams, WorkspaceMoveBlockParams, WorkspaceMoveParams, WorkspaceRenameParams,
     WorkspaceTarget, WorktreeCreateParams, WorktreeOpenParams, WorktreeRemoveParams,
 };
@@ -43,6 +43,18 @@ impl App {
         params: MachineAddParams,
     ) -> String {
         self.dispatch_runtime_mutation(id, Method::MachineAdd(params))
+    }
+
+    pub(crate) fn runtime_machine_ssh_hosts(&mut self, id: &'static str) -> String {
+        self.dispatch_runtime_mutation(id, Method::MachineSshHosts(EmptyParams::default()))
+    }
+
+    pub(crate) fn runtime_machine_import(
+        &mut self,
+        id: &'static str,
+        aliases: Vec<String>,
+    ) -> String {
+        self.dispatch_runtime_mutation(id, Method::MachineImport(MachineImportParams { aliases }))
     }
 
     pub(crate) fn runtime_workspace_rename(

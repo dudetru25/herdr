@@ -85,6 +85,8 @@ Register machines that Herdr can open through plain SSH. The remote machine does
 
 Left-click New to create a Local workspace immediately. Right-click New to open a target picker with Local, every configured machine, and Add remote machine. The add form asks for a unique name, an SSH target, and an optional remote working directory. Save & open writes the machine to `config.toml`, reloads the live registry, and opens its workspace. Herdr validates the fields before saving, but it does not probe SSH connectivity; authentication and connection errors appear in the new terminal.
 
+Select Import SSH hosts in the add form to load aliases from `~/.ssh/config`. Use Space or a mouse click to select more than one alias, then confirm once. Herdr marks aliases that are already configured and does not let you select them. It shows the result for each selected alias after the import. Esc or Back returns to the manual form without clearing its fields.
+
 ```toml
 [[machines]]
 name = "build"

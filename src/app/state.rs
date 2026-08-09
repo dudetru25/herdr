@@ -628,6 +628,7 @@ pub enum MachineCreateField {
     Name,
     Target,
     Cwd,
+    Import,
 }
 
 impl MachineCreateField {
@@ -635,16 +636,88 @@ impl MachineCreateField {
         match self {
             Self::Name => Self::Target,
             Self::Target => Self::Cwd,
-            Self::Cwd => Self::Name,
+            Self::Cwd => Self::Import,
+            Self::Import => Self::Name,
         }
     }
 
     pub fn previous(self) -> Self {
         match self {
-            Self::Name => Self::Cwd,
+            Self::Name => Self::Import,
             Self::Target => Self::Name,
             Self::Cwd => Self::Target,
+            Self::Import => Self::Cwd,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineImportHostState {
+    pub alias: String,
+    pub target: String,
+    pub already_configured: bool,
+    pub selected: bool,
+    pub outcome: Option<crate::api::schema::MachineImportOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineImportState {
+    pub hosts: Vec<MachineImportHostState>,
+    pub highlighted: usize,
+    pub error: Option<String>,
+}
+
+impl MachineImportState {
+    pub fn from_hosts(hosts: Vec<crate::api::schema::SshHostInfo>) -> Self {
+        Self {
+            hosts: hosts
+                .into_iter()
+                .map(|host| MachineImportHostState {
+                    alias: host.alias,
+                    target: host.target,
+                    already_configured: host.already_configured,
+                    selected: false,
+                    outcome: None,
+                })
+                .collect(),
+            highlighted: 0,
+            error: None,
+        }
+    }
+
+    pub fn move_next(&mut self) {
+        if !self.hosts.is_empty() {
+            self.highlighted = (self.highlighted + 1) % self.hosts.len();
+        }
+    }
+
+    pub fn move_previous(&mut self) {
+        if !self.hosts.is_empty() {
+            self.highlighted = self
+                .highlighted
+                .checked_sub(1)
+                .unwrap_or(self.hosts.len() - 1);
+        }
+    }
+
+    pub fn toggle(&mut self, index: usize) {
+        let Some(host) = self.hosts.get_mut(index) else {
+            return;
+        };
+        if host.already_configured {
+            return;
+        }
+        host.selected = !host.selected;
+        host.outcome = None;
+        self.error = None;
+    }
+
+    pub fn selected_aliases(&self) -> Vec<String> {
+        self.hosts
+            .iter()
+            .filter(|host| host.selected && !host.already_configured)
+            .map(|host| host.alias.clone())
+            .collect()
     }
 }
 
@@ -655,6 +728,7 @@ pub struct MachineCreateState {
     pub cwd: String,
     pub focused: MachineCreateField,
     pub error: Option<String>,
+    pub import: Option<MachineImportState>,
 }
 
 impl Default for MachineCreateState {
@@ -665,6 +739,7 @@ impl Default for MachineCreateState {
             cwd: String::new(),
             focused: MachineCreateField::Name,
             error: None,
+            import: None,
         }
     }
 }

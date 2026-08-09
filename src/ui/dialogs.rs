@@ -12,7 +12,7 @@ use super::widgets::{
     render_modal_header, render_modal_shell, render_panel_shell, ActionButtonSpec,
 };
 use crate::app::{
-    state::{MachineCreateField, WorktreeOpenState},
+    state::{MachineCreateField, MachineImportState, WorktreeOpenState},
     AppState, Mode,
 };
 use crate::terminal::TerminalRuntimeRegistry;
@@ -153,10 +153,14 @@ pub(crate) fn add_remote_machine_input_rects(inner: Rect) -> [(MachineCreateFiel
     ]
 }
 
-pub(crate) fn add_remote_machine_button_rects(inner: Rect) -> (Rect, Rect) {
+pub(crate) fn add_remote_machine_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
     let rects = action_button_row_rects(
         inner,
         &[
+            ActionButtonSpec {
+                hint: None,
+                label: "import SSH hosts",
+            },
             ActionButtonSpec {
                 hint: Some("↵"),
                 label: "add and open",
@@ -166,10 +170,54 @@ pub(crate) fn add_remote_machine_button_rects(inner: Rect) -> (Rect, Rect) {
                 label: "cancel",
             },
         ],
+        3,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1], rects[2])
+}
+
+pub(crate) fn machine_import_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "import selected",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "back",
+            },
+        ],
         2,
         inner.height.saturating_sub(1),
     );
     (rects[0], rects[1])
+}
+
+pub(crate) fn machine_import_row_rects(
+    inner: Rect,
+    import: &MachineImportState,
+) -> Vec<(usize, Rect)> {
+    let visible_rows = usize::from(inner.height.saturating_sub(6));
+    let start = import
+        .highlighted
+        .saturating_sub(visible_rows.saturating_sub(1));
+    (start..import.hosts.len())
+        .take(visible_rows)
+        .enumerate()
+        .map(|(row, index)| {
+            (
+                index,
+                Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(3 + row as u16),
+                    inner.width,
+                    1,
+                ),
+            )
+        })
+        .collect()
 }
 
 pub(super) fn render_add_remote_machine_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
@@ -188,6 +236,97 @@ pub(super) fn render_add_remote_machine_overlay(app: &AppState, frame: &mut Fram
         return;
     };
     if inner.height < 12 {
+        return;
+    }
+
+    if let Some(import) = create.import.as_ref() {
+        render_modal_header(
+            frame,
+            Rect::new(inner.x, inner.y, inner.width, 1),
+            "import SSH hosts",
+            &app.palette,
+        );
+        frame.render_widget(
+            Paragraph::new(" space toggle  ·  ↑/↓ move  ·  enter import")
+                .style(Style::default().fg(app.palette.overlay0)),
+            Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
+        );
+
+        if import.hosts.is_empty() {
+            frame.render_widget(
+                Paragraph::new(" No importable SSH hosts were found.")
+                    .style(Style::default().fg(app.palette.overlay0)),
+                Rect::new(inner.x, inner.y.saturating_add(4), inner.width, 1),
+            );
+        }
+        for (index, rect) in machine_import_row_rects(inner, import) {
+            let host = &import.hosts[index];
+            let (marker, suffix, foreground) = match host.outcome.as_ref() {
+                Some(crate::api::schema::MachineImportOutcome::Added { .. }) => {
+                    ("[+]", "added".to_string(), app.palette.green)
+                }
+                Some(crate::api::schema::MachineImportOutcome::AlreadyExists { .. }) => {
+                    ("[·]", "already added".to_string(), app.palette.overlay0)
+                }
+                Some(crate::api::schema::MachineImportOutcome::Failed { reason, .. }) => {
+                    ("[!]", reason.clone(), app.palette.red)
+                }
+                None if host.already_configured => {
+                    ("[·]", "already added".to_string(), app.palette.overlay0)
+                }
+                None if host.selected => ("[x]", host.target.clone(), app.palette.text),
+                None => ("[ ]", host.target.clone(), app.palette.text),
+            };
+            let text = truncate_end(
+                &format!(" {marker} {}  {suffix}", host.alias),
+                rect.width as usize,
+            );
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(foreground).bg(
+                    if index == import.highlighted {
+                        app.palette.surface1
+                    } else {
+                        app.palette.panel_bg
+                    },
+                )),
+                rect,
+            );
+        }
+
+        if let Some(error) = &import.error {
+            frame.render_widget(
+                Paragraph::new(format!(" {error}")).style(Style::default().fg(app.palette.red)),
+                Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(inner.height.saturating_sub(2)),
+                    inner.width,
+                    1,
+                ),
+            );
+        }
+
+        let (confirm, back) = machine_import_button_rects(inner);
+        render_action_button(
+            frame,
+            confirm,
+            Some("↵"),
+            "import selected",
+            Style::default()
+                .fg(panel_contrast_fg(&app.palette))
+                .bg(app.palette.accent)
+                .add_modifier(Modifier::BOLD),
+        );
+        render_action_button(
+            frame,
+            back,
+            Some("esc"),
+            "back",
+            Style::default()
+                .fg(app.palette.text)
+                .bg(app.palette.surface0)
+                .add_modifier(Modifier::BOLD),
+        );
         return;
     }
 
@@ -213,6 +352,7 @@ pub(super) fn render_add_remote_machine_overlay(app: &AppState, frame: &mut Fram
             MachineCreateField::Name => &create.name,
             MachineCreateField::Target => &create.target,
             MachineCreateField::Cwd => &create.cwd,
+            MachineCreateField::Import => continue,
         };
         let focused = create.focused == field;
         let text = truncate_end(
@@ -244,7 +384,25 @@ pub(super) fn render_add_remote_machine_overlay(app: &AppState, frame: &mut Fram
         );
     }
 
-    let (add_rect, cancel_rect) = add_remote_machine_button_rects(inner);
+    let (import_rect, add_rect, cancel_rect) = add_remote_machine_button_rects(inner);
+    render_action_button(
+        frame,
+        import_rect,
+        None,
+        "import SSH hosts",
+        Style::default()
+            .fg(if create.focused == MachineCreateField::Import {
+                panel_contrast_fg(&app.palette)
+            } else {
+                app.palette.text
+            })
+            .bg(if create.focused == MachineCreateField::Import {
+                app.palette.accent
+            } else {
+                app.palette.surface0
+            })
+            .add_modifier(Modifier::BOLD),
+    );
     render_action_button(
         frame,
         add_rect,
@@ -1111,6 +1269,7 @@ mod tests {
             cwd: "~/src".into(),
             focused: MachineCreateField::Target,
             error: Some("machine name must be unique".into()),
+            import: None,
         });
 
         let mut terminal =
@@ -1139,13 +1298,59 @@ mod tests {
         let area = Rect::new(0, 0, 100, 30);
         let inner = super::add_remote_machine_inner_rect(area).unwrap();
         let inputs = super::add_remote_machine_input_rects(inner);
-        let (add, cancel) = super::add_remote_machine_button_rects(inner);
+        let (import, add, cancel) = super::add_remote_machine_button_rects(inner);
 
         assert_eq!(inner.width, super::ADD_REMOTE_MACHINE_POPUP_WIDTH - 2);
         assert_eq!(inner.height, super::ADD_REMOTE_MACHINE_POPUP_HEIGHT - 2);
         assert_eq!(inputs[0].1.y, inner.y + 3);
         assert_eq!(inputs[2].1.y, inner.y + 7);
+        assert_eq!(import.y, inner.y + inner.height - 1);
         assert_eq!(add.y, inner.y + inner.height - 1);
         assert_eq!(cancel.y, inner.y + inner.height - 1);
+    }
+
+    #[test]
+    fn ssh_host_import_renders_selection_existing_and_failure_outcomes() {
+        let mut app = AppState::test_new();
+        let mut import = crate::app::state::MachineImportState::from_hosts(vec![
+            crate::api::schema::SshHostInfo {
+                alias: "existing".into(),
+                target: "ops@example.test".into(),
+                already_configured: true,
+            },
+            crate::api::schema::SshHostInfo {
+                alias: "build".into(),
+                target: "builder@example.test".into(),
+                already_configured: false,
+            },
+        ]);
+        import.hosts[1].outcome = Some(crate::api::schema::MachineImportOutcome::Failed {
+            alias: "build".into(),
+            reason: "permission denied".into(),
+        });
+        app.machine_create = Some(MachineCreateState {
+            import: Some(import),
+            ..Default::default()
+        });
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(100, 30)).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| render_add_remote_machine_overlay(&app, frame, Rect::new(0, 0, 100, 30)))
+            .expect("SSH host import overlay should render");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("import SSH hosts"));
+        assert!(rendered.contains("existing"));
+        assert!(rendered.contains("already added"));
+        assert!(rendered.contains("build"));
+        assert!(rendered.contains("permission denied"));
+        assert!(rendered.contains("import selected"));
     }
 }

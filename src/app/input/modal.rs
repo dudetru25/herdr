@@ -468,11 +468,12 @@ fn cancel_add_remote_machine(state: &mut AppState) {
     leave_modal(state);
 }
 
-fn machine_create_input_mut(create: &mut MachineCreateState) -> &mut String {
+fn machine_create_input_mut(create: &mut MachineCreateState) -> Option<&mut String> {
     match create.focused {
-        MachineCreateField::Name => &mut create.name,
-        MachineCreateField::Target => &mut create.target,
-        MachineCreateField::Cwd => &mut create.cwd,
+        MachineCreateField::Name => Some(&mut create.name),
+        MachineCreateField::Target => Some(&mut create.target),
+        MachineCreateField::Cwd => Some(&mut create.cwd),
+        MachineCreateField::Import => None,
     }
 }
 
@@ -480,7 +481,10 @@ fn insert_machine_create_text(state: &mut AppState, text: &str) -> bool {
     let Some(create) = state.machine_create.as_mut() else {
         return false;
     };
-    machine_create_input_mut(create).push_str(text);
+    let Some(input) = machine_create_input_mut(create) else {
+        return false;
+    };
+    input.push_str(text);
     create.error = None;
     true
 }
@@ -496,6 +500,36 @@ fn machine_add_response(response: &str) -> Result<String, String> {
         return Err(error.error.message);
     }
     Err("Herdr could not read the response while adding the machine.".into())
+}
+
+fn machine_ssh_hosts_response(
+    response: &str,
+) -> Result<Vec<crate::api::schema::SshHostInfo>, String> {
+    if let Ok(success) = serde_json::from_str::<crate::api::schema::SuccessResponse>(response) {
+        return match success.result {
+            crate::api::schema::ResponseResult::MachineSshHosts { hosts } => Ok(hosts),
+            _ => Err("Herdr returned an unexpected response while listing SSH hosts.".into()),
+        };
+    }
+    if let Ok(error) = serde_json::from_str::<crate::api::schema::ErrorResponse>(response) {
+        return Err(error.error.message);
+    }
+    Err("Herdr could not read the response while listing SSH hosts.".into())
+}
+
+fn machine_import_response(
+    response: &str,
+) -> Result<Vec<crate::api::schema::MachineImportOutcome>, String> {
+    if let Ok(success) = serde_json::from_str::<crate::api::schema::SuccessResponse>(response) {
+        return match success.result {
+            crate::api::schema::ResponseResult::MachineImported { outcomes } => Ok(outcomes),
+            _ => Err("Herdr returned an unexpected response while importing SSH hosts.".into()),
+        };
+    }
+    if let Ok(error) = serde_json::from_str::<crate::api::schema::ErrorResponse>(response) {
+        return Err(error.error.message);
+    }
+    Err("Herdr could not read the response while importing SSH hosts.".into())
 }
 
 pub(super) const ONBOARDING_WELCOME_ACTIONS: &[ModalActionSpec<ModalAction>] = &[ModalActionSpec {
@@ -1079,9 +1113,68 @@ pub(crate) fn handle_context_menu_key(
 
 impl App {
     pub(crate) fn handle_add_remote_machine_key(&mut self, key: KeyEvent) {
+        if self
+            .state
+            .machine_create
+            .as_ref()
+            .is_some_and(|create| create.import.is_some())
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(create) = self.state.machine_create.as_mut() {
+                        create.import = None;
+                    }
+                }
+                KeyCode::Enter => self.submit_machine_import(),
+                KeyCode::Up | KeyCode::BackTab => {
+                    if let Some(import) = self
+                        .state
+                        .machine_create
+                        .as_mut()
+                        .and_then(|create| create.import.as_mut())
+                    {
+                        import.move_previous();
+                    }
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    if let Some(import) = self
+                        .state
+                        .machine_create
+                        .as_mut()
+                        .and_then(|create| create.import.as_mut())
+                    {
+                        import.move_next();
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(import) = self
+                        .state
+                        .machine_create
+                        .as_mut()
+                        .and_then(|create| create.import.as_mut())
+                    {
+                        import.toggle(import.highlighted);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => cancel_add_remote_machine(&mut self.state),
-            KeyCode::Enter => self.submit_add_remote_machine(),
+            KeyCode::Enter => {
+                if self
+                    .state
+                    .machine_create
+                    .as_ref()
+                    .is_some_and(|create| create.focused == MachineCreateField::Import)
+                {
+                    self.open_machine_import();
+                } else {
+                    self.submit_add_remote_machine();
+                }
+            }
             KeyCode::Tab | KeyCode::Down => {
                 if let Some(create) = self.state.machine_create.as_mut() {
                     create.focused = create.focused.next();
@@ -1094,7 +1187,9 @@ impl App {
             }
             KeyCode::Backspace => {
                 if let Some(create) = self.state.machine_create.as_mut() {
-                    machine_create_input_mut(create).pop();
+                    if let Some(input) = machine_create_input_mut(create) {
+                        input.pop();
+                    }
                     create.error = None;
                 }
             }
@@ -1118,6 +1213,87 @@ impl App {
         };
         let response = self.runtime_machine_add("tui.machine.add", params);
         self.apply_machine_add_response(&response);
+    }
+
+    pub(super) fn open_machine_import(&mut self) {
+        let response = self.runtime_machine_ssh_hosts("tui.machine.ssh_hosts");
+        self.apply_machine_ssh_hosts_response(&response);
+    }
+
+    fn apply_machine_ssh_hosts_response(&mut self, response: &str) {
+        let Some(create) = self.state.machine_create.as_mut() else {
+            return;
+        };
+        match machine_ssh_hosts_response(response) {
+            Ok(hosts) => {
+                create.import = Some(crate::app::state::MachineImportState::from_hosts(hosts));
+                create.error = None;
+            }
+            Err(message) => create.error = Some(message),
+        }
+    }
+
+    pub(super) fn submit_machine_import(&mut self) {
+        let Some(import) = self
+            .state
+            .machine_create
+            .as_ref()
+            .and_then(|create| create.import.as_ref())
+        else {
+            return;
+        };
+        let aliases = import.selected_aliases();
+        if aliases.is_empty() {
+            if let Some(import) = self
+                .state
+                .machine_create
+                .as_mut()
+                .and_then(|create| create.import.as_mut())
+            {
+                import.error = Some("Select at least one SSH host to import.".into());
+            }
+            return;
+        }
+
+        let response = self.runtime_machine_import("tui.machine.import", aliases);
+        self.apply_machine_import_response(&response);
+    }
+
+    fn apply_machine_import_response(&mut self, response: &str) {
+        let Some(import) = self
+            .state
+            .machine_create
+            .as_mut()
+            .and_then(|create| create.import.as_mut())
+        else {
+            return;
+        };
+        match machine_import_response(response) {
+            Ok(outcomes) => {
+                import.error = None;
+                for outcome in outcomes {
+                    let alias = match &outcome {
+                        crate::api::schema::MachineImportOutcome::Added { alias }
+                        | crate::api::schema::MachineImportOutcome::AlreadyExists { alias }
+                        | crate::api::schema::MachineImportOutcome::Failed { alias, .. } => alias,
+                    };
+                    let Some(host) = import.hosts.iter_mut().find(|host| host.alias == *alias)
+                    else {
+                        continue;
+                    };
+                    host.selected = false;
+                    if matches!(
+                        outcome,
+                        crate::api::schema::MachineImportOutcome::Added { .. }
+                            | crate::api::schema::MachineImportOutcome::AlreadyExists { .. }
+                    ) {
+                        host.already_configured = true;
+                    }
+                    host.outcome = Some(outcome);
+                }
+            }
+            Err(message) => import.error = Some(message),
+        }
     }
 
     fn apply_machine_add_response(&mut self, response: &str) {
@@ -1752,6 +1928,18 @@ mod tests {
         assert_eq!(create.cwd, "~/src");
         assert_eq!(create.focused, MachineCreateField::Cwd);
 
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(
+            app.state.machine_create.as_ref().unwrap().focused,
+            MachineCreateField::Import
+        );
+        assert!(!app.insert_add_remote_machine_text("ignored"));
+
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(
+            app.state.machine_create.as_ref().unwrap().focused,
+            MachineCreateField::Cwd
+        );
         app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(
             app.state.machine_create.as_ref().unwrap().focused,
@@ -1812,6 +2000,114 @@ mod tests {
             Some("machine name \"dev\" must be unique")
         );
         assert!(app.state.request_new_workspace_machine.is_none());
+        assert_eq!(app.state.mode, Mode::AddRemoteMachine);
+    }
+
+    #[test]
+    fn ssh_host_import_view_preserves_form_and_skips_already_added_hosts() {
+        let mut app = app_with_test_workspaces(&[]);
+        open_add_remote_machine(&mut app.state);
+        app.state.machine_create.as_mut().unwrap().name = "manual draft".into();
+        let response = serde_json::to_string(&crate::api::schema::SuccessResponse {
+            id: "tui.machine.ssh_hosts".into(),
+            result: crate::api::schema::ResponseResult::MachineSshHosts {
+                hosts: vec![
+                    crate::api::schema::SshHostInfo {
+                        alias: "existing".into(),
+                        target: "ops@example.test".into(),
+                        already_configured: true,
+                    },
+                    crate::api::schema::SshHostInfo {
+                        alias: "build".into(),
+                        target: "builder@example.test".into(),
+                        already_configured: false,
+                    },
+                    crate::api::schema::SshHostInfo {
+                        alias: "deploy".into(),
+                        target: "deploy@example.test".into(),
+                        already_configured: false,
+                    },
+                ],
+            },
+        })
+        .unwrap();
+
+        app.apply_machine_ssh_hosts_response(&response);
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()));
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()));
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()));
+
+        let create = app.state.machine_create.as_ref().unwrap();
+        assert_eq!(create.name, "manual draft");
+        let import = create.import.as_ref().unwrap();
+        assert!(!import.hosts[0].selected);
+        assert!(import.hosts[1].selected);
+        assert!(import.hosts[2].selected);
+        assert_eq!(import.selected_aliases(), vec!["build", "deploy"]);
+
+        app.handle_add_remote_machine_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        let create = app.state.machine_create.as_ref().unwrap();
+        assert_eq!(create.name, "manual draft");
+        assert!(create.import.is_none());
+        assert_eq!(app.state.mode, Mode::AddRemoteMachine);
+    }
+
+    #[test]
+    fn machine_import_response_keeps_each_host_outcome_visible() {
+        let mut app = app_with_test_workspaces(&[]);
+        open_add_remote_machine(&mut app.state);
+        app.state.machine_create.as_mut().unwrap().import =
+            Some(crate::app::state::MachineImportState::from_hosts(vec![
+                crate::api::schema::SshHostInfo {
+                    alias: "build".into(),
+                    target: "builder@example.test".into(),
+                    already_configured: false,
+                },
+                crate::api::schema::SshHostInfo {
+                    alias: "deploy".into(),
+                    target: "deploy@example.test".into(),
+                    already_configured: false,
+                },
+            ]));
+        let response = serde_json::to_string(&crate::api::schema::SuccessResponse {
+            id: "tui.machine.import".into(),
+            result: crate::api::schema::ResponseResult::MachineImported {
+                outcomes: vec![
+                    crate::api::schema::MachineImportOutcome::Failed {
+                        alias: "build".into(),
+                        reason: "permission denied".into(),
+                    },
+                    crate::api::schema::MachineImportOutcome::Added {
+                        alias: "deploy".into(),
+                    },
+                ],
+            },
+        })
+        .unwrap();
+
+        app.apply_machine_import_response(&response);
+
+        let import = app
+            .state
+            .machine_create
+            .as_ref()
+            .unwrap()
+            .import
+            .as_ref()
+            .unwrap();
+        assert!(matches!(
+            import.hosts[0].outcome,
+            Some(crate::api::schema::MachineImportOutcome::Failed { ref reason, .. })
+                if reason == "permission denied"
+        ));
+        assert!(!import.hosts[0].already_configured);
+        assert!(matches!(
+            import.hosts[1].outcome,
+            Some(crate::api::schema::MachineImportOutcome::Added { .. })
+        ));
+        assert!(import.hosts[1].already_configured);
         assert_eq!(app.state.mode, Mode::AddRemoteMachine);
     }
 

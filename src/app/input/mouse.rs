@@ -58,6 +58,8 @@ pub(super) enum MouseAction {
     },
     RenameModal(ModalAction),
     AddRemoteMachineSubmit,
+    AddRemoteMachineImportOpen,
+    AddRemoteMachineImportSubmit,
     ConfirmCloseAccept,
     ContextMenu {
         menu: ContextMenuState,
@@ -214,6 +216,24 @@ impl AppState {
             }
         }
 
+        if self.mode == Mode::AddRemoteMachine {
+            let import = self
+                .machine_create
+                .as_mut()
+                .and_then(|create| create.import.as_mut());
+            match (mouse.kind, import) {
+                (MouseEventKind::ScrollUp, Some(import)) => {
+                    import.move_previous();
+                    return None;
+                }
+                (MouseEventKind::ScrollDown, Some(import)) => {
+                    import.move_next();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         if matches!(
             self.mode,
             Mode::AddRemoteMachine
@@ -261,6 +281,40 @@ impl AppState {
                     if let Some(inner) =
                         crate::ui::add_remote_machine_inner_rect(self.screen_rect())
                     {
+                        if let Some(import) = self
+                            .machine_create
+                            .as_mut()
+                            .and_then(|create| create.import.as_mut())
+                        {
+                            if let Some((index, _)) =
+                                crate::ui::machine_import_row_rects(inner, import)
+                                    .into_iter()
+                                    .find(|(_, rect)| rect_contains(*rect, mouse.column, mouse.row))
+                            {
+                                import.highlighted = index;
+                                import.toggle(index);
+                                return None;
+                            }
+
+                            let (confirm, back) = crate::ui::machine_import_button_rects(inner);
+                            match modal_action_from_buttons(
+                                mouse.column,
+                                mouse.row,
+                                &[(confirm, ModalAction::Confirm), (back, ModalAction::Cancel)],
+                            ) {
+                                Some(ModalAction::Confirm) => {
+                                    return Some(MouseAction::AddRemoteMachineImportSubmit);
+                                }
+                                Some(ModalAction::Cancel) => {
+                                    if let Some(create) = self.machine_create.as_mut() {
+                                        create.import = None;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            return None;
+                        }
+
                         if let Some((field, _)) = crate::ui::add_remote_machine_input_rects(inner)
                             .into_iter()
                             .find(|(_, rect)| rect_contains(*rect, mouse.column, mouse.row))
@@ -271,12 +325,20 @@ impl AppState {
                             return None;
                         }
 
-                        let (add, cancel) = crate::ui::add_remote_machine_button_rects(inner);
+                        let (import, add, cancel) =
+                            crate::ui::add_remote_machine_button_rects(inner);
                         match modal_action_from_buttons(
                             mouse.column,
                             mouse.row,
-                            &[(add, ModalAction::Confirm), (cancel, ModalAction::Cancel)],
+                            &[
+                                (import, ModalAction::Apply),
+                                (add, ModalAction::Confirm),
+                                (cancel, ModalAction::Cancel),
+                            ],
                         ) {
+                            Some(ModalAction::Apply) => {
+                                return Some(MouseAction::AddRemoteMachineImportOpen);
+                            }
                             Some(ModalAction::Confirm) => {
                                 return Some(MouseAction::AddRemoteMachineSubmit);
                             }
@@ -2738,7 +2800,7 @@ mod tests {
         app.state.mode = Mode::AddRemoteMachine;
         app.state.machine_create = Some(crate::app::state::MachineCreateState::default());
         let inner = crate::ui::add_remote_machine_inner_rect(app.state.screen_rect()).unwrap();
-        let (_, cancel) = crate::ui::add_remote_machine_button_rects(inner);
+        let (_, _, cancel) = crate::ui::add_remote_machine_button_rects(inner);
 
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
@@ -2757,7 +2819,7 @@ mod tests {
         app.state.mode = Mode::AddRemoteMachine;
         app.state.machine_create = Some(crate::app::state::MachineCreateState::default());
         let inner = crate::ui::add_remote_machine_inner_rect(app.state.screen_rect()).unwrap();
-        let (add, _) = crate::ui::add_remote_machine_button_rects(inner);
+        let (_, add, _) = crate::ui::add_remote_machine_button_rects(inner);
 
         let action = app.state.handle_mouse(
             &mut app.terminal_runtimes,
@@ -2767,6 +2829,163 @@ mod tests {
         assert!(matches!(action, Some(MouseAction::AddRemoteMachineSubmit)));
         assert_eq!(app.state.mode, Mode::AddRemoteMachine);
         assert!(app.state.machine_create.is_some());
+    }
+
+    #[test]
+    fn add_remote_machine_mouse_import_button_requests_discovery() {
+        let mut app = app_for_mouse_test();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 100, 30));
+        app.state.mode = Mode::AddRemoteMachine;
+        app.state.machine_create = Some(crate::app::state::MachineCreateState::default());
+        let inner = crate::ui::add_remote_machine_inner_rect(app.state.screen_rect()).unwrap();
+        let (import, _, _) = crate::ui::add_remote_machine_button_rects(inner);
+
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                import.x + 1,
+                import.y,
+            ),
+        );
+
+        assert!(matches!(
+            action,
+            Some(MouseAction::AddRemoteMachineImportOpen)
+        ));
+    }
+
+    #[test]
+    fn machine_import_mouse_toggles_only_available_rows_and_back_preserves_form() {
+        let mut app = app_for_mouse_test();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 100, 30));
+        app.state.mode = Mode::AddRemoteMachine;
+        app.state.machine_create = Some(crate::app::state::MachineCreateState {
+            name: "manual draft".into(),
+            import: Some(crate::app::state::MachineImportState::from_hosts(vec![
+                crate::api::schema::SshHostInfo {
+                    alias: "existing".into(),
+                    target: "ops@example.test".into(),
+                    already_configured: true,
+                },
+                crate::api::schema::SshHostInfo {
+                    alias: "build".into(),
+                    target: "builder@example.test".into(),
+                    already_configured: false,
+                },
+            ])),
+            ..Default::default()
+        });
+        let inner = crate::ui::add_remote_machine_inner_rect(app.state.screen_rect()).unwrap();
+        let rows = crate::ui::machine_import_row_rects(
+            inner,
+            app.state
+                .machine_create
+                .as_ref()
+                .unwrap()
+                .import
+                .as_ref()
+                .unwrap(),
+        );
+
+        for (_, row) in &rows {
+            app.handle_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                row.x + 1,
+                row.y,
+            ));
+        }
+
+        let import = app
+            .state
+            .machine_create
+            .as_ref()
+            .unwrap()
+            .import
+            .as_ref()
+            .unwrap();
+        assert!(!import.hosts[0].selected);
+        assert!(import.hosts[1].selected);
+
+        let (_, back) = crate::ui::machine_import_button_rects(inner);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            back.x + 1,
+            back.y,
+        ));
+
+        let create = app.state.machine_create.as_ref().unwrap();
+        assert_eq!(create.name, "manual draft");
+        assert!(create.import.is_none());
+        assert_eq!(app.state.mode, Mode::AddRemoteMachine);
+    }
+
+    #[test]
+    fn machine_import_mouse_wheel_reaches_and_toggles_hosts_after_first_page() {
+        let mut app = app_for_mouse_test();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 100, 30));
+        app.state.mode = Mode::AddRemoteMachine;
+        app.state.machine_create = Some(crate::app::state::MachineCreateState {
+            import: Some(crate::app::state::MachineImportState::from_hosts(
+                (0..10)
+                    .map(|index| crate::api::schema::SshHostInfo {
+                        alias: format!("host-{index}"),
+                        target: format!("host-{index}.example.test"),
+                        already_configured: false,
+                    })
+                    .collect(),
+            )),
+            ..Default::default()
+        });
+        let inner = crate::ui::add_remote_machine_inner_rect(app.state.screen_rect()).unwrap();
+        let initial_rows = crate::ui::machine_import_row_rects(
+            inner,
+            app.state
+                .machine_create
+                .as_ref()
+                .unwrap()
+                .import
+                .as_ref()
+                .unwrap(),
+        );
+        assert!(!initial_rows.iter().any(|(index, _)| *index == 8));
+
+        for _ in 0..8 {
+            app.handle_mouse(mouse(MouseEventKind::ScrollDown, inner.x + 1, inner.y + 3));
+        }
+
+        let import = app
+            .state
+            .machine_create
+            .as_ref()
+            .unwrap()
+            .import
+            .as_ref()
+            .unwrap();
+        assert_eq!(import.highlighted, 8);
+        let host_nine_row = crate::ui::machine_import_row_rects(inner, import)
+            .into_iter()
+            .find(|(index, _)| *index == 8)
+            .unwrap()
+            .1;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            host_nine_row.x + 1,
+            host_nine_row.y,
+        ));
+
+        assert!(
+            app.state
+                .machine_create
+                .as_ref()
+                .unwrap()
+                .import
+                .as_ref()
+                .unwrap()
+                .hosts[8]
+                .selected
+        );
     }
 
     #[test]
