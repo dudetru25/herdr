@@ -135,10 +135,14 @@ herdr workspace create --cwd ~/project --label api --no-focus
 
 ```bash
 herdr machine list
+herdr machine add --name NAME --target TARGET [--cwd PATH]
+herdr machine import <ALIAS>...
+herdr machine import --all
+herdr machine ssh-hosts [--json]
 herdr workspace create --machine build
 ```
 
-`machine list` 输出当前的 `[[machines]]` 注册表。`workspace create --machine NAME` 创建基于 SSH 的工作区；`--machine` 与 `--cwd` 不能同时使用。
+`machine list` 输出当前的 `[[machines]]` 注册表。`machine add` 保存一台机器而不打开工作区。`machine import` 保存从 SSH 配置发现的主机别名,`--all` 会导入所有发现的别名。每台机器都使用别名作为名称和目标,并让 `cwd` 保持未设置。`workspace create --machine NAME` 创建基于 SSH 的工作区；`--machine` 与 `--cwd` 不能同时使用。
 
 ## Worktree
 

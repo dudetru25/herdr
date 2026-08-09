@@ -83,6 +83,8 @@ new_cwd = "follow"
 
 `[[machines]]` で通常の SSH 接続先を登録できます。`cwd` を指定すると Herdr はリモート側で `cd` と `$SHELL` を使うため、POSIX 互換のログインシェルが必要です。PowerShell、`cmd.exe`、またはその他の非 POSIX SSH 接続先では `cwd` を省略してください。
 
+New を左クリックすると Local ワークスペースがすぐに作成されます。右クリックすると、Local、設定済みマシン、Add remote machine を含む接続先ピッカーが開きます。追加フォームの Import SSH hosts は `~/.ssh/config` のエイリアスを読み込みます。Space またはマウスで複数選択し、一度の確認で保存できます。設定済みのエイリアスは選択できず、各エイリアスの結果が表示されます。Esc または Back で手動フォームへ戻っても、入力済みの値は保持されます。
+
 ## Worktree
 
 サイドバーから作成される Git worktree チェックアウトに Herdr が使うルートディレクトリを設定します:

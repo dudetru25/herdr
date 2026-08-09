@@ -135,10 +135,14 @@ herdr workspace create --cwd ~/project --label api --no-focus
 
 ```bash
 herdr machine list
+herdr machine add --name NAME --target TARGET [--cwd PATH]
+herdr machine import <ALIAS>...
+herdr machine import --all
+herdr machine ssh-hosts [--json]
 herdr workspace create --machine build
 ```
 
-`machine list` は現在の `[[machines]]` レジストリを表示します。`workspace create --machine NAME` は SSH ベースのワークスペースを作成します。`--machine` と `--cwd` は同時に指定できません。
+`machine list` は現在の `[[machines]]` レジストリを表示します。`machine add` はワークスペースを開かずに 1 台のマシンを保存します。`machine import` は SSH 設定から検出したホストエイリアスを保存し、`--all` は検出されたすべてのエイリアスを読み込みます。各マシンはエイリアスを名前と接続先に使い、`cwd` は未設定のままです。`workspace create --machine NAME` は SSH ベースのワークスペースを作成します。`--machine` と `--cwd` は同時に指定できません。
 
 ## Worktree
 

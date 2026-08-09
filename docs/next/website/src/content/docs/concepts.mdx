@@ -11,11 +11,13 @@ A workspace is the top-level project container. Use one workspace per repo, task
 
 A workspace owns tabs and panes. Its sidebar state rolls up from the agents inside it, so you can see which project needs attention.
 
+The file tree follows the selected workspace. It shows an unavailable state when the checkout cannot be read, and its edge control collapses or restores the panel without changing pane identity.
+
 ## Tab
 
-A tab is a layout inside a workspace. Use tabs to separate views like `agents`, `logs`, `server`, or `review`.
+A tab is a layout inside a workspace. Use tabs to separate views like `agents`, `logs`, `server`, or `review`. Unnamed tabs show their current position and type, such as `1 terminal` or `2 file-viewer`.
 
-Right-click `+` in the tab bar and select an installed plugin pane to create a plugin tab.
+Left-click `+` to create a terminal tab immediately. Right-click `+`, or open **New tab** from a tab context menu, to choose Terminal or an enabled plugin pane. Use the tab context menu to set a custom name.
 
 Tabs are addressable from the CLI and socket API.
 

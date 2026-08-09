@@ -5,8 +5,13 @@
 ### Added
 - Added non-interactive `herdr machine add` and `herdr machine import` commands, including `--all` import from discovered SSH host aliases and per-alias import outcomes.
 - Added multi-select SSH host import to the Add remote machine dialog, with existing-machine markers and visible per-host outcomes.
+- Added a selected-workspace file tree that follows the current space, reports unavailable checkouts, and collapses without changing pane identity.
+- Added `workspace retarget` to move an existing workspace to a caller-supplied checkout, including stale-path reporting, live pane restart, linked-worktree pointer repair, parent-space reconciliation, and restart-safe recovery.
+- Added a first-party repository migration plugin for supported Skills V4 paths, explicit Claude project keys, and named editor workspace files, with bounded per-consumer success and partial reports.
+- Added Terminal and enabled plugin-pane choices to the tab creation menus.
 
 ### Changed
+- Left-clicking `+` now creates a terminal tab immediately. Tab naming remains available through the tab context menu.
 - Unnamed tabs now show their current position and type, such as `1 terminal` or `3 file-viewer`, while custom tab names remain unchanged.
 
 ## [0.8.0] - 2026-08-03

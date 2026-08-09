@@ -83,6 +83,8 @@ new_cwd = "follow"
 
 可通过 `[[machines]]` 注册普通 SSH 目标。指定 `cwd` 时，Herdr 会在远端使用 `cd` 和 `$SHELL`，因此远端登录 shell 必须兼容 POSIX。对于 PowerShell、`cmd.exe` 或其他非 POSIX SSH 目标，请省略 `cwd`。
 
+左键点击 New 会立即创建 Local 工作区。右键点击会打开目标选择器,其中包含 Local、已配置的机器和 Add remote machine。添加表单中的 Import SSH hosts 会读取 `~/.ssh/config` 的别名。可用 Space 或鼠标选择多个别名,然后一次确认并保存。已配置的别名不能选择,界面会显示每个别名的结果。按 Esc 或 Back 返回手动表单时,已输入的值会保留。
+
 ## Worktree
 
 设置 Herdr 从侧边栏创建 Git worktree 检出时使用的根目录：
