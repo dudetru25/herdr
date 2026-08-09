@@ -707,6 +707,51 @@ mod tests {
         app
     }
 
+    #[cfg(unix)]
+    fn restart_parent_space_api_app(app: &App) -> App {
+        let snapshot = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+            app.state.sidebar_width,
+            app.state.sidebar_section_split,
+            app.state.collapsed_space_keys.clone(),
+        );
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut restarted = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let (workspaces, terminals, terminal_runtimes) = crate::persist::restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            "/bin/sh",
+            crate::config::ShellModeConfig::NonLogin,
+            crate::persist::RestorePolicy::new(false, &[]),
+            restarted.event_tx.clone(),
+            restarted.render_notify.clone(),
+            restarted.render_dirty.clone(),
+        );
+        restarted.state.workspaces = workspaces;
+        restarted.state.terminals = terminals;
+        restarted.terminal_runtimes = terminal_runtimes.into();
+        restarted.state.active = snapshot.active;
+        restarted.state.selected = snapshot.selected;
+        restarted.state.sidebar_width = snapshot.sidebar_width.unwrap_or(32);
+        restarted.state.sidebar_section_split = snapshot.sidebar_section_split.unwrap_or(0.5);
+        restarted.state.collapsed_space_keys = snapshot.collapsed_space_keys;
+        restarted.state.default_shell = "/bin/sh".into();
+        restarted
+    }
+
     #[test]
     fn workspace_reads_refresh_staleness_after_checkout_removal_and_retarget() {
         let fixture = ParentSpaceApiFixture::new();
@@ -1862,6 +1907,287 @@ mod tests {
         app.state.assert_invariants_for_test();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_retarget_repairs_linked_worktree_after_parent_retarget_and_restart() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_child =
+            std::fs::canonicalize(test_linked_git_worktree(&old_container, "child")).unwrap();
+        let old_parent = std::fs::canonicalize(old_container.join("child-source")).unwrap();
+        let old_key = std::fs::canonicalize(old_parent.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("parent", &old_parent, &old_key, &old_parent, false);
+        let parent_id = parent.id.clone();
+        let child = grouped_worktree_workspace("child", &old_child, &old_key, &old_parent, true);
+        let child_id = child.id.clone();
+        let mut app = parent_space_api_app(vec![parent, child]);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_parent = std::fs::canonicalize(new_container.join("child-source")).unwrap();
+        let new_child = std::fs::canonicalize(new_container.join("child")).unwrap();
+        let parent_response = retarget_workspace_response(&mut app, &parent_id, &new_parent);
+        let _: SuccessResponse = serde_json::from_str(&parent_response).unwrap();
+
+        let mut app = restart_parent_space_api_app(&app);
+        assert_eq!(app.state.workspaces.len(), 2);
+        let restored_parent = app
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == parent_id)
+            .unwrap();
+        let restored_child = app
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == child_id)
+            .unwrap();
+        assert_eq!(restored_parent.worktree_space().unwrap().key, old_key);
+        assert_eq!(
+            restored_parent.worktree_space().unwrap().repo_root,
+            new_parent
+        );
+        assert_eq!(restored_parent.identity_cwd, new_parent);
+        assert_eq!(restored_child.worktree_space().unwrap().key, old_key);
+        assert_eq!(
+            restored_child.worktree_space().unwrap().checkout_path,
+            old_child
+        );
+        let response = retarget_workspace_response(&mut app, &child_id, &new_child);
+        let success: SuccessResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|error| panic!("child repair failed: {error}: {response}"));
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        let new_key = std::fs::canonicalize(new_parent.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(app.state.workspaces.iter().all(|workspace| {
+            workspace
+                .worktree_space()
+                .is_some_and(|membership| membership.key == new_key)
+        }));
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&new_child)
+            .args(["status", "--porcelain=v1"])
+            .status()
+            .unwrap()
+            .success());
+        app.state.assert_invariants_for_test();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_restore_preserves_cold_moved_group_without_repairing_git() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_child =
+            std::fs::canonicalize(test_linked_git_worktree(&old_container, "child")).unwrap();
+        let old_parent = std::fs::canonicalize(old_container.join("child-source")).unwrap();
+        let old_key = std::fs::canonicalize(old_parent.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("parent", &old_parent, &old_key, &old_parent, false);
+        let child = grouped_worktree_workspace("child", &old_child, &old_key, &old_parent, true);
+        let app = parent_space_api_app(vec![parent, child]);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_parent = std::fs::canonicalize(new_container.join("child-source")).unwrap();
+        let new_child = std::fs::canonicalize(new_container.join("child")).unwrap();
+        let child_pointer = new_child.join(".git");
+        let admin_pointer = new_parent
+            .join(".git")
+            .join("worktrees")
+            .join("child")
+            .join("gitdir");
+        let child_pointer_before = std::fs::read(&child_pointer).unwrap();
+        let admin_pointer_before = std::fs::read(&admin_pointer).unwrap();
+        let registry_before = git_worktree_registry(&new_parent);
+
+        let restarted = restart_parent_space_api_app(&app);
+
+        assert_eq!(restarted.state.workspaces.len(), 2);
+        assert!(restarted.state.workspaces.iter().all(|workspace| {
+            workspace
+                .worktree_space()
+                .is_some_and(|membership| membership.key == old_key)
+        }));
+        assert_eq!(std::fs::read(child_pointer).unwrap(), child_pointer_before);
+        assert_eq!(std::fs::read(admin_pointer).unwrap(), admin_pointer_before);
+        assert_eq!(git_worktree_registry(&new_parent), registry_before);
+        restarted.state.assert_invariants_for_test();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_retarget_repairs_moved_worktree_and_restarts_live_pane() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_child =
+            std::fs::canonicalize(test_linked_git_worktree(&old_container, "child")).unwrap();
+        let old_parent = std::fs::canonicalize(old_container.join("child-source")).unwrap();
+        let old_key = std::fs::canonicalize(old_parent.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("parent", &old_parent, &old_key, &old_parent, false);
+        let parent_id = parent.id.clone();
+        let child = grouped_worktree_workspace("child", &old_child, &old_key, &old_parent, true);
+        let child_id = child.id.clone();
+        let mut app = parent_space_api_app(vec![parent, child]);
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        let event_hub = app.event_hub.clone();
+        let pane_id = app.state.workspaces[1].tabs[0].root_pane;
+        let public_pane_id = app.public_pane_id(1, pane_id).unwrap();
+        let (terminal_id, old_pid) = install_live_shell_runtime(&mut app, 1, pane_id, &old_child);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_parent = std::fs::canonicalize(new_container.join("child-source")).unwrap();
+        let new_child = std::fs::canonicalize(new_container.join("child")).unwrap();
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app,
+            &parent_id,
+            &new_parent,
+        ))
+        .unwrap();
+        let event_cursor = event_hub.current_sequence();
+
+        let response = retarget_workspace_response(&mut app, &child_id, &new_child);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !app.intentional_pane_restarts.is_empty() && std::time::Instant::now() < deadline {
+            app.drain_internal_events();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let new_pid = app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .and_then(|runtime| runtime.child_pid())
+            .expect("repaired pane should have a replacement shell");
+        assert_ne!(new_pid, old_pid);
+        let expected_cwd = std::fs::canonicalize(&new_child).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::platform::process_cwd(new_pid).and_then(|cwd| std::fs::canonicalize(cwd).ok())
+            != Some(expected_cwd.clone())
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            crate::platform::process_cwd(new_pid).and_then(|cwd| std::fs::canonicalize(cwd).ok()),
+            Some(expected_cwd)
+        );
+        assert_eq!(app.public_pane_id(1, pane_id), Some(public_pane_id));
+        assert_eq!(
+            app.state.workspaces[1].terminal_id(pane_id),
+            Some(&terminal_id)
+        );
+        let events = event_hub.events_after(event_cursor);
+        assert!(events
+            .iter()
+            .any(|(_, event)| event.event == crate::api::schema::EventKind::WorkspaceUpdated));
+        assert!(events
+            .iter()
+            .any(|(_, event)| event.event == crate::api::schema::EventKind::PaneUpdated));
+        assert!(!events.iter().any(|(_, event)| matches!(
+            event.event,
+            crate::api::schema::EventKind::PaneCreated
+                | crate::api::schema::EventKind::PaneClosed
+                | crate::api::schema::EventKind::PaneExited
+        )));
+        app.state.assert_invariants_for_test();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_retarget_repairs_second_sibling_after_first_repair_and_restart() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_first =
+            std::fs::canonicalize(test_linked_git_worktree(&old_container, "first")).unwrap();
+        let old_parent = std::fs::canonicalize(old_container.join("first-source")).unwrap();
+        let old_second = old_container.join("second");
+        add_test_linked_git_worktree(&old_parent, &old_second, "second-branch");
+        let old_second = std::fs::canonicalize(old_second).unwrap();
+        let old_key = std::fs::canonicalize(old_parent.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("parent", &old_parent, &old_key, &old_parent, false);
+        let parent_id = parent.id.clone();
+        let first = grouped_worktree_workspace("first", &old_first, &old_key, &old_parent, true);
+        let first_id = first.id.clone();
+        let second = grouped_worktree_workspace("second", &old_second, &old_key, &old_parent, true);
+        let second_id = second.id.clone();
+        let mut app = parent_space_api_app(vec![parent, first, second]);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_parent = std::fs::canonicalize(new_container.join("first-source")).unwrap();
+        let new_first = std::fs::canonicalize(new_container.join("first")).unwrap();
+        let new_second = std::fs::canonicalize(new_container.join("second")).unwrap();
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app,
+            &parent_id,
+            &new_parent,
+        ))
+        .unwrap();
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app, &first_id, &new_first,
+        ))
+        .unwrap();
+
+        let mut app = restart_parent_space_api_app(&app);
+        assert_eq!(app.state.workspaces.len(), 3);
+        let response = retarget_workspace_response(&mut app, &second_id, &new_second);
+        let success: SuccessResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|error| panic!("second repair failed: {error}: {response}"));
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        assert_eq!(
+            app.state
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == second_id)
+                .and_then(|workspace| workspace.worktree_space())
+                .map(|membership| membership.checkout_path.clone()),
+            Some(new_second.clone())
+        );
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&new_second)
+            .args(["status", "--porcelain=v1"])
+            .status()
+            .unwrap()
+            .success());
+        app.state.assert_invariants_for_test();
+    }
+
     #[test]
     fn workspace_retarget_repairs_real_herdr_worktrees_sibling_layout() {
         let fixture = ParentSpaceApiFixture::new();
@@ -2249,6 +2575,102 @@ mod tests {
         );
         assert_eq!(git_worktree_registry(&new_repo_root), registry_before);
         assert!(!app.state.session_dirty);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_retarget_repair_failure_keeps_live_runtime_and_snapshot_unchanged() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_child =
+            std::fs::canonicalize(test_linked_git_worktree(&old_container, "child")).unwrap();
+        let old_parent = std::fs::canonicalize(old_container.join("child-source")).unwrap();
+        let old_key = std::fs::canonicalize(old_parent.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("parent", &old_parent, &old_key, &old_parent, false);
+        let parent_id = parent.id.clone();
+        let child = grouped_worktree_workspace("child", &old_child, &old_key, &old_parent, true);
+        let child_id = child.id.clone();
+        let mut app = parent_space_api_app(vec![parent, child]);
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        let pane_id = app.state.workspaces[1].tabs[0].root_pane;
+        let (terminal_id, old_pid) = install_live_shell_runtime(&mut app, 1, pane_id, &old_child);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_parent = std::fs::canonicalize(new_container.join("child-source")).unwrap();
+        let new_child = std::fs::canonicalize(new_container.join("child")).unwrap();
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app,
+            &parent_id,
+            &new_parent,
+        ))
+        .unwrap();
+        app.state.session_dirty = false;
+        app.session_save_deadline = None;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let snapshot_before = serde_json::to_vec(&crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+            app.state.sidebar_width,
+            app.state.sidebar_section_split,
+            app.state.collapsed_space_keys.clone(),
+        ))
+        .unwrap();
+        let child_pointer = new_child.join(".git");
+        let admin_pointer = new_parent
+            .join(".git")
+            .join("worktrees")
+            .join("child")
+            .join("gitdir");
+        let child_pointer_before = std::fs::read(&child_pointer).unwrap();
+        let admin_pointer_before = std::fs::read(&admin_pointer).unwrap();
+        let registry_before = git_worktree_registry(&new_parent);
+        let event_cursor = app.event_hub.current_sequence();
+
+        let response = crate::worktree::with_forced_linked_worktree_repair_failure(|| {
+            retarget_workspace_response(&mut app, &child_id, &new_child)
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code,
+            "workspace_retarget_worktree_repair_failed"
+        );
+        assert_eq!(
+            app.terminal_runtimes
+                .get(&terminal_id)
+                .and_then(|runtime| runtime.child_pid()),
+            Some(old_pid)
+        );
+        let snapshot_after = serde_json::to_vec(&crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+            app.state.sidebar_width,
+            app.state.sidebar_section_split,
+            app.state.collapsed_space_keys.clone(),
+        ))
+        .unwrap();
+        assert_eq!(snapshot_after, snapshot_before);
+        assert!(!app.state.session_dirty);
+        assert!(app.session_save_deadline.is_none());
+        assert!(app.intentional_pane_restarts.is_empty());
+        assert!(app.event_hub.events_after(event_cursor).is_empty());
+        assert_eq!(std::fs::read(child_pointer).unwrap(), child_pointer_before);
+        assert_eq!(std::fs::read(admin_pointer).unwrap(), admin_pointer_before);
+        assert_eq!(git_worktree_registry(&new_parent), registry_before);
         app.state.assert_invariants_for_test();
     }
 

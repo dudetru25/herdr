@@ -32,6 +32,7 @@
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 
 ### Fixed
+- Moved linked-worktree recovery groups now survive server restart between parent and child repairs without changing Git pointer files during restore.
 - Pane applications now receive semantic light/dark query responses and live Mode 2031 updates when the host appearance changes. (#714)
 - Remote attach now falls back to `sh` when the login shell cannot perform path discovery. (#1201)
 - PTY output continues to be read while pane input is temporarily blocked. (#1295)

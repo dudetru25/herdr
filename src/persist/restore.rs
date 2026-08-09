@@ -276,9 +276,22 @@ fn restore_with_imports_and_failures(
     let mut terminal_runtimes = HashMap::new();
     let mut resumed_agent_sessions = HashSet::new();
     let mut failed_imports = 0;
+    let saved_worktree_spaces = snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            if workspace.machine.is_some() {
+                None
+            } else {
+                workspace.worktree_space.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let restored_worktree_spaces = restored_worktree_space_memberships(&saved_worktree_spaces);
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
         let (restored, workspace_failed_imports) = restore_workspace(
             ws_snap,
+            restored_worktree_spaces.get(idx).cloned().flatten(),
             history.and_then(|history| history.workspaces.get(idx)),
             rows,
             cols,
@@ -301,6 +314,7 @@ fn restore_with_imports_and_failures(
 
 fn restore_workspace(
     snap: &WorkspaceSnapshot,
+    restored_worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
     history: Option<&WorkspaceHistorySnapshot>,
     rows: u16,
     cols: u16,
@@ -430,11 +444,9 @@ fn restore_workspace(
     let identity_cwd = machine_identity_cwd
         .clone()
         .unwrap_or_else(|| snap.identity_cwd.clone());
-    let worktree_space = if machine_workspace {
-        None
-    } else {
-        restored_worktree_space_membership(snap.worktree_space.clone())
-    };
+    let worktree_space = (!machine_workspace)
+        .then_some(restored_worktree_space)
+        .flatten();
     let (cached_git_space, cached_auto_label, cached_git_status_key) = if machine_workspace {
         (
             None,
@@ -480,14 +492,165 @@ fn restore_workspace(
     )
 }
 
+#[cfg(test)]
 fn restored_worktree_space_membership(
     space: Option<crate::workspace::WorktreeSpaceMembership>,
 ) -> Option<crate::workspace::WorktreeSpaceMembership> {
-    space.filter(|space| {
-        space.checkout_path.exists()
-            && crate::workspace::git_space_metadata(&space.checkout_path)
-                .is_some_and(|current| current.key == space.key)
+    restored_worktree_space_memberships(&[space])
+        .into_iter()
+        .next()
+        .flatten()
+}
+
+fn restored_worktree_space_memberships(
+    spaces: &[Option<crate::workspace::WorktreeSpaceMembership>],
+) -> Vec<Option<crate::workspace::WorktreeSpaceMembership>> {
+    let mut restored = vec![None; spaces.len()];
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+
+    for (index, space) in spaces.iter().enumerate() {
+        if let Some(space) = space {
+            groups.entry(&space.key).or_default().push(index);
+        }
+    }
+
+    for indices in groups.into_values() {
+        if indices.len() == 1 {
+            let index = indices[0];
+            let Some(space) = spaces[index].as_ref() else {
+                continue;
+            };
+            if live_membership_matches(space, &space.key) {
+                restored[index] = Some(space.clone());
+            }
+            continue;
+        }
+
+        let Some(parent_index) = coherent_recovery_group_parent(spaces, &indices) else {
+            continue;
+        };
+        let Some(parent) = spaces[parent_index].as_ref() else {
+            continue;
+        };
+
+        let live_parent = crate::workspace::git_space_metadata(&parent.checkout_path);
+        let expected_key = match live_parent.as_ref() {
+            Some(current)
+                if !current.is_linked_worktree
+                    && same_path(&current.repo_root, &parent.checkout_path) =>
+            {
+                current.key.as_str()
+            }
+            Some(_) => continue,
+            None => parent.key.as_str(),
+        };
+
+        let retained = indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                spaces[*index].as_ref().is_some_and(|space| {
+                    crate::workspace::git_space_metadata(&space.checkout_path)
+                        .is_none_or(|_| live_membership_matches(space, expected_key))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if !retained.contains(&parent_index)
+            || !retained.iter().any(|index| {
+                spaces[*index]
+                    .as_ref()
+                    .is_some_and(|space| space.is_linked_worktree)
+            })
+        {
+            continue;
+        }
+
+        if expected_key != parent.key && !recovery_group_registry_matches(parent, spaces, &retained)
+        {
+            continue;
+        }
+
+        for index in retained {
+            restored[index] = spaces[index].clone();
+        }
+    }
+
+    restored
+}
+
+fn coherent_recovery_group_parent(
+    spaces: &[Option<crate::workspace::WorktreeSpaceMembership>],
+    indices: &[usize],
+) -> Option<usize> {
+    let mut parent_index = None;
+    let mut label = None;
+    let mut checkout_paths = HashSet::new();
+    let mut linked_count = 0;
+
+    for index in indices {
+        let space = spaces.get(*index)?.as_ref()?;
+        if !space.checkout_path.is_absolute() || !space.repo_root.is_absolute() {
+            return None;
+        }
+        if !checkout_paths.insert(space.checkout_path.clone()) {
+            return None;
+        }
+        if label.is_some_and(|label| label != space.label) {
+            return None;
+        }
+        label = Some(space.label.as_str());
+
+        if space.is_linked_worktree {
+            linked_count += 1;
+        } else if parent_index.replace(*index).is_some() || space.checkout_path != space.repo_root {
+            return None;
+        }
+    }
+
+    (linked_count > 0).then_some(parent_index).flatten()
+}
+
+fn live_membership_matches(
+    space: &crate::workspace::WorktreeSpaceMembership,
+    expected_key: &str,
+) -> bool {
+    crate::workspace::git_space_metadata(&space.checkout_path).is_some_and(|current| {
+        current.key == expected_key
+            && current.is_linked_worktree == space.is_linked_worktree
+            && same_path(&current.repo_root, &space.checkout_path)
     })
+}
+
+fn recovery_group_registry_matches(
+    parent: &crate::workspace::WorktreeSpaceMembership,
+    spaces: &[Option<crate::workspace::WorktreeSpaceMembership>],
+    retained: &[usize],
+) -> bool {
+    let Ok(entries) = crate::worktree::list_existing_worktrees(&parent.checkout_path) else {
+        return false;
+    };
+
+    retained.iter().all(|index| {
+        let Some(space) = spaces[*index].as_ref() else {
+            return false;
+        };
+        if !space.is_linked_worktree {
+            return true;
+        }
+        let expected = crate::worktree::canonical_or_original(&space.checkout_path);
+        entries
+            .iter()
+            .filter(|entry| {
+                !entry.is_bare && crate::worktree::canonical_or_original(&entry.path) == expected
+            })
+            .count()
+            == 1
+    })
+}
+
+fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    crate::worktree::canonical_or_original(left) == crate::worktree::canonical_or_original(right)
 }
 
 fn restore_tab(
@@ -1182,6 +1345,224 @@ mod tests {
     }
 
     #[test]
+    fn restored_worktree_space_memberships_preserve_a_coherent_missing_group() {
+        let missing = std::env::temp_dir().join(format!(
+            "herdr-missing-worktree-group-{}-{}",
+            std::process::id(),
+            crate::terminal::TerminalId::alloc()
+        ));
+        let parent = crate::workspace::WorktreeSpaceMembership {
+            key: "saved-key".into(),
+            label: "herdr".into(),
+            repo_root: missing.join("repo"),
+            checkout_path: missing.join("repo"),
+            is_linked_worktree: false,
+        };
+        let child = crate::workspace::WorktreeSpaceMembership {
+            key: "saved-key".into(),
+            label: "herdr".into(),
+            repo_root: missing.join("repo"),
+            checkout_path: missing.join("child"),
+            is_linked_worktree: true,
+        };
+
+        let restored =
+            restored_worktree_space_memberships(&[Some(parent.clone()), Some(child.clone())]);
+
+        assert_eq!(restored, vec![Some(parent), Some(child)]);
+    }
+
+    #[test]
+    fn restored_worktree_space_memberships_use_registry_proof_after_parent_retarget() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-restored-worktree-registry-{}-{}",
+            std::process::id(),
+            crate::terminal::TerminalId::alloc()
+        ));
+        let old_container = root.join("old");
+        let old_parent = old_container.join("repo");
+        let old_child = old_container.join("child");
+        std::fs::create_dir_all(&old_container).unwrap();
+        run_git(&root, &["init", "--quiet", old_parent.to_str().unwrap()]);
+        run_git(
+            &old_parent,
+            &["config", "user.email", "herdr@example.invalid"],
+        );
+        run_git(&old_parent, &["config", "user.name", "Herdr Test"]);
+        run_git(
+            &old_parent,
+            &["commit", "--quiet", "--allow-empty", "-m", "initial"],
+        );
+        run_git(
+            &old_parent,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "child-branch",
+                old_child.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let old_parent_identity = std::fs::canonicalize(&old_parent).unwrap();
+        let old_child_identity = std::fs::canonicalize(&old_child).unwrap();
+        let old_key = std::fs::canonicalize(old_parent.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let child_pointer_before = std::fs::read(old_child.join(".git")).unwrap();
+        let new_container = root.join("new");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_parent = new_container.join("repo");
+        let new_child = new_container.join("child");
+        let new_parent_identity = std::fs::canonicalize(&new_parent).unwrap();
+        let registry_before = git_registry(&new_parent);
+        let parent = crate::workspace::WorktreeSpaceMembership {
+            key: old_key.clone(),
+            label: "repo".into(),
+            repo_root: new_parent_identity.clone(),
+            checkout_path: new_parent_identity,
+            is_linked_worktree: false,
+        };
+        let child = crate::workspace::WorktreeSpaceMembership {
+            key: old_key,
+            label: "repo".into(),
+            repo_root: old_parent_identity,
+            checkout_path: old_child_identity,
+            is_linked_worktree: true,
+        };
+
+        let restored =
+            restored_worktree_space_memberships(&[Some(parent.clone()), Some(child.clone())]);
+
+        assert_eq!(restored, vec![Some(parent), Some(child)]);
+        assert_eq!(
+            std::fs::read(new_child.join(".git")).unwrap(),
+            child_pointer_before
+        );
+        assert_eq!(git_registry(&new_parent), registry_before);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restored_worktree_space_memberships_reject_live_parent_without_registry_proof() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-restored-worktree-wrong-parent-{}-{}",
+            std::process::id(),
+            crate::terminal::TerminalId::alloc()
+        ));
+        let live_parent = root.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init", "--quiet", live_parent.to_str().unwrap()]);
+        let live_parent = std::fs::canonicalize(live_parent).unwrap();
+        let registry_before = git_registry(&live_parent);
+        let config_before = std::fs::read(live_parent.join(".git").join("config")).unwrap();
+        let parent = crate::workspace::WorktreeSpaceMembership {
+            key: "unrelated-saved-key".into(),
+            label: "repo".into(),
+            repo_root: live_parent.clone(),
+            checkout_path: live_parent.clone(),
+            is_linked_worktree: false,
+        };
+        let child = crate::workspace::WorktreeSpaceMembership {
+            key: "unrelated-saved-key".into(),
+            label: "repo".into(),
+            repo_root: root.join("old-repo"),
+            checkout_path: root.join("missing-child"),
+            is_linked_worktree: true,
+        };
+
+        assert_eq!(
+            restored_worktree_space_memberships(&[Some(parent), Some(child)]),
+            vec![None, None]
+        );
+        assert_eq!(git_registry(&live_parent), registry_before);
+        assert_eq!(
+            std::fs::read(live_parent.join(".git").join("config")).unwrap(),
+            config_before
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restored_worktree_space_memberships_drop_unrelated_and_malformed_groups() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-restored-worktree-invalid-{}-{}",
+            std::process::id(),
+            crate::terminal::TerminalId::alloc()
+        ));
+        let unrelated = root.join("unrelated");
+        std::fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init", "--quiet", unrelated.to_str().unwrap()]);
+        let missing_parent = root.join("missing-parent");
+        let parent = crate::workspace::WorktreeSpaceMembership {
+            key: "saved-key".into(),
+            label: "repo".into(),
+            repo_root: missing_parent.clone(),
+            checkout_path: missing_parent,
+            is_linked_worktree: false,
+        };
+        let unrelated_child = crate::workspace::WorktreeSpaceMembership {
+            key: "saved-key".into(),
+            label: "repo".into(),
+            repo_root: root.join("missing-parent"),
+            checkout_path: unrelated,
+            is_linked_worktree: true,
+        };
+        assert_eq!(
+            restored_worktree_space_memberships(&[Some(parent.clone()), Some(unrelated_child),]),
+            vec![None, None]
+        );
+
+        let duplicate_parent = crate::workspace::WorktreeSpaceMembership {
+            checkout_path: root.join("second-parent"),
+            repo_root: root.join("second-parent"),
+            ..parent.clone()
+        };
+        let missing_child = crate::workspace::WorktreeSpaceMembership {
+            checkout_path: root.join("missing-child"),
+            is_linked_worktree: true,
+            ..parent.clone()
+        };
+        assert_eq!(
+            restored_worktree_space_memberships(&[
+                Some(parent),
+                Some(duplicate_parent),
+                Some(missing_child),
+            ]),
+            vec![None, None, None]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn run_git(cwd: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_registry(repo: &std::path::Path) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        output.stdout
+    }
+
+    #[test]
     fn restore_plan_respects_opt_in_and_allowlist() {
         let pi_session_path = test_session_path("pi-session.jsonl");
         let session = super::super::snapshot::PaneAgentSessionSnapshot {
@@ -1413,6 +1794,7 @@ mod tests {
 
         let (restored, failed_imports) = restore_workspace(
             &snapshot,
+            None,
             None,
             24,
             80,
