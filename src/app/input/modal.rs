@@ -1470,20 +1470,8 @@ impl App {
     }
 
     pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
-        if let ContextMenuKind::TabCreateTarget { .. } = &menu.kind {
-            if idx == 0 {
-                self.runtime_tab_create(
-                    "tui.tab.create",
-                    crate::api::schema::TabCreateParams {
-                        workspace_id: None,
-                        cwd: None,
-                        focus: true,
-                        label: None,
-                        env: Default::default(),
-                    },
-                );
-            }
-            leave_modal(&mut self.state);
+        if let ContextMenuKind::TabCreateTarget { plugin_panes } = &menu.kind {
+            self.apply_tab_create_target_via_api(plugin_panes, idx);
             return;
         }
         if let ContextMenuKind::WorkspaceCreateTarget { machines } = &menu.kind {
@@ -1701,6 +1689,50 @@ impl App {
             }
             _ => leave_modal(&mut self.state),
         }
+    }
+
+    fn apply_tab_create_target_via_api(
+        &mut self,
+        plugin_panes: &[crate::app::state::TabCreatePluginTarget],
+        idx: usize,
+    ) {
+        if idx == 0 {
+            self.runtime_tab_create(
+                "tui.tab.create",
+                crate::api::schema::TabCreateParams {
+                    workspace_id: None,
+                    cwd: None,
+                    focus: true,
+                    label: None,
+                    env: Default::default(),
+                },
+            );
+        } else if let Some(plugin_pane) = plugin_panes.get(idx - 1) {
+            let target_workspace = self
+                .state
+                .active
+                .and_then(|ws_idx| self.state.workspaces.get(ws_idx));
+            let workspace_id = target_workspace.map(|workspace| workspace.id.clone());
+            let cwd =
+                target_workspace.map(|workspace| workspace.identity_cwd.display().to_string());
+            self.runtime_plugin_pane_open(
+                "tui.tab.create_plugin",
+                crate::api::schema::PluginPaneOpenParams {
+                    plugin_id: plugin_pane.plugin_id.clone(),
+                    entrypoint: plugin_pane.entrypoint.clone(),
+                    placement: Some(crate::api::schema::PluginPanePlacement::Tab),
+                    width: None,
+                    height: None,
+                    workspace_id,
+                    target_pane_id: None,
+                    direction: None,
+                    cwd,
+                    focus: true,
+                    env: Default::default(),
+                },
+            );
+        }
+        leave_modal(&mut self.state);
     }
 }
 
@@ -2654,6 +2686,87 @@ mod tests {
 
         assert_eq!(app.state.workspaces[0].tabs.len(), 2);
         assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[tokio::test]
+    async fn api_tab_type_plugin_selection_creates_plugin_tab_in_active_checkout() {
+        let mut app = app_with_test_workspaces(&["other", "test"]);
+        app.state.mode = Mode::ContextMenu;
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        let fixture_root = temp_config_path("plugin-tab-selection")
+            .parent()
+            .expect("fixture root")
+            .to_path_buf();
+        let checkout_cwd = fixture_root.join("active-checkout");
+        let plugin_root = fixture_root.join("plugin-root");
+        std::fs::create_dir_all(&checkout_cwd).expect("active checkout");
+        std::fs::create_dir_all(&plugin_root).expect("plugin root");
+        assert_ne!(checkout_cwd, plugin_root);
+        app.state.workspaces[1].identity_cwd = checkout_cwd.clone();
+        let target = crate::app::state::TabCreatePluginTarget {
+            plugin_id: "example.logs".into(),
+            entrypoint: "logs".into(),
+            title: "Logs".into(),
+        };
+        app.state.installed_plugins.insert(
+            target.plugin_id.clone(),
+            crate::api::schema::InstalledPluginInfo {
+                plugin_id: target.plugin_id.clone(),
+                name: "Logs".into(),
+                version: "0.1.0".into(),
+                min_herdr_version: "0.8.0".into(),
+                description: None,
+                manifest_path: plugin_root.join("herdr-plugin.toml").display().to_string(),
+                plugin_root: plugin_root.display().to_string(),
+                enabled: true,
+                platforms: None,
+                build: Vec::new(),
+                startup: Vec::new(),
+                actions: Vec::new(),
+                events: Vec::new(),
+                panes: vec![crate::api::schema::PluginManifestPane {
+                    id: target.entrypoint.clone(),
+                    title: target.title.clone(),
+                    description: None,
+                    platforms: None,
+                    placement: crate::api::schema::PluginPanePlacement::Overlay,
+                    width: None,
+                    height: None,
+                    command: vec![
+                        crate::app::api::test_support::exiting_test_command().to_string(),
+                    ],
+                }],
+                link_handlers: Vec::new(),
+                source: crate::api::schema::PluginSourceInfo::default(),
+                warnings: Vec::new(),
+            },
+        );
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::TabCreateTarget {
+                plugin_panes: vec![target],
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(1),
+        };
+
+        app.apply_context_menu_action_via_api(menu, 1);
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        let workspace = &app.state.workspaces[1];
+        assert_eq!(workspace.tabs.len(), 2);
+        let plugin_tab = &workspace.tabs[1];
+        assert_eq!(workspace.active_tab, 1);
+        assert!(app.state.plugin_panes.contains_key(&plugin_tab.root_pane));
+        let terminal_id = plugin_tab
+            .terminal_id(plugin_tab.root_pane)
+            .expect("plugin tab root terminal");
+        assert_eq!(app.state.terminals[terminal_id].cwd, checkout_cwd);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.context_menu.is_none());
+        crate::app::api::test_support::shutdown_test_runtimes(&mut app);
+        std::fs::remove_dir_all(fixture_root).expect("remove fixture");
     }
 
     #[test]

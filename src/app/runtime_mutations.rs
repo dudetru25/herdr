@@ -1,9 +1,10 @@
 use crate::api::schema::{
     EmptyParams, LayoutSetSplitRatioParams, MachineAddParams, MachineImportParams, Method,
     PaneFocusDirectionParams, PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams,
-    PaneTarget, PaneZoomParams, TabCreateParams, TabMoveParams, TabRenameParams, TabTarget,
-    WorkspaceCreateParams, WorkspaceMoveBlockParams, WorkspaceMoveParams, WorkspaceRenameParams,
-    WorkspaceTarget, WorktreeCreateParams, WorktreeOpenParams, WorktreeRemoveParams,
+    PaneTarget, PaneZoomParams, PluginPaneOpenParams, TabCreateParams, TabMoveParams,
+    TabRenameParams, TabTarget, WorkspaceCreateParams, WorkspaceMoveBlockParams,
+    WorkspaceMoveParams, WorkspaceRenameParams, WorkspaceTarget, WorktreeCreateParams,
+    WorktreeOpenParams, WorktreeRemoveParams,
 };
 
 use super::App;
@@ -99,6 +100,20 @@ impl App {
             &response,
             "tab creation failed",
             "Herdr could not read the response while creating the tab.",
+        );
+        response
+    }
+
+    pub(crate) fn runtime_plugin_pane_open(
+        &mut self,
+        id: &'static str,
+        params: PluginPaneOpenParams,
+    ) -> String {
+        let response = self.dispatch_runtime_mutation(id, Method::PluginPaneOpen(params));
+        self.show_runtime_creation_error(
+            &response,
+            "plugin tab creation failed",
+            "Herdr could not read the response while creating the plugin tab.",
         );
         response
     }
