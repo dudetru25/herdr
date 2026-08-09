@@ -4418,7 +4418,7 @@ mod tests {
         ));
 
         assert_eq!(app.state.mode, Mode::RenameTab);
-        assert_eq!(app.state.name_input, "1");
+        assert_eq!(app.state.name_input, "1 terminal");
         assert!(app.state.context_menu.is_none());
         assert!(app.state.context_submenu.is_none());
     }

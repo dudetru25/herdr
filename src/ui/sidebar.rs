@@ -2418,7 +2418,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             [
                 ("auto", None),
                 ("custom", Some("focus")),
-                ("multi", Some("1")),
+                ("multi", Some("1 terminal")),
                 ("multi", Some("logs")),
             ]
         );

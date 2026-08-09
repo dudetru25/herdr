@@ -2696,7 +2696,7 @@ mod tests {
         open_rename_active_tab(&mut state, true);
 
         assert_eq!(state.mode, Mode::RenameTab);
-        assert_eq!(state.name_input, "2");
+        assert_eq!(state.name_input, "2 terminal");
         assert!(state.name_input_replace_on_type);
     }
 
@@ -2717,7 +2717,7 @@ mod tests {
         apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 1);
 
         assert_eq!(state.mode, Mode::RenameTab);
-        assert_eq!(state.name_input, "1");
+        assert_eq!(state.name_input, "1 terminal");
         assert!(!state.name_input_replace_on_type);
     }
 
@@ -2880,7 +2880,7 @@ mod tests {
         assert!(state.workspaces[0].tabs[1].custom_name.is_none());
         assert_eq!(
             state.workspaces[0].tab_display_name(1).as_deref(),
-            Some("2")
+            Some("2 terminal")
         );
     }
 

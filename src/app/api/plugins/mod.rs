@@ -1890,8 +1890,23 @@ command = ["sh", "-c", "sleep 1"]
             panic!("expected plugin pane opened response: {open}");
         };
 
-        let events = event_hub
-            .events_after(0)
+        assert_eq!(
+            app.state.workspaces[0].tabs[1].tab_type,
+            crate::workspace::TabType::Plugin {
+                plugin_id: "example.tab".into(),
+                entrypoint: "board".into(),
+            }
+        );
+        let emitted = event_hub.events_after(0);
+        let created_label = emitted
+            .iter()
+            .find_map(|(_, event)| match &event.data {
+                crate::api::schema::EventData::TabCreated { tab } => Some(tab.label.as_str()),
+                _ => None,
+            })
+            .expect("tab.created data should be emitted");
+        assert_eq!(created_label, "2 board");
+        let events = emitted
             .into_iter()
             .map(|(_, event)| event.event)
             .collect::<Vec<_>>();
@@ -3149,7 +3164,7 @@ command = ["show-ctx"]
         assert_eq!(context.workspace_label.as_deref(), Some("Plugin Work"));
         assert_eq!(context.workspace_cwd.as_deref(), Some("/tmp/issue"));
         assert_eq!(context.tab_id.as_deref(), Some(tab_public.as_str()));
-        assert_eq!(context.tab_label.as_deref(), Some("1"));
+        assert_eq!(context.tab_label.as_deref(), Some("1 terminal"));
         assert_eq!(
             context.focused_pane_id.as_deref(),
             Some(pane_public.as_str())

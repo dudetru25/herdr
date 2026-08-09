@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ratatui::layout::Direction;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Notify};
 
 use crate::events::AppEvent;
@@ -24,6 +25,26 @@ pub struct NewPane {
     pub runtime: TerminalRuntime,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TabType {
+    #[default]
+    Terminal,
+    Plugin {
+        plugin_id: String,
+        entrypoint: String,
+    },
+}
+
+impl TabType {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Plugin { entrypoint, .. } => entrypoint,
+        }
+    }
+}
+
 enum SplitCommand<'a> {
     Shell {
         command: &'a str,
@@ -37,6 +58,7 @@ enum SplitCommand<'a> {
 
 pub struct Tab {
     pub custom_name: Option<String>,
+    pub tab_type: TabType,
     pub number: usize,
     /// Identity source for this tab's pane tree.
     pub root_pane: PaneId,
@@ -181,6 +203,7 @@ impl Tab {
         Ok((
             Self {
                 custom_name: None,
+                tab_type: TabType::Terminal,
                 number,
                 root_pane: root_id,
                 layout,
@@ -475,6 +498,7 @@ impl Tab {
         panes.insert(pane_id, moved.pane_state);
         Self {
             custom_name,
+            tab_type: TabType::Terminal,
             number,
             root_pane: pane_id,
             layout: TileLayout::from_saved(Node::Pane(pane_id), pane_id),

@@ -4276,7 +4276,7 @@ mod tests {
 
         assert_eq!(tab.tab_id, format!("{}:t3", app.state.workspaces[0].id));
         assert_eq!(tab.number, 3);
-        assert_eq!(tab.label, "2");
+        assert_eq!(tab.label, "2 terminal");
     }
 
     #[test]

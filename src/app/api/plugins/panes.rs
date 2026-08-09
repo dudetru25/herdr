@@ -221,6 +221,10 @@ impl App {
             Err(err) => return encode_error(id, "plugin_pane_open_failed", err.to_string()),
         };
         let pane_id = ws.tabs[tab_idx].root_pane;
+        ws.tabs[tab_idx].tab_type = crate::workspace::TabType::Plugin {
+            plugin_id: plugin.plugin_id.clone(),
+            entrypoint: pane.id.clone(),
+        };
         if params.focus {
             self.state.switch_workspace_tab(ws_idx, tab_idx);
             self.state.mode = crate::app::Mode::Terminal;

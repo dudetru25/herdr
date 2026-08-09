@@ -29,7 +29,7 @@ pub use self::{
         git_status_cache_key, git_worktree_is_bare, GitSpaceMetadata, GitStatusCacheEntry,
         GitStatusRefreshDemand,
     },
-    tab::{NewPane, Tab},
+    tab::{NewPane, Tab, TabType},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -558,7 +558,7 @@ impl Workspace {
         Some(
             tab.custom_name
                 .clone()
-                .unwrap_or_else(|| (tab_idx + 1).to_string()),
+                .unwrap_or_else(|| format!("{} {}", tab_idx + 1, tab.tab_type.label())),
         )
     }
 
@@ -1438,6 +1438,7 @@ impl Workspace {
         panes.insert(root_id, PaneState::new(terminal_id));
         let tab = Tab {
             custom_name: None,
+            tab_type: TabType::Terminal,
             number: 1,
             root_pane: root_id,
             layout,
@@ -1497,6 +1498,7 @@ impl Workspace {
         panes.insert(root_id, PaneState::new(TerminalId::alloc()));
         let tab = Tab {
             custom_name: name.map(str::to_string),
+            tab_type: TabType::Terminal,
             number: self.next_public_tab_number,
             root_pane: root_id,
             layout,
@@ -1965,6 +1967,46 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_tab_labels_follow_position_and_type_after_close_and_reorder() {
+        let mut ws = Workspace::test_new("test");
+        let plugin_idx = ws.test_add_tab(None);
+        ws.tabs[plugin_idx].tab_type = TabType::Plugin {
+            plugin_id: "example.files".into(),
+            entrypoint: "file-viewer".into(),
+        };
+        ws.test_add_tab(None);
+
+        let labels = (0..ws.tabs.len())
+            .map(|tab_idx| ws.tab_display_name(tab_idx).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["1 terminal", "2 file-viewer", "3 terminal"]);
+
+        assert!(ws.close_tab(0));
+        let labels = (0..ws.tabs.len())
+            .map(|tab_idx| ws.tab_display_name(tab_idx).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["1 file-viewer", "2 terminal"]);
+
+        assert!(ws.move_tab(1, 0));
+        let labels = (0..ws.tabs.len())
+            .map(|tab_idx| ws.tab_display_name(tab_idx).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["1 terminal", "2 file-viewer"]);
+    }
+
+    #[test]
+    fn custom_tab_name_overrides_position_and_type() {
+        let mut ws = Workspace::test_new("test");
+        ws.tabs[0].tab_type = TabType::Plugin {
+            plugin_id: "example.files".into(),
+            entrypoint: "file-viewer".into(),
+        };
+        ws.tabs[0].set_custom_name("review".into());
+
+        assert_eq!(ws.tab_display_name(0).as_deref(), Some("review"));
+    }
+
+    #[test]
     fn moving_tab_keeps_active_identity_and_stable_tab_numbers() {
         let mut ws = Workspace::test_new("test");
         let moved_root = ws.tabs[0].root_pane;
@@ -1978,7 +2020,7 @@ mod tests {
         let labels: Vec<_> = (0..ws.tabs.len())
             .map(|tab_idx| ws.tab_display_name(tab_idx).unwrap())
             .collect();
-        assert_eq!(labels, vec!["foo", "2", "3"]);
+        assert_eq!(labels, vec!["foo", "2 terminal", "3 terminal"]);
         assert_eq!(ws.tabs[0].custom_name.as_deref(), Some("foo"));
         assert!(ws.tabs[1].custom_name.is_none());
         assert!(ws.tabs[2].custom_name.is_none());

@@ -996,6 +996,7 @@ fn restore_tab(
         Some((
             crate::workspace::Tab {
                 custom_name: snap.custom_name.clone(),
+                tab_type: snap.tab_type.clone(),
                 number,
                 root_pane,
                 layout,
@@ -1758,6 +1759,7 @@ mod tests {
             next_public_tab_number: 0,
             tabs: vec![TabSnapshot {
                 custom_name: None,
+                tab_type: crate::workspace::TabType::Terminal,
                 layout: LayoutSnapshot::Pane(0),
                 panes: HashMap::from([(
                     0,
@@ -1861,6 +1863,7 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    tab_type: crate::workspace::TabType::Terminal,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
                         0,
@@ -1943,6 +1946,7 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    tab_type: crate::workspace::TabType::Terminal,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
                         0,
@@ -2032,10 +2036,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn machine_workspace_restore_preserves_pane_when_ssh_spawn_fails() {
+    async fn machine_workspace_restore_preserves_pane_and_tab_type_when_ssh_spawn_fails() {
         let cwd = std::env::current_dir().unwrap();
         let tab = TabSnapshot {
             custom_name: Some("build".into()),
+            tab_type: crate::workspace::TabType::Plugin {
+                plugin_id: "example.machine".into(),
+                entrypoint: "monitor".into(),
+            },
             layout: LayoutSnapshot::Pane(0),
             panes: HashMap::from([(
                 0,
@@ -2090,8 +2098,15 @@ mod tests {
         );
 
         assert_eq!(failed_imports, 0);
-        let (_tab, terminals, runtimes, _reverse_ids) =
+        let (tab, terminals, runtimes, _reverse_ids) =
             restored.expect("machine tab must survive a transient spawn failure");
+        assert_eq!(
+            tab.tab_type,
+            crate::workspace::TabType::Plugin {
+                plugin_id: "example.machine".into(),
+                entrypoint: "monitor".into(),
+            }
+        );
         assert_eq!(terminals.len(), 1);
         assert!(runtimes.is_empty());
         assert!(
@@ -2121,6 +2136,7 @@ mod tests {
                 next_public_tab_number: 6,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    tab_type: crate::workspace::TabType::Terminal,
                     layout: LayoutSnapshot::Split {
                         direction: super::super::snapshot::DirectionSnapshot::Horizontal,
                         ratio: 0.5,
@@ -2233,6 +2249,7 @@ mod tests {
                 tabs: vec![
                     TabSnapshot {
                         custom_name: None,
+                        tab_type: crate::workspace::TabType::Terminal,
                         layout: LayoutSnapshot::Pane(10),
                         panes: HashMap::from([pane_snap("10")]),
                         zoomed: false,
@@ -2241,6 +2258,7 @@ mod tests {
                     },
                     TabSnapshot {
                         custom_name: None,
+                        tab_type: crate::workspace::TabType::Terminal,
                         layout: LayoutSnapshot::Pane(11),
                         panes: HashMap::from([pane_snap("11")]),
                         zoomed: false,
@@ -2249,6 +2267,7 @@ mod tests {
                     },
                     TabSnapshot {
                         custom_name: None,
+                        tab_type: crate::workspace::TabType::Terminal,
                         layout: LayoutSnapshot::Pane(12),
                         panes: HashMap::from([pane_snap("12")]),
                         zoomed: false,
@@ -2257,6 +2276,7 @@ mod tests {
                     },
                     TabSnapshot {
                         custom_name: None,
+                        tab_type: crate::workspace::TabType::Terminal,
                         layout: LayoutSnapshot::Pane(13),
                         panes: HashMap::from([(13, final_pane)]),
                         zoomed: false,
@@ -2317,6 +2337,7 @@ mod tests {
             next_public_tab_number: 0,
             tabs: vec![TabSnapshot {
                 custom_name: None,
+                tab_type: crate::workspace::TabType::Terminal,
                 layout: LayoutSnapshot::Split {
                     direction: super::super::snapshot::DirectionSnapshot::Horizontal,
                     ratio: 0.5,
@@ -2358,6 +2379,7 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    tab_type: crate::workspace::TabType::Terminal,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
                         0,
@@ -2570,6 +2592,7 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    tab_type: crate::workspace::TabType::Terminal,
                     layout: LayoutSnapshot::Pane(0),
                     panes,
                     zoomed: false,

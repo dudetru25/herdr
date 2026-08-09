@@ -302,9 +302,19 @@ mod tests {
         assert!(!app.view.split_borders.is_empty());
         assert!(frame.cursor.is_some());
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
+        let tab_bar_text = frame
+            .cells
+            .iter()
+            .take(frame.width as usize)
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert!(
+            tab_bar_text.contains("1 terminal"),
+            "tab bar should include the typed automatic label: {tab_bar_text:?}"
+        );
         assert_eq!(
             frame_digest(&frame),
-            "b019ccdeb2e2db971a5076aed00a5aa789eeb8d6aad953a6cb7fd93ac1063ad3"
+            "f4432e1f36cc319202afc7666be1aec0ef79d86bb63379a81ba631780d4bddf0"
         );
     }
 
@@ -319,9 +329,18 @@ mod tests {
         assert_eq!(app.view.mobile_header_rect, Rect::new(0, 0, 44, 2));
         assert_eq!(app.view.terminal_area, Rect::new(0, 2, 44, 18));
         assert_eq!(frame.cursor, None);
+        let frame_text = frame
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        assert!(
+            frame_text.contains("1 terminal"),
+            "mobile frame should include the typed automatic label: {frame_text:?}"
+        );
         assert_eq!(
             frame_digest(&frame),
-            "295608a66067f1e1f066c0adb3cf427e8a2d68bba8f68949fb72d464dcd8baab"
+            "dd5c9001ad740de3fffe479b7dbca36ca5104bf4f9f39a2873c7cc57e1d3345d"
         );
     }
 }

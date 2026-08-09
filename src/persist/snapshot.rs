@@ -89,6 +89,8 @@ struct LegacyWorkspaceSnapshot {
 pub struct TabSnapshot {
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default)]
+    pub tab_type: crate::workspace::TabType,
     pub layout: LayoutSnapshot,
     pub panes: HashMap<u32, PaneSnapshot>,
     pub zoomed: bool,
@@ -150,6 +152,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
         let identity_cwd = legacy_identity_cwd(&snap);
         let tab = TabSnapshot {
             custom_name: None,
+            tab_type: crate::workspace::TabType::Terminal,
             layout: snap.layout,
             panes: snap.panes,
             zoomed: snap.zoomed,
@@ -388,6 +391,7 @@ fn capture_tab(
     }
     TabSnapshot {
         custom_name: tab.custom_name.clone(),
+        tab_type: tab.tab_type.clone(),
         layout: capture_node(tab.layout.root()),
         panes,
         zoomed: tab.zoomed,
@@ -740,6 +744,7 @@ mod tests {
                 next_public_tab_number: 2,
                 tabs: vec![TabSnapshot {
                     custom_name: Some("api".to_string()),
+                    tab_type: crate::workspace::TabType::Terminal,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
                         ratio: 0.5,
@@ -1270,6 +1275,47 @@ mod tests {
     }
 
     #[test]
+    fn tab_type_round_trip_and_legacy_snapshot_default() {
+        let mut state = state_with_workspaces(&["typed"]);
+        state.workspaces[0].tabs[0].tab_type = crate::workspace::TabType::Plugin {
+            plugin_id: "example.files".into(),
+            entrypoint: "file-viewer".into(),
+        };
+
+        let captured = capture_from_state(&state);
+        assert_eq!(
+            captured.workspaces[0].tabs[0].tab_type,
+            crate::workspace::TabType::Plugin {
+                plugin_id: "example.files".into(),
+                entrypoint: "file-viewer".into(),
+            }
+        );
+        let json = serde_json::to_string(&captured).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            value["workspaces"][0]["tabs"][0]["tab_type"],
+            serde_json::json!({
+                "kind": "plugin",
+                "plugin_id": "example.files",
+                "entrypoint": "file-viewer",
+            })
+        );
+        let parsed = parse_snapshot(&json).unwrap();
+        assert_eq!(
+            parsed.workspaces[0].tabs[0].tab_type,
+            crate::workspace::TabType::Plugin {
+                plugin_id: "example.files".into(),
+                entrypoint: "file-viewer".into(),
+            }
+        );
+
+        let legacy = r#"{"custom_name":null,"layout":{"Pane":0},"panes":{},"zoomed":false}"#;
+        let legacy_tab: TabSnapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(legacy_tab.tab_type, crate::workspace::TabType::Terminal);
+        assert_eq!(SNAPSHOT_VERSION, 3);
+    }
+
+    #[test]
     fn old_unversioned_snapshot_loads_as_version_0() {
         let json = r#"{"workspaces":[],"active":null,"selected":0}"#;
         let snap = parse_snapshot(json).unwrap();
@@ -1332,6 +1378,7 @@ mod tests {
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
+                    tab_type: crate::workspace::TabType::Terminal,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
                         ratio: 0.5,

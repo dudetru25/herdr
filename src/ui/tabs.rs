@@ -429,9 +429,12 @@ mod tests {
             .unwrap();
 
         let row = buffer_row_text(terminal.backend().buffer(), app.view.tab_bar_rect, 0);
-        assert!(row.contains(" 1 Z"), "tab row: {row:?}");
+        assert!(row.contains(" 1 terminal Z"), "tab row: {row:?}");
         assert!(row.contains(" test Z"), "tab row: {row:?}");
-        assert_eq!(app.workspaces[0].tab_display_name(0).as_deref(), Some("1"));
+        assert_eq!(
+            app.workspaces[0].tab_display_name(0).as_deref(),
+            Some("1 terminal")
+        );
         assert_eq!(
             app.workspaces[0].tab_display_name(custom_tab).as_deref(),
             Some("test")
@@ -461,6 +464,17 @@ mod tests {
         assert_eq!(style.bg, Some(app.palette.accent));
         assert!(!style.add_modifier.contains(Modifier::DIM));
         assert!(!style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn auto_plugin_label_counts_toward_tab_width() {
+        let mut ws = Workspace::test_new("test");
+        ws.tabs[0].tab_type = crate::workspace::TabType::Plugin {
+            plugin_id: "example.files".into(),
+            entrypoint: "file-viewer".into(),
+        };
+
+        assert_eq!(tab_width(&ws, 0), display_width_u16("1 file-viewer") + 4);
     }
 
     #[test]

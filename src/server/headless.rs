@@ -5397,7 +5397,7 @@ mod tests {
                 _ => None,
             })
             .expect("tab created event");
-        assert_eq!(tab_created.label, "2");
+        assert_eq!(tab_created.label, "2 terminal");
         shutdown_test_runtimes(&mut server);
     }
 

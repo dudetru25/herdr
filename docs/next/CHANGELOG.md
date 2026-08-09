@@ -6,6 +6,9 @@
 - Added non-interactive `herdr machine add` and `herdr machine import` commands, including `--all` import from discovered SSH host aliases and per-alias import outcomes.
 - Added multi-select SSH host import to the Add remote machine dialog, with existing-machine markers and visible per-host outcomes.
 
+### Changed
+- Unnamed tabs now show their current position and type, such as `1 terminal` or `3 file-viewer`, while custom tab names remain unchanged.
+
 ## [0.8.0] - 2026-08-03
 
 ### Added

@@ -1408,7 +1408,7 @@ mod tests {
         assert!(workspace.close_tab(removed_tab));
         workspace.active_tab = 1;
 
-        assert_eq!(mobile_tab_status(&workspace), "tab 2 · 2/2");
+        assert_eq!(mobile_tab_status(&workspace), "tab 2 terminal · 2/2");
     }
 
     #[test]
@@ -1442,8 +1442,8 @@ mod tests {
             .map(|x| terminal.backend().buffer()[(x, 10)].symbol())
             .collect::<String>();
 
-        assert!(row.contains("tab 2"), "mobile tab row: {row:?}");
-        assert!(!row.contains("tab 3"), "mobile tab row: {row:?}");
+        assert!(row.contains("tab 2 terminal"), "mobile tab row: {row:?}");
+        assert!(!row.contains("tab 3 terminal"), "mobile tab row: {row:?}");
     }
 
     #[cfg(unix)]
