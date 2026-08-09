@@ -13,6 +13,19 @@ import { fileURLToPath } from "node:url";
 
 const CONFIG_FILE = "migration.json";
 const REPORT_FILE = "migration-report.json";
+const CONSUMER_SKILLS = "skills-v4";
+const CONSUMER_CLAUDE = "claude-projects";
+const CONSUMER_EDITORS = "editor-workspaces";
+const CONSUMER_REPORT = "report";
+const FULL_CONFIG_KEYS = [
+  "claudeProjectsRoot",
+  "claudeRootQuiescent",
+  "editorWorkspaceFiles",
+  "newPath",
+  "newProjectKey",
+  "oldPath",
+  "oldProjectKey",
+];
 const PLACEMENT_SCHEMA = "skills-ticket-placement/v1";
 const SNAPSHOT_SCHEMAS = new Set(["skills-snapshot/v4", "skills-snapshot/v5"]);
 const DEFAULT_LIMITS = Object.freeze({
@@ -135,6 +148,794 @@ export async function migrateSkillsV4({ configDir, stateDir, limits, testHooks =
     }
   }
   return report;
+}
+
+export async function migrateRepositoryPaths({ configDir, stateDir, limits, testHooks = {} }) {
+  const report = createRepositoryReport();
+  const effectiveLimits = { ...DEFAULT_LIMITS, ...limits };
+
+  try {
+    requireDirectoryOption(configDir, "configDir");
+    requireDirectoryOption(stateDir, "stateDir");
+    await mkdir(stateDir, { recursive: true });
+    await requireRegularDirectory(configDir, "invalid_config");
+    await requireRegularDirectory(stateDir, "invalid_state_path");
+
+    const config = await loadRepositoryConfig(
+      path.join(configDir, CONFIG_FILE),
+      effectiveLimits,
+    );
+    report.oldPath = config.oldPath;
+    report.newPath = config.newPath;
+    await requireRegularDirectory(config.newPath, "invalid_new_path");
+
+    const traversal = {
+      depth: 0,
+      entries: 0,
+      files: 0,
+      totalBytes: 0,
+      plannedBytes: 0,
+      fields: 0,
+    };
+    const plan = [];
+
+    await planSkillsConsumer({
+      config,
+      report,
+      traversal,
+      limits: effectiveLimits,
+      testHooks,
+      plan,
+    });
+    await planClaudeConsumer({
+      config,
+      report,
+      traversal,
+      limits: effectiveLimits,
+      plan,
+    });
+    await planEditorConsumers({
+      config,
+      report,
+      traversal,
+      limits: effectiveLimits,
+      plan,
+    });
+
+    const planningExceededLimits = report.failures.some(
+      ({ code }) => code === "resource_limit",
+    );
+    if (
+      !planningExceededLimits &&
+      reserveRepositoryReportSpace(report, plan, effectiveLimits)
+    ) {
+      for (const item of plan) {
+        try {
+          if (item.kind === "claude-directory") {
+            await renameClaudeProjectAtomically(item, testHooks);
+          } else {
+            await replaceFileAtomically(
+              item.file,
+              item.original,
+              item.replacement,
+              item.originalStat,
+              testHooks,
+              effectiveLimits.maxFileBytes,
+            );
+          }
+          recordRepositoryChange(report, item.consumer, item.reportPath, item.fields);
+        } catch (error) {
+          report.failures.push(
+            repositoryFailureRecord(
+              item.consumer,
+              item.reportPath,
+              error?.migrationCode ?? "migration_failed",
+              error instanceof Error ? error.message : String(error),
+            ),
+          );
+        }
+      }
+    }
+  } catch (error) {
+    report.failures.push(
+      repositoryFailureRecord(
+        "migration",
+        error?.migrationPath ?? ".",
+        error?.migrationCode ?? "migration_failed",
+        error instanceof Error ? error.message : String(error),
+      ),
+    );
+  }
+
+  finalizeRepositoryReport(report);
+  boundUnappliedRepositoryReport(report, effectiveLimits);
+  report.delivery = { status: "unavailable", reportPath: null };
+  if (typeof stateDir === "string" && stateDir.length > 0) {
+    try {
+      report.delivery = { status: "written", reportPath: REPORT_FILE };
+      ensureReportSize(report, effectiveLimits);
+      await testHooks.beforeWriteReport?.(report);
+      await writeReport(path.join(stateDir, REPORT_FILE), report);
+    } catch (error) {
+      report.delivery = { status: "failed", reportPath: null };
+      report.failures.push(
+        repositoryFailureRecord(
+          CONSUMER_REPORT,
+          REPORT_FILE,
+          error?.migrationCode ?? "report_write_failed",
+          error instanceof Error ? error.message : String(error),
+        ),
+      );
+      finalizeRepositoryReport(report);
+    }
+  }
+  return report;
+}
+
+function createRepositoryReport() {
+  return {
+    schema: "repository-migration-report/v1",
+    status: "failed",
+    oldPath: null,
+    newPath: null,
+    changed: [],
+    failures: [],
+    consumers: {
+      [CONSUMER_SKILLS]: emptyConsumerSummary(),
+      [CONSUMER_CLAUDE]: emptyConsumerSummary(),
+      [CONSUMER_EDITORS]: emptyConsumerSummary(),
+    },
+    summary: {
+      changedFiles: 0,
+      changedValues: 0,
+      failures: 0,
+    },
+    delivery: { status: "pending", reportPath: null },
+  };
+}
+
+function emptyConsumerSummary() {
+  return {
+    status: "unchanged",
+    changedFiles: 0,
+    changedValues: 0,
+    failures: 0,
+  };
+}
+
+function finalizeRepositoryReport(report) {
+  report.changed.sort((left, right) =>
+    `${left.consumer}:${left.path}`.localeCompare(`${right.consumer}:${right.path}`),
+  );
+  report.failures.sort((left, right) =>
+    `${left.consumer}:${left.path}`.localeCompare(`${right.consumer}:${right.path}`),
+  );
+  report.summary = {
+    changedFiles: report.changed.length,
+    changedValues: report.changed.reduce(
+      (total, change) => total + change.fields.length,
+      0,
+    ),
+    failures: report.failures.length,
+  };
+  for (const consumer of [CONSUMER_SKILLS, CONSUMER_CLAUDE, CONSUMER_EDITORS]) {
+    const changes = report.changed.filter((change) => change.consumer === consumer);
+    const failures = report.failures.filter((failureEntry) =>
+      failureEntry.consumer === consumer,
+    );
+    report.consumers[consumer] = {
+      status:
+        failures.length === 0
+          ? changes.length === 0
+            ? "unchanged"
+            : "success"
+          : changes.length === 0
+            ? "failed"
+            : "partial",
+      changedFiles: changes.length,
+      changedValues: changes.reduce(
+        (total, change) => total + change.fields.length,
+        0,
+      ),
+      failures: failures.length,
+    };
+  }
+  report.status =
+    report.failures.length === 0
+      ? "success"
+      : report.changed.length === 0
+        ? "failed"
+        : "partial";
+}
+
+async function loadRepositoryConfig(configPath, limits) {
+  const text = await readRegularFile(configPath, "invalid_config", limits.maxFileBytes);
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw failure("invalid_config", CONFIG_FILE, `invalid JSON: ${error.message}`);
+  }
+  const keys = isPlainObject(value) ? Object.keys(value).sort() : [];
+  if (
+    keys.length !== FULL_CONFIG_KEYS.length ||
+    keys.some((key, index) => key !== FULL_CONFIG_KEYS[index])
+  ) {
+    throw failure(
+      "invalid_config",
+      CONFIG_FILE,
+      `full migration config must contain only ${FULL_CONFIG_KEYS.join(", ")}`,
+    );
+  }
+
+  validateMigrationPair(value.oldPath, value.newPath);
+  validateMigrationPath(value.claudeProjectsRoot, "claudeProjectsRoot");
+  if (value.claudeRootQuiescent !== true) {
+    throw failure(
+      "invalid_config",
+      CONFIG_FILE,
+      "claudeRootQuiescent must be true after all Claude processes using the projects root are stopped",
+    );
+  }
+  validateClaudeProjectKey(value.oldProjectKey, "oldProjectKey");
+  validateClaudeProjectKey(value.newProjectKey, "newProjectKey");
+  if (
+    !Array.isArray(value.editorWorkspaceFiles) ||
+    value.editorWorkspaceFiles.length === 0
+  ) {
+    throw failure(
+      "invalid_config",
+      CONFIG_FILE,
+      "editorWorkspaceFiles must be a non-empty array",
+    );
+  }
+  if (value.editorWorkspaceFiles.length > limits.maxFiles) {
+    throw failure(
+      "resource_limit",
+      CONFIG_FILE,
+      "editor workspace file count exceeds the file limit",
+    );
+  }
+  const seen = new Set();
+  for (const [index, file] of value.editorWorkspaceFiles.entries()) {
+    validateMigrationPath(file, `editorWorkspaceFiles[${index}]`);
+    if (path.extname(file) !== ".code-workspace") {
+      throw failure(
+        "invalid_config",
+        CONFIG_FILE,
+        `editorWorkspaceFiles[${index}] must name a .code-workspace file`,
+      );
+    }
+    if (seen.has(file)) {
+      throw failure(
+        "invalid_config",
+        CONFIG_FILE,
+        `editorWorkspaceFiles contains duplicate path ${file}`,
+      );
+    }
+    seen.add(file);
+  }
+  return value;
+}
+
+function validateMigrationPair(oldPath, newPath) {
+  validateMigrationPath(oldPath, "oldPath");
+  validateMigrationPath(newPath, "newPath");
+  if (oldPath === newPath) {
+    throw failure("invalid_config", CONFIG_FILE, "oldPath and newPath must differ");
+  }
+  if (path.parse(oldPath).root === oldPath) {
+    throw failure("invalid_config", CONFIG_FILE, "oldPath must not be a filesystem root");
+  }
+  if (isPathWithin(oldPath, newPath) || isPathWithin(newPath, oldPath)) {
+    throw failure(
+      "invalid_config",
+      CONFIG_FILE,
+      "oldPath and newPath must not contain one another",
+    );
+  }
+}
+
+function validateClaudeProjectKey(value, field) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value === "." ||
+    value === ".." ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    value.includes("\0") ||
+    Buffer.byteLength(value) > 255 ||
+    path.basename(value) !== value
+  ) {
+    throw failure(
+      "invalid_config",
+      CONFIG_FILE,
+      `${field} must be a safe basename of at most 255 bytes`,
+    );
+  }
+}
+
+async function planSkillsConsumer({
+  config,
+  report,
+  traversal,
+  limits,
+  testHooks,
+  plan,
+}) {
+  const failures = [];
+  const consumerReport = {
+    oldPath: config.oldPath,
+    newPath: config.newPath,
+    failures,
+    newMatches: 0,
+  };
+  const planStart = plan.length;
+  try {
+    const skillsRoot = await resolveSkillsRoot(config.newPath, limits);
+    await planJsonDirectory({
+      directory: path.join(skillsRoot, "placements"),
+      kind: "placement",
+      report: consumerReport,
+      skillsRoot,
+      traversal,
+      limits,
+      testHooks,
+      plan,
+    });
+    await planJsonDirectory({
+      directory: path.join(skillsRoot, "snapshots"),
+      kind: "snapshot",
+      report: consumerReport,
+      skillsRoot,
+      traversal,
+      limits,
+      testHooks,
+      plan,
+    });
+    await planTrackerDirectory({
+      directory: path.join(skillsRoot, "backlog"),
+      report: consumerReport,
+      skillsRoot,
+      traversal,
+      limits,
+      testHooks,
+      plan,
+    });
+  } catch (error) {
+    failures.push(normalizeFailure(error));
+  }
+  if (
+    plan.length === planStart &&
+    consumerReport.newMatches === 0 &&
+    failures.length === 0
+  ) {
+    failures.push(
+      failureRecord(
+        ".",
+        "no_matching_paths",
+        "no supported Skills V4 value uses the old or new repository path",
+      ),
+    );
+  }
+  for (let index = planStart; index < plan.length; index += 1) {
+    plan[index].consumer = CONSUMER_SKILLS;
+    plan[index].kind = "file";
+  }
+  report.failures.push(
+    ...failures.map((failureEntry) => ({
+      consumer: CONSUMER_SKILLS,
+      ...failureEntry,
+    })),
+  );
+}
+
+async function planClaudeConsumer({ config, report, traversal, limits, plan }) {
+  try {
+    await requireRegularDirectory(config.claudeProjectsRoot, "unsafe_file_type");
+    consumeEntry(traversal, limits);
+    consumeEntry(traversal, limits);
+    const source = path.join(config.claudeProjectsRoot, config.oldProjectKey);
+    const destination = path.join(config.claudeProjectsRoot, config.newProjectKey);
+    const sourceStat = await optionalLstat(source);
+    const destinationStat = source === destination
+      ? sourceStat
+      : await optionalLstat(destination);
+
+    if (source === destination) {
+      if (!sourceStat) {
+        throw failure(
+          "source_missing",
+          source,
+          "Claude project source and destination are both missing",
+        );
+      }
+      requireSafeDirectoryStat(sourceStat, source);
+      return;
+    }
+    if (!sourceStat && destinationStat) {
+      requireSafeDirectoryStat(destinationStat, destination);
+      throw failure(
+        "unverifiable_destination",
+        destination,
+        "Claude project destination exists but this run cannot prove it owns the migration",
+      );
+    }
+    if (!sourceStat) {
+      throw failure("source_missing", source, "Claude project source is missing");
+    }
+    requireSafeDirectoryStat(sourceStat, source);
+    if (destinationStat) {
+      if (destinationStat.isSymbolicLink()) {
+        throw failure(
+          "unsafe_file_type",
+          destination,
+          "Claude project destination must not be a symbolic link",
+        );
+      }
+      throw failure(
+        "destination_exists",
+        destination,
+        "Claude project destination already exists",
+      );
+    }
+    plan.push({
+      kind: "claude-directory",
+      consumer: CONSUMER_CLAUDE,
+      source,
+      destination,
+      sourceStat,
+      reportPath: destination,
+      fields: ["projectDirectory"],
+    });
+  } catch (error) {
+    report.failures.push(
+      repositoryFailureRecord(
+        CONSUMER_CLAUDE,
+        error?.migrationPath ?? config.claudeProjectsRoot,
+        error?.migrationCode ?? "migration_failed",
+        error instanceof Error ? error.message : String(error),
+      ),
+    );
+  }
+}
+
+async function planEditorConsumers({ config, report, traversal, limits, plan }) {
+  for (const file of config.editorWorkspaceFiles) {
+    consumeEntry(traversal, limits);
+    try {
+      const result = await planRegularFile(
+        file,
+        (text) => transformEditorWorkspace(
+          text,
+          file,
+          config.oldPath,
+          config.newPath,
+          limits,
+        ),
+        { limits, traversal },
+      );
+      if (result.fields.length > 0) {
+        plan.push({
+          ...result,
+          kind: "file",
+          consumer: CONSUMER_EDITORS,
+          reportPath: file,
+        });
+      } else if ((result.currentFields?.length ?? 0) === 0) {
+        report.failures.push(
+          repositoryFailureRecord(
+            CONSUMER_EDITORS,
+            file,
+            "no_matching_paths",
+            "workspace has no folder path within the old or new repository path",
+          ),
+        );
+      }
+    } catch (error) {
+      report.failures.push(
+        repositoryFailureRecord(
+          CONSUMER_EDITORS,
+          error?.migrationPath ?? file,
+          error?.migrationCode ?? "migration_failed",
+          error instanceof Error ? error.message : String(error),
+        ),
+      );
+    }
+  }
+}
+
+function transformEditorWorkspace(text, file, oldPath, newPath, limits) {
+  let record;
+  try {
+    record = JSON.parse(text);
+  } catch (error) {
+    throw failure(
+      "malformed_workspace",
+      file,
+      `invalid workspace JSON: ${error.message}`,
+    );
+  }
+  if (!isPlainObject(record) || !Array.isArray(record.folders)) {
+    throw failure(
+      "malformed_workspace",
+      file,
+      "workspace must be a JSON object with a folders array",
+    );
+  }
+  if (record.folders.length > limits.maxFields) {
+    throw failure(
+      "resource_limit",
+      file,
+      "workspace folder count exceeds the field limit",
+    );
+  }
+
+  const fields = [];
+  const currentFields = [];
+  for (const [index, folder] of record.folders.entries()) {
+    if (!isPlainObject(folder)) {
+      throw failure(
+        "malformed_workspace",
+        file,
+        `folders[${index}] must be an object`,
+      );
+    }
+    const hasPath = Object.hasOwn(folder, "path");
+    const hasUri = Object.hasOwn(folder, "uri");
+    if (hasPath === hasUri) {
+      throw failure(
+        "malformed_workspace",
+        file,
+        `folders[${index}] must contain exactly one of path or uri`,
+      );
+    }
+    if (hasUri) {
+      if (typeof folder.uri !== "string" || !isValidWorkspaceUri(folder.uri)) {
+        throw failure(
+          "malformed_workspace",
+          file,
+          `folders[${index}].uri must be a valid URI`,
+        );
+      }
+      continue;
+    }
+    if (
+      typeof folder.path !== "string" ||
+      folder.path.length === 0 ||
+      folder.path.includes("\0")
+    ) {
+      throw failure(
+        "malformed_workspace",
+        file,
+        `folders[${index}].path must be a non-empty path without NUL bytes`,
+      );
+    }
+    const originalPath = folder.path;
+    const absolute = path.isAbsolute(folder.path)
+      ? folder.path
+      : path.resolve(path.dirname(file), folder.path);
+    const replacement = replacePathBoundary(absolute, oldPath, newPath);
+    if (replacement === null) {
+      if (replacePathBoundary(absolute, newPath, newPath) !== null) {
+        currentFields.push(`folders[${index}].path`);
+      }
+      continue;
+    }
+    folder.path = path.isAbsolute(folder.path)
+      ? replacement
+      : path.relative(path.dirname(file), replacement) || ".";
+    if (originalPath.includes("/") && !originalPath.includes("\\")) {
+      folder.path = folder.path.split(path.sep).join("/");
+    }
+    fields.push(`folders[${index}].path`);
+  }
+  return {
+    content: fields.length === 0 ? text : `${JSON.stringify(record, null, 2)}\n`,
+    fields,
+    currentFields,
+  };
+}
+
+function isValidWorkspaceUri(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol.length > 1;
+  } catch {
+    return false;
+  }
+}
+
+async function renameClaudeProjectAtomically(item, testHooks) {
+  const lockPath = path.join(
+    path.dirname(item.source),
+    ".herdr-repository-migration.lock",
+  );
+  let lockHandle;
+  let lockStat;
+  let lockOwned = false;
+  let renamed = false;
+  try {
+    try {
+      lockHandle = await open(lockPath, "wx", 0o600);
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        throw failure(
+          "migration_locked",
+          lockPath,
+          "another Claude project migration holds the cooperative lock",
+        );
+      }
+      throw error;
+    }
+    lockOwned = true;
+    lockStat = await lockHandle.stat();
+    await testHooks.beforeClaudeRename?.(item.source, item.destination);
+    const currentSource = await safeLstat(item.source, "concurrent_change");
+    if (!sameDirectoryIdentity(item.sourceStat, currentSource)) {
+      throw failure(
+        "concurrent_change",
+        item.source,
+        "Claude project source changed during migration",
+      );
+    }
+    const destinationStat = await optionalLstat(item.destination);
+    if (destinationStat) {
+      throw failure(
+        "concurrent_change",
+        item.destination,
+        "Claude project destination appeared during migration",
+      );
+    }
+    await rename(item.source, item.destination);
+    renamed = true;
+    await testHooks.afterClaudeRenameBeforeVerify?.(
+      item.source,
+      item.destination,
+    );
+    const sourceAfter = await optionalLstat(item.source);
+    const migrated = await safeLstat(item.destination, "migration_failed");
+    if (sourceAfter || !sameDirectoryIdentity(item.sourceStat, migrated)) {
+      throw failure(
+        "concurrent_change",
+        item.destination,
+        "Claude project destination appeared or changed during migration",
+      );
+    }
+    await testHooks.afterClaudeRename?.(item.source, item.destination);
+  } catch (error) {
+    if (renamed) {
+      try {
+        const sourceNow = await optionalLstat(item.source);
+        const destinationNow = await optionalLstat(item.destination);
+        if (
+          sourceNow ||
+          !destinationNow ||
+          !sameDirectoryIdentity(item.sourceStat, destinationNow)
+        ) {
+          throw new Error("filesystem state no longer permits rollback");
+        }
+        await rename(item.destination, item.source);
+      } catch (rollbackError) {
+        throw failure(
+          "rollback_failed",
+          item.destination,
+          `Claude project rename failed and rollback failed: ${rollbackError.message}`,
+        );
+      }
+    }
+    throw error;
+  } finally {
+    await lockHandle?.close().catch(() => {});
+    if (lockOwned && lockStat) {
+      const currentLock = await optionalLstat(lockPath).catch(() => null);
+      if (currentLock && sameFileIdentity(lockStat, currentLock)) {
+        await unlink(lockPath).catch(() => {});
+      }
+    }
+  }
+}
+
+function requireSafeDirectoryStat(stat, directory) {
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw failure(
+      "unsafe_file_type",
+      directory,
+      "Claude project path must be a regular directory",
+    );
+  }
+}
+
+function sameDirectoryIdentity(left, right) {
+  return (
+    right.isDirectory() &&
+    !right.isSymbolicLink() &&
+    left.dev === right.dev &&
+    left.ino === right.ino
+  );
+}
+
+async function optionalLstat(file) {
+  try {
+    return await lstat(file);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function recordRepositoryChange(report, consumer, file, fields) {
+  if (fields.length > 0) {
+    report.changed.push({ consumer, path: file, fields });
+  }
+}
+
+function repositoryFailureRecord(consumer, file, code, detail) {
+  return { consumer, ...failureRecord(file, code, detail) };
+}
+
+function reserveRepositoryReportSpace(report, plan, limits) {
+  const worstCase = {
+    ...report,
+    changed: plan.map(({ consumer, reportPath, fields }) => ({
+      consumer,
+      path: reportPath,
+      fields,
+    })),
+    failures: [
+      ...report.failures,
+      ...plan.map(({ consumer, reportPath }) =>
+        repositoryFailureRecord(
+          consumer,
+          reportPath,
+          "concurrent_change",
+          "x".repeat(MAX_FAILURE_DETAIL_LENGTH),
+        ),
+      ),
+      repositoryFailureRecord(
+        CONSUMER_REPORT,
+        REPORT_FILE,
+        "report_write_failed",
+        "x".repeat(MAX_FAILURE_DETAIL_LENGTH),
+      ),
+    ],
+  };
+  finalizeRepositoryReport(worstCase);
+  const reportBytes = serializedReport(worstCase).length;
+  const fallbackBytes = Buffer.byteLength(
+    `${JSON.stringify(compactMigrationSummary(worstCase))}\n`,
+  );
+  if (reportBytes > limits.maxReportBytes || fallbackBytes > limits.maxReportBytes) {
+    report.changed = [];
+    report.failures = [
+      repositoryFailureRecord(
+        "migration",
+        REPORT_FILE,
+        "resource_limit",
+        "migration report or fallback exceeds the byte limit",
+      ),
+    ];
+    return false;
+  }
+  return true;
+}
+
+function boundUnappliedRepositoryReport(report, limits) {
+  if (report.changed.length > 0 || serializedReport(report).length <= limits.maxReportBytes) {
+    return;
+  }
+  report.failures = [
+    repositoryFailureRecord(
+      "migration",
+      REPORT_FILE,
+      "resource_limit",
+      "migration stopped before mutation because its report exceeded the byte limit",
+    ),
+  ];
+  finalizeRepositoryReport(report);
 }
 
 function createReport() {
@@ -297,6 +1098,7 @@ async function planJsonDirectory({
         (text) => transformJsonState(text, kind, report.oldPath, report.newPath, reportPath),
         { limits, traversal },
       );
+      report.newMatches = (report.newMatches ?? 0) + (result.currentFields?.length ?? 0);
       if (result.fields.length > 0) {
         plan.push({ ...result, reportPath });
       }
@@ -319,16 +1121,20 @@ function transformJsonState(text, kind, oldPath, newPath, reportPath) {
 
   const fields = kind === "placement" ? placementFields(record, reportPath) : snapshotFields(record, reportPath);
   const changed = [];
+  const currentFields = [];
   for (const field of fields) {
     const replacement = replacePathBoundary(record[field], oldPath, newPath);
     if (replacement !== null) {
       record[field] = replacement;
       changed.push(field);
+    } else if (replacePathBoundary(record[field], newPath, newPath) !== null) {
+      currentFields.push(field);
     }
   }
   return {
     content: changed.length === 0 ? text : `${JSON.stringify(record, null, 2)}\n`,
     fields: changed,
+    currentFields,
   };
 }
 
@@ -433,6 +1239,7 @@ async function planTrackerDirectory({
           ),
           { limits, traversal },
         );
+        report.newMatches = (report.newMatches ?? 0) + (result.currentFields?.length ?? 0);
         if (result.fields.length > 0) {
           plan.push({ ...result, reportPath });
         }
@@ -445,10 +1252,14 @@ async function planTrackerDirectory({
 
 function transformTracker(text, oldPath, newPath, reportPath, limits, traversal) {
   const fields = [];
+  const currentFields = [];
   let projectedBytes = Buffer.byteLength(text);
   const content = text.replace(/^Claimed worktree: ([^\r\n]+)$/gm, (line, value) => {
     const replacement = replacePathBoundary(value, oldPath, newPath);
     if (replacement === null) {
+      if (replacePathBoundary(value, newPath, newPath) !== null) {
+        currentFields.push("Claimed worktree");
+      }
       return line;
     }
     const replacementLine = `Claimed worktree: ${replacement}`;
@@ -469,21 +1280,37 @@ function transformTracker(text, oldPath, newPath, reportPath, limits, traversal)
     fields.push("Claimed worktree");
     return replacementLine;
   });
-  return { content, fields };
+  return { content, fields, currentFields };
 }
 
-function replacePathBoundary(value, oldPath, newPath) {
-  if (!path.isAbsolute(value) || path.normalize(value) !== value) {
+export function replacePathBoundary(value, oldPath, newPath) {
+  const pathApi =
+    path.win32.isAbsolute(value) &&
+    path.win32.isAbsolute(oldPath) &&
+    path.win32.isAbsolute(newPath)
+      ? path.win32
+      : path;
+  if (!pathApi.isAbsolute(value)) {
     return null;
   }
-  const relative = path.relative(oldPath, value);
+  const relative = pathApi.relative(
+    pathApi.normalize(oldPath),
+    pathApi.normalize(value),
+  );
   if (relative.length === 0) {
     return newPath;
   }
-  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+  if (
+    relative === ".." ||
+    relative.startsWith(`..${pathApi.sep}`) ||
+    pathApi.isAbsolute(relative)
+  ) {
     return null;
   }
-  return path.join(newPath, relative);
+  const replacement = pathApi.join(pathApi.normalize(newPath), relative);
+  return pathApi === path.win32 && value.includes("/") && !value.includes("\\")
+    ? replacement.replaceAll("\\", "/")
+    : replacement;
 }
 
 async function planRegularFile(file, transform, { limits, traversal }) {
@@ -900,12 +1727,30 @@ function normalizeFailure(error, fallbackPath = ".", fallbackCode = "migration_f
 }
 
 async function main() {
-  const report = await migrateSkillsV4({
+  const mode = migrationModeForArguments(process.argv.slice(2));
+  const migrate = mode === "all-consumers"
+    ? migrateRepositoryPaths
+    : migrateSkillsV4;
+  const report = await migrate({
     configDir: process.env.HERDR_PLUGIN_CONFIG_DIR,
     stateDir: process.env.HERDR_PLUGIN_STATE_DIR,
   });
   process.stdout.write(`${JSON.stringify(compactMigrationSummary(report))}\n`);
   process.exitCode = report.status === "success" ? 0 : 1;
+}
+
+export function migrationModeForArguments(args) {
+  if (args.length === 0 || (args.length === 1 && args[0] === "--skills-v4-only")) {
+    return "skills-v4-only";
+  }
+  if (args.length === 1 && args[0] === "--all-consumers") {
+    return "all-consumers";
+  }
+  throw failure(
+    "invalid_arguments",
+    "command line",
+    "expected --skills-v4-only or --all-consumers",
+  );
 }
 
 export function compactMigrationSummary(report, maxBytes = DEFAULT_LIMITS.maxReportBytes) {

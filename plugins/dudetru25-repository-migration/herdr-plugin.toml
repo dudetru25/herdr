@@ -9,4 +9,10 @@ platforms = ["linux", "macos", "windows"]
 id = "migrate-skills-v4"
 title = "Migrate Skills V4 state"
 contexts = ["workspace"]
-command = ["node", "./src/migrate.mjs"]
+command = ["node", "./src/migrate.mjs", "--skills-v4-only"]
+
+[[actions]]
+id = "migrate-repository-paths"
+title = "Migrate repository path consumers"
+contexts = ["workspace"]
+command = ["node", "./src/migrate.mjs", "--all-consumers"]

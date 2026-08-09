@@ -1,10 +1,26 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { compactMigrationSummary, migrateSkillsV4 } from "../src/migrate.mjs";
+import {
+  compactMigrationSummary,
+  migrationModeForArguments,
+  migrateRepositoryPaths,
+  migrateSkillsV4,
+  replacePathBoundary,
+} from "../src/migrate.mjs";
 
 async function fixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), "herdr-repository-migration-"));
@@ -31,6 +47,404 @@ async function fixture(t) {
 async function writeJson(file, value) {
   await writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
 }
+
+async function repositoryFixture(t) {
+  const f = await fixture(t);
+  const claudeProjectsRoot = path.join(f.root, "claude-projects");
+  const oldProjectKey = "-old-location-repository";
+  const newProjectKey = "-new-location-repository-a1b2c3d4";
+  const oldClaudeProject = path.join(claudeProjectsRoot, oldProjectKey);
+  const newClaudeProject = path.join(claudeProjectsRoot, newProjectKey);
+  const absoluteWorkspace = path.join(f.root, "editor", "absolute.code-workspace");
+  const relativeWorkspace = path.join(f.root, "editor", "relative.code-workspace");
+
+  await mkdir(oldClaudeProject, { recursive: true });
+  await writeFile(path.join(oldClaudeProject, "session.jsonl"), "live claude marker\n");
+  await mkdir(path.dirname(absoluteWorkspace), { recursive: true });
+  await writeJson(absoluteWorkspace, {
+    folders: [
+      { path: path.join(f.oldPath, "app") },
+      { path: `${f.oldPath}-copy` },
+      { uri: "vscode-remote://ssh-remote+dev/workspace" },
+    ],
+    settings: { "migration.unrelated": f.oldPath },
+  });
+  await writeJson(relativeWorkspace, {
+    folders: [
+      { path: path.relative(path.dirname(relativeWorkspace), path.join(f.oldPath, "docs")) },
+    ],
+  });
+  await writeJson(path.join(f.configDir, "migration.json"), {
+    oldPath: f.oldPath,
+    newPath: f.newPath,
+    claudeProjectsRoot,
+    claudeRootQuiescent: true,
+    oldProjectKey,
+    newProjectKey,
+    editorWorkspaceFiles: [absoluteWorkspace, relativeWorkspace],
+  });
+  await writeJson(path.join(f.skillsRoot, "placements", "TASK-DEFAULT.json"), {
+    schema: "skills-ticket-placement/v1",
+    worktree: f.oldPath,
+    gitCommonDirectory: path.join(f.oldPath, ".git"),
+    gitDirectory: path.join(f.oldPath, ".git", "worktrees", "default"),
+  });
+
+  return {
+    ...f,
+    absoluteWorkspace,
+    claudeProjectsRoot,
+    newClaudeProject,
+    newProjectKey,
+    oldClaudeProject,
+    oldProjectKey,
+    relativeWorkspace,
+  };
+}
+
+test("re-points Skills, explicit Claude project keys, and editor workspace paths", async (t) => {
+  const f = await repositoryFixture(t);
+  const placement = path.join(f.skillsRoot, "placements", "TASK-1.json");
+  await writeJson(placement, {
+    schema: "skills-ticket-placement/v1",
+    worktree: f.oldPath,
+    gitCommonDirectory: path.join(f.oldPath, ".git"),
+    gitDirectory: path.join(f.oldPath, ".git", "worktrees", "one"),
+  });
+
+  const report = await migrateRepositoryPaths({
+    configDir: f.configDir,
+    stateDir: f.stateDir,
+  });
+
+  assert.equal(report.status, "success");
+  assert.deepEqual(
+    new Set(report.changed.map(({ consumer }) => consumer)),
+    new Set(["skills-v4", "claude-projects", "editor-workspaces"]),
+  );
+  assert.equal(await readFile(path.join(f.newClaudeProject, "session.jsonl"), "utf8"), "live claude marker\n");
+  await assert.rejects(lstat(f.oldClaudeProject), { code: "ENOENT" });
+
+  const absolute = JSON.parse(await readFile(f.absoluteWorkspace, "utf8"));
+  assert.equal(absolute.folders[0].path, path.join(f.newPath, "app"));
+  assert.equal(absolute.folders[1].path, `${f.oldPath}-copy`);
+  assert.equal(absolute.folders[2].uri, "vscode-remote://ssh-remote+dev/workspace");
+  assert.equal(absolute.settings["migration.unrelated"], f.oldPath);
+
+  const relative = JSON.parse(await readFile(f.relativeWorkspace, "utf8"));
+  assert.equal(
+    relative.folders[0].path,
+    path.relative(path.dirname(f.relativeWorkspace), path.join(f.newPath, "docs")),
+  );
+});
+
+test("reports Claude destination collisions without merging or overwriting", async (t) => {
+  const f = await repositoryFixture(t);
+  await mkdir(f.newClaudeProject);
+  await writeFile(path.join(f.newClaudeProject, "existing.jsonl"), "keep target\n");
+
+  const report = await migrateRepositoryPaths({
+    configDir: f.configDir,
+    stateDir: f.stateDir,
+  });
+
+  assert.equal(report.status, "partial");
+  assert.ok(
+    report.failures.some(
+      ({ consumer, code }) => consumer === "claude-projects" && code === "destination_exists",
+    ),
+  );
+  assert.equal(await readFile(path.join(f.oldClaudeProject, "session.jsonl"), "utf8"), "live claude marker\n");
+  assert.equal(await readFile(path.join(f.newClaudeProject, "existing.jsonl"), "utf8"), "keep target\n");
+  assert.ok(!report.changed.some(({ consumer }) => consumer === "claude-projects"));
+});
+
+test("reports a named partial result when an editor workspace is malformed", async (t) => {
+  const f = await repositoryFixture(t);
+  await writeFile(f.absoluteWorkspace, "{ // JSONC is not accepted\n}\n");
+
+  const report = await migrateRepositoryPaths({
+    configDir: f.configDir,
+    stateDir: f.stateDir,
+  });
+
+  assert.equal(report.status, "partial");
+  assert.ok(report.changed.some(({ consumer }) => consumer === "claude-projects"));
+  assert.ok(
+    report.failures.some(
+      ({ consumer, code, path: failedPath }) =>
+        consumer === "editor-workspaces" &&
+        code === "malformed_workspace" &&
+        failedPath === f.absoluteWorkspace,
+    ),
+  );
+  assert.equal(await readFile(path.join(f.newClaudeProject, "session.jsonl"), "utf8"), "live claude marker\n");
+});
+
+test("rejects symlinked Claude projects and editor workspace files", async (t) => {
+  const f = await repositoryFixture(t);
+  const outsideClaude = path.join(f.root, "outside-claude");
+  const outsideWorkspace = path.join(f.root, "outside.code-workspace");
+  await mkdir(outsideClaude);
+  await writeFile(path.join(outsideClaude, "marker"), "outside\n");
+  await rm(f.oldClaudeProject, { recursive: true });
+  await symlink(outsideClaude, f.oldClaudeProject);
+  await writeJson(outsideWorkspace, { folders: [{ path: f.oldPath }] });
+  await rm(f.absoluteWorkspace);
+  await symlink(outsideWorkspace, f.absoluteWorkspace);
+
+  const report = await migrateRepositoryPaths({
+    configDir: f.configDir,
+    stateDir: f.stateDir,
+  });
+
+  assert.equal(report.status, "partial");
+  assert.ok(
+    report.failures.some(
+      ({ consumer, code }) => consumer === "claude-projects" && code === "unsafe_file_type",
+    ),
+  );
+  assert.ok(
+    report.failures.some(
+      ({ consumer, code }) => consumer === "editor-workspaces" && code === "unsafe_file_type",
+    ),
+  );
+  assert.equal(JSON.parse(await readFile(outsideWorkspace, "utf8")).folders[0].path, f.oldPath);
+  assert.equal(await readFile(path.join(outsideClaude, "marker"), "utf8"), "outside\n");
+});
+
+test("fails closed when only the Claude destination exists", async (t) => {
+  const f = await repositoryFixture(t);
+  await rename(f.oldClaudeProject, f.newClaudeProject);
+
+  const report = await migrateRepositoryPaths({
+    configDir: f.configDir,
+    stateDir: f.stateDir,
+  });
+
+  assert.equal(report.status, "partial");
+  assert.deepEqual(report.consumers["claude-projects"], {
+    status: "failed",
+    changedFiles: 0,
+    changedValues: 0,
+    failures: 1,
+  });
+  assert.ok(
+    report.failures.some(
+      ({ consumer, code }) =>
+        consumer === "claude-projects" && code === "unverifiable_destination",
+    ),
+  );
+  assert.ok(!report.changed.some(({ consumer }) => consumer === "claude-projects"));
+});
+
+test("blocks every mutation when a full migration exceeds a shared resource limit", async (t) => {
+  const f = await repositoryFixture(t);
+  const placement = path.join(f.skillsRoot, "placements", "TASK-1.json");
+  await writeJson(placement, {
+    schema: "skills-ticket-placement/v1",
+    worktree: f.oldPath,
+    gitCommonDirectory: path.join(f.oldPath, ".git"),
+    gitDirectory: path.join(f.oldPath, ".git", "worktrees", "one"),
+  });
+
+  const report = await migrateRepositoryPaths({
+    configDir: f.configDir,
+    stateDir: f.stateDir,
+    limits: { maxFiles: 2 },
+  });
+
+  assert.equal(report.status, "failed");
+  assert.ok(report.failures.some(({ code }) => code === "resource_limit"));
+  assert.equal(JSON.parse(await readFile(placement, "utf8")).worktree, f.oldPath);
+  assert.equal(await readFile(path.join(f.oldClaudeProject, "session.jsonl"), "utf8"), "live claude marker\n");
+  await assert.rejects(lstat(f.newClaudeProject), { code: "ENOENT" });
+});
+
+test("rejects unsafe Claude keys and duplicate editor workspace files", async (t) => {
+  const f = await repositoryFixture(t);
+  const baseConfig = JSON.parse(
+    await readFile(path.join(f.configDir, "migration.json"), "utf8"),
+  );
+  const cases = [
+    { ...baseConfig, oldProjectKey: "../outside" },
+    {
+      ...baseConfig,
+      editorWorkspaceFiles: [f.absoluteWorkspace, f.absoluteWorkspace],
+    },
+    { ...baseConfig, unexpected: true },
+  ];
+
+  for (const config of cases) {
+    await writeJson(path.join(f.configDir, "migration.json"), config);
+    const report = await migrateRepositoryPaths({
+      configDir: f.configDir,
+      stateDir: f.stateDir,
+    });
+    assert.equal(report.status, "failed");
+    assert.equal(report.failures[0].code, "invalid_config");
+    assert.equal(await readFile(path.join(f.oldClaudeProject, "session.jsonl"), "utf8"), "live claude marker\n");
+    await assert.rejects(lstat(f.newClaudeProject), { code: "ENOENT" });
+  }
+});
+
+test("requires an explicit true Claude-root quiescence acknowledgement", async (t) => {
+  const f = await repositoryFixture(t);
+  const configFile = path.join(f.configDir, "migration.json");
+  const baseConfig = JSON.parse(await readFile(configFile, "utf8"));
+  const { claudeRootQuiescent: _acknowledgement, ...missingAcknowledgement } = baseConfig;
+
+  for (const config of [
+    missingAcknowledgement,
+    { ...baseConfig, claudeRootQuiescent: false },
+  ]) {
+    await writeJson(configFile, config);
+    const report = await migrateRepositoryPaths({
+      configDir: f.configDir,
+      stateDir: f.stateDir,
+    });
+
+    assert.equal(report.status, "failed");
+    assert.equal(report.failures[0].code, "invalid_config");
+    assert.equal(await readFile(path.join(f.oldClaudeProject, "session.jsonl"), "utf8"), "live claude marker\n");
+    await assert.rejects(lstat(f.newClaudeProject), { code: "ENOENT" });
+  }
+});
+
+test("rolls back a Claude rename when verification cannot complete", async (t) => {
+  const f = await repositoryFixture(t);
+
+  const report = await migrateRepositoryPaths({
+    configDir: f.configDir,
+    stateDir: f.stateDir,
+    testHooks: {
+      afterClaudeRenameBeforeVerify: async () => {
+        throw new Error("simulated post-rename verification failure");
+      },
+    },
+  });
+
+  assert.equal(report.status, "partial");
+  assert.ok(
+    report.failures.some(
+      ({ consumer, code }) =>
+        consumer === "claude-projects" && code === "migration_failed",
+    ),
+  );
+  assert.equal(await readFile(path.join(f.oldClaudeProject, "session.jsonl"), "utf8"), "live claude marker\n");
+  await assert.rejects(lstat(f.newClaudeProject), { code: "ENOENT" });
+  assert.ok(!report.changed.some(({ consumer }) => consumer === "claude-projects"));
+});
+
+test("does not report an editor change when its atomic replacement loses a race", async (t) => {
+  const f = await repositoryFixture(t);
+
+  const report = await migrateRepositoryPaths({
+    configDir: f.configDir,
+    stateDir: f.stateDir,
+    testHooks: {
+      beforeReplace: async (file) => {
+        if (file === f.absoluteWorkspace) {
+          await chmod(file, 0o600);
+        }
+      },
+    },
+  });
+
+  assert.equal(report.status, "partial");
+  assert.ok(
+    report.failures.some(
+      ({ consumer, code, path: failedPath }) =>
+        consumer === "editor-workspaces" &&
+        code === "concurrent_change" &&
+        failedPath === f.absoluteWorkspace,
+    ),
+  );
+  assert.ok(
+    !report.changed.some(
+      ({ consumer, path: changedPath }) =>
+        consumer === "editor-workspaces" && changedPath === f.absoluteWorkspace,
+    ),
+  );
+  assert.equal(
+    JSON.parse(await readFile(f.absoluteWorkspace, "utf8")).folders[0].path,
+    path.join(f.oldPath, "app"),
+  );
+});
+
+test("reports an unrelated configured workspace instead of calling it unchanged", async (t) => {
+  const f = await repositoryFixture(t);
+  await writeJson(f.absoluteWorkspace, {
+    folders: [{ path: path.join(f.root, "unrelated") }],
+  });
+  await writeJson(f.relativeWorkspace, {
+    folders: [{ uri: "vscode-remote://ssh-remote+dev/unrelated" }],
+  });
+
+  const report = await migrateRepositoryPaths({
+    configDir: f.configDir,
+    stateDir: f.stateDir,
+  });
+
+  assert.equal(report.status, "partial");
+  assert.equal(report.consumers["editor-workspaces"].status, "failed");
+  assert.equal(report.consumers["editor-workspaces"].failures, 2);
+  assert.ok(
+    report.failures.every(
+      ({ consumer, code }) => consumer !== "editor-workspaces" || code === "no_matching_paths",
+    ),
+  );
+});
+
+test("accepts dot-relative workspace paths and keeps the replacement relative", async (t) => {
+  const f = await repositoryFixture(t);
+  const dotRelative = `.${path.sep}${path.relative(
+    path.dirname(f.absoluteWorkspace),
+    path.join(f.oldPath, "portable"),
+  )}`;
+  await writeJson(f.absoluteWorkspace, { folders: [{ path: dotRelative }] });
+
+  const report = await migrateRepositoryPaths({
+    configDir: f.configDir,
+    stateDir: f.stateDir,
+  });
+
+  assert.equal(report.status, "success");
+  const workspace = JSON.parse(await readFile(f.absoluteWorkspace, "utf8"));
+  assert.equal(
+    workspace.folders[0].path,
+    path.relative(path.dirname(f.absoluteWorkspace), path.join(f.newPath, "portable")),
+  );
+});
+
+test("keeps no-argument CLI compatibility and rejects unknown modes", () => {
+  assert.equal(migrationModeForArguments([]), "skills-v4-only");
+  assert.equal(migrationModeForArguments(["--skills-v4-only"]), "skills-v4-only");
+  assert.equal(migrationModeForArguments(["--all-consumers"]), "all-consumers");
+  assert.throws(
+    () => migrationModeForArguments(["--unknown"]),
+    ({ migrationCode }) => migrationCode === "invalid_arguments",
+  );
+});
+
+test("accepts absolute Windows workspace paths with forward slashes", () => {
+  assert.equal(
+    replacePathBoundary(
+      "C:/old/repository/app",
+      "C:\\old\\repository",
+      "D:\\new\\repository",
+    ),
+    "D:/new/repository/app",
+  );
+  assert.equal(
+    replacePathBoundary(
+      "C:/old/repository-copy/app",
+      "C:\\old\\repository",
+      "D:\\new\\repository",
+    ),
+    null,
+  );
+});
 
 test("re-points only supported Skills V4 path fields and exact tracker notes", async (t) => {
   const f = await fixture(t);
