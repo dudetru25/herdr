@@ -1,0 +1,12 @@
+id = "dudetru25.repository-migration"
+name = "Repository Migration"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Re-point path-keyed state after a repository moves"
+platforms = ["linux", "macos", "windows"]
+
+[[actions]]
+id = "migrate-skills-v4"
+title = "Migrate Skills V4 state"
+contexts = ["workspace"]
+command = ["node", "./src/migrate.mjs"]

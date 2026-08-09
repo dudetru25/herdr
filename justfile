@@ -6,6 +6,7 @@ test:
     python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_reload_local scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
     just integration-assets-test
     just plugin-marketplace-test
+    just repository-migration-plugin-test
 
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
@@ -28,6 +29,7 @@ ci filter='all()': lint
     cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
     just integration-assets-test
     just plugin-marketplace-test
+    just repository-migration-plugin-test
 
 # Run Windows target lint from Unix/macOS to catch cfg(windows) compile and clippy failures before CI
 [unix]
@@ -79,6 +81,10 @@ integration-assets-test:
 # Run plugin marketplace Worker tests
 plugin-marketplace-test:
     cd workers/plugin-marketplace && bun test
+
+# Run first-party repository migration plugin tests
+repository-migration-plugin-test:
+    node --test plugins/dudetru25-repository-migration/test/migrate.test.mjs
 
 # Build the vendored libghostty-vt source dist
 build-libghostty-vt:
