@@ -93,7 +93,7 @@ If an existing workspace's checkout moved on disk, point it at the caller-suppli
 herdr workspace retarget <workspace_id> <absolute-checkout-path>
 ```
 
-The path must already exist and be a usable Git checkout. Herdr rejects missing or non-checkout paths without changing the workspace; it does not discover or guess a replacement. After a successful retarget, inspect the workspace's panes with `herdr pane list --workspace <workspace_id>` to confirm their working-directory state, and use the same command after a server restart to verify the persisted target.
+The path must already exist and be a usable Git checkout. Herdr rejects missing or non-checkout paths without changing the workspace; it does not discover or guess a replacement. If a moved repository has linked worktrees, retarget its main checkout first and then retarget each linked checkout. Herdr repairs the linked checkout's paired Git pointers during retarget, or returns a typed error that names the broken pointer. After a successful retarget, inspect the workspace's panes with `herdr pane list --workspace <workspace_id>` to confirm their working-directory state, and use the same command after a server restart to verify the persisted target.
 
 ## Start and coordinate an agent
 

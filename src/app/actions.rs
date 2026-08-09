@@ -1383,6 +1383,51 @@ impl AppState {
         Ok(())
     }
 
+    pub(crate) fn apply_retargeted_worktree_membership(
+        &mut self,
+        ws_idx: usize,
+        path: &std::path::Path,
+        repair: Option<&crate::worktree::LinkedWorktreeRepair>,
+    ) {
+        let Some(membership) = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.worktree_space())
+            .cloned()
+        else {
+            return;
+        };
+
+        let Some(repair) = repair else {
+            if !membership.is_linked_worktree {
+                if let Some(membership) = self.workspaces[ws_idx].worktree_space.as_mut() {
+                    membership.repo_root = path.to_path_buf();
+                    membership.checkout_path = path.to_path_buf();
+                }
+            }
+            return;
+        };
+
+        for (index, workspace) in self.workspaces.iter_mut().enumerate() {
+            let Some(candidate) = workspace.worktree_space.as_mut() else {
+                continue;
+            };
+            if candidate.key != membership.key {
+                continue;
+            }
+            candidate.key = repair.key.clone();
+            candidate.repo_root = repair.repo_root.clone();
+            if index == ws_idx {
+                candidate.checkout_path = path.to_path_buf();
+            } else if !candidate.is_linked_worktree {
+                candidate.checkout_path = repair.repo_root.clone();
+            }
+        }
+        if membership.key != repair.key && self.collapsed_space_keys.remove(&membership.key) {
+            self.collapsed_space_keys.insert(repair.key.clone());
+        }
+    }
+
     #[cfg(test)]
     pub fn next_workspace(&mut self) {
         if self.workspaces.is_empty() {

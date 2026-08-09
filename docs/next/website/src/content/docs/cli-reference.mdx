@@ -128,6 +128,7 @@ herdr workspace create [--cwd PATH | --machine NAME] [--label TEXT] [--env KEY=V
 herdr workspace get <workspace_id>
 herdr workspace focus <workspace_id>
 herdr workspace rename <workspace_id> <label>
+herdr workspace retarget <workspace_id> <path>
 herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]
 herdr workspace close <workspace_id>
 ```
@@ -139,6 +140,8 @@ herdr workspace create --cwd ~/project --label api --no-focus
 ```
 
 A workspace is the top-level project or work context. Creating one also creates its first tab and root pane. The JSON response exposes their IDs as `.result.workspace.workspace_id`, `.result.tab.tab_id`, and `.result.root_pane.pane_id`.
+
+Use `workspace retarget` after a checkout moves to a caller-supplied path. Herdr does not search for the checkout. For a repository with linked worktrees, retarget the main checkout first and then each linked checkout. Herdr repairs both linked-worktree pointers or returns a typed error that names the broken pointer.
 
 ## Machines
 

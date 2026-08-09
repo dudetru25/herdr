@@ -231,6 +231,393 @@ pub(crate) fn canonical_or_original(path: &Path) -> PathBuf {
     canonical_path(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkedWorktreeRepair {
+    pub key: String,
+    pub repo_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkedWorktreeRepairErrorKind {
+    PointerBroken,
+    RepairFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkedWorktreeRepairError {
+    pub kind: LinkedWorktreeRepairErrorKind,
+    pub message: String,
+}
+
+impl LinkedWorktreeRepairError {
+    fn pointer(path: &Path, detail: impl fmt::Display) -> Self {
+        Self {
+            kind: LinkedWorktreeRepairErrorKind::PointerBroken,
+            message: format!(
+                "broken linked-worktree pointer {}: {detail}",
+                path.display()
+            ),
+        }
+    }
+
+    fn repair(path: &Path, detail: impl fmt::Display) -> Self {
+        Self {
+            kind: LinkedWorktreeRepairErrorKind::RepairFailed,
+            message: format!(
+                "failed to repair linked-worktree pointer {}: {detail}",
+                path.display()
+            ),
+        }
+    }
+}
+
+fn read_regular_pointer(path: &Path) -> Result<PathBuf, LinkedWorktreeRepairError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(path, err))?;
+    if !metadata.file_type().is_file() {
+        return Err(LinkedWorktreeRepairError::pointer(
+            path,
+            "expected a regular file",
+        ));
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(path, err))?;
+    let mut lines = contents.lines();
+    let Some(line) = lines.next() else {
+        return Err(LinkedWorktreeRepairError::pointer(path, "file is empty"));
+    };
+    if lines.next().is_some() {
+        return Err(LinkedWorktreeRepairError::pointer(
+            path,
+            "expected one gitdir line",
+        ));
+    }
+    let Some(value) = line.strip_prefix("gitdir:").map(str::trim) else {
+        return Err(LinkedWorktreeRepairError::pointer(
+            path,
+            "expected a gitdir line",
+        ));
+    };
+    if value.is_empty() {
+        return Err(LinkedWorktreeRepairError::pointer(
+            path,
+            "gitdir path is empty",
+        ));
+    }
+    let value = PathBuf::from(value);
+    Ok(if value.is_absolute() {
+        value
+    } else {
+        path.parent().unwrap_or(Path::new(".")).join(value)
+    })
+}
+
+fn read_admin_checkout_pointer(path: &Path) -> Result<PathBuf, LinkedWorktreeRepairError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(path, err))?;
+    if !metadata.file_type().is_file() {
+        return Err(LinkedWorktreeRepairError::pointer(
+            path,
+            "expected a regular file",
+        ));
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(path, err))?;
+    let value = contents.trim();
+    if value.is_empty() || contents.lines().count() != 1 {
+        return Err(LinkedWorktreeRepairError::pointer(
+            path,
+            "expected one checkout path",
+        ));
+    }
+    let value = PathBuf::from(value);
+    Ok(if value.is_absolute() {
+        value
+    } else {
+        path.parent().unwrap_or(Path::new(".")).join(value)
+    })
+}
+
+fn canonical_pointer_target(
+    pointer: &Path,
+    target: &Path,
+) -> Result<PathBuf, LinkedWorktreeRepairError> {
+    canonical_new_path(target).map_err(|err| LinkedWorktreeRepairError::pointer(pointer, err))
+}
+
+fn has_linked_worktree_admin_shape(path: &Path, admin_name: &std::ffi::OsStr) -> bool {
+    path.file_name() == Some(admin_name)
+        && path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("worktrees"))
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            == Some(std::ffi::OsStr::new(".git"))
+}
+
+fn validated_main_worktree_common_dir(
+    repo_root: &Path,
+) -> Result<PathBuf, LinkedWorktreeRepairError> {
+    let git_path = repo_root.join(".git");
+    let metadata = std::fs::symlink_metadata(&git_path)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&git_path, err))?;
+    if !metadata.file_type().is_dir() {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &git_path,
+            "recovery parent is not a main checkout",
+        ));
+    }
+
+    let output = crate::noninteractive_process::command("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "rev-parse",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--is-bare-repository",
+        ])
+        .output()
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&git_path, err))?;
+    if !output.status.success() {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &git_path,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&git_path, err))?;
+    let lines = stdout.lines().collect::<Vec<_>>();
+    if lines.len() != 3 || lines[2] != "false" {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &git_path,
+            "recovery parent is not a non-bare main checkout",
+        ));
+    }
+    let reported_root = canonical_path(Path::new(lines[0]))
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&git_path, err))?;
+    let expected_root = canonical_path(repo_root)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&git_path, err))?;
+    if reported_root != expected_root {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &git_path,
+            format!(
+                "Git reports a different main checkout: {}",
+                reported_root.display()
+            ),
+        ));
+    }
+    let reported_common = PathBuf::from(lines[1]);
+    let reported_common = if reported_common.is_absolute() {
+        reported_common
+    } else {
+        repo_root.join(reported_common)
+    };
+    let reported_common = canonical_path(&reported_common)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&git_path, err))?;
+    let expected_common = canonical_path(&git_path)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&git_path, err))?;
+    if reported_common != expected_common {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &git_path,
+            format!(
+                "Git reports a different common directory: {}",
+                reported_common.display()
+            ),
+        ));
+    }
+    Ok(reported_common)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_LINKED_WORKTREE_REPAIR_FAILURE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_forced_linked_worktree_repair_failure<T>(run: impl FnOnce() -> T) -> T {
+    FORCE_LINKED_WORKTREE_REPAIR_FAILURE.with(|forced| {
+        assert!(
+            !forced.replace(true),
+            "repair failure seam is already active"
+        );
+        let result = run();
+        forced.set(false);
+        result
+    })
+}
+
+fn run_linked_worktree_repair_command(repo_root: &Path, checkout: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if FORCE_LINKED_WORKTREE_REPAIR_FAILURE.with(std::cell::Cell::get) {
+        return Err("forced native git worktree repair failure".to_string());
+    }
+
+    let output = crate::noninteractive_process::command("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "repair"])
+        .arg(checkout)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+pub(crate) fn repair_linked_worktree_after_parent_move(
+    checkout: &Path,
+    previous_key: &str,
+    previous_repo_root: &Path,
+    previous_checkout: &Path,
+    repo_root: &Path,
+) -> Result<LinkedWorktreeRepair, LinkedWorktreeRepairError> {
+    let checkout = canonical_path(checkout)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&checkout.join(".git"), err))?;
+    let git_file = checkout.join(".git");
+    let child_target = read_regular_pointer(&git_file)?;
+    let child_target = canonical_pointer_target(&git_file, &child_target)?;
+
+    let Some(admin_name) = child_target.file_name() else {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &git_file,
+            "gitdir has no worktree name",
+        ));
+    };
+    let common_dir = validated_main_worktree_common_dir(repo_root)?;
+    let worktrees_dir = common_dir.join("worktrees");
+    let worktrees_metadata = std::fs::symlink_metadata(&worktrees_dir)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&worktrees_dir, err))?;
+    if !worktrees_metadata.file_type().is_dir() {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &worktrees_dir,
+            "expected a regular worktrees directory",
+        ));
+    }
+    let raw_new_admin_dir = worktrees_dir.join(admin_name);
+    let new_admin_identity = canonical_pointer_target(&git_file, &raw_new_admin_dir)?;
+    let previous_admin_dir = canonical_pointer_target(
+        &git_file,
+        &previous_repo_root
+            .join(".git")
+            .join("worktrees")
+            .join(admin_name),
+    )?;
+    let group_already_rekeyed = previous_key == common_dir.display().to_string();
+    let legacy_admin_matches = if group_already_rekeyed {
+        child_target != new_admin_identity
+            && has_linked_worktree_admin_shape(&child_target, admin_name)
+    } else {
+        child_target == previous_admin_dir
+    };
+    if child_target != new_admin_identity && !legacy_admin_matches {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &git_file,
+            "gitdir does not match the recorded old parent or the selected new parent",
+        ));
+    }
+    let new_admin_metadata = std::fs::symlink_metadata(&raw_new_admin_dir)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&raw_new_admin_dir, err))?;
+    if !new_admin_metadata.file_type().is_dir() {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &raw_new_admin_dir,
+            "expected a regular worktree administration directory",
+        ));
+    }
+    let new_admin_dir = canonical_path(&raw_new_admin_dir)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&raw_new_admin_dir, err))?;
+    let admin_gitdir = new_admin_dir.join("gitdir");
+    let admin_target = read_admin_checkout_pointer(&admin_gitdir)?;
+    let admin_target = canonical_pointer_target(&admin_gitdir, &admin_target)?;
+    let previous_checkout_git =
+        canonical_pointer_target(&admin_gitdir, &previous_checkout.join(".git"))?;
+    let checkout_git = canonical_path(&git_file)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&admin_gitdir, err))?;
+
+    let pointers_current = child_target == new_admin_dir && admin_target == checkout_git;
+    let pointers_legacy = legacy_admin_matches && admin_target == previous_checkout_git;
+    if !pointers_current && !pointers_legacy {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &admin_gitdir,
+            "pointer does not match the recorded old checkout or the selected new checkout",
+        ));
+    }
+
+    if pointers_legacy {
+        run_linked_worktree_repair_command(repo_root, &checkout)
+            .map_err(|err| LinkedWorktreeRepairError::repair(&git_file, err))?;
+    }
+
+    let repaired_child_target = read_regular_pointer(&git_file)?;
+    let repaired_child_target = canonical_pointer_target(&git_file, &repaired_child_target)?;
+    if repaired_child_target != new_admin_dir {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &git_file,
+            format!(
+                "expected {}, found {}",
+                new_admin_dir.display(),
+                repaired_child_target.display()
+            ),
+        ));
+    }
+    let repaired_admin_target = read_admin_checkout_pointer(&admin_gitdir)?;
+    let repaired_admin_target = canonical_pointer_target(&admin_gitdir, &repaired_admin_target)?;
+    if repaired_admin_target != checkout_git {
+        return Err(LinkedWorktreeRepairError::pointer(
+            &admin_gitdir,
+            format!(
+                "expected {}, found {}",
+                checkout_git.display(),
+                repaired_admin_target.display()
+            ),
+        ));
+    }
+
+    let status = crate::noninteractive_process::command("git")
+        .arg("-C")
+        .arg(&checkout)
+        .args(["status", "--porcelain=v1"])
+        .output()
+        .map_err(|err| LinkedWorktreeRepairError::repair(&git_file, err))?;
+    if !status.status.success() {
+        return Err(LinkedWorktreeRepairError::repair(
+            &git_file,
+            String::from_utf8_lossy(&status.stderr).trim(),
+        ));
+    }
+
+    let registry = list_existing_worktrees(repo_root)
+        .map_err(|err| LinkedWorktreeRepairError::repair(&git_file, err))?;
+    let repo_root_identity = canonical_path(repo_root)
+        .map_err(|err| LinkedWorktreeRepairError::pointer(&git_file, err))?;
+    let checkout_matches = registry
+        .iter()
+        .filter(|entry| {
+            canonical_or_original(&entry.path) == checkout && !entry.is_prunable && !entry.is_bare
+        })
+        .count();
+    let parent_is_registered = registry.iter().any(|entry| {
+        canonical_or_original(&entry.path) == repo_root_identity && !entry.is_prunable
+    });
+    if checkout_matches != 1 || !parent_is_registered {
+        return Err(LinkedWorktreeRepairError::repair(
+            &git_file,
+            format!(
+                "git worktree list did not contain one repaired checkout and its parent (checkout matches: {checkout_matches})"
+            ),
+        ));
+    }
+
+    Ok(LinkedWorktreeRepair {
+        key: common_dir.display().to_string(),
+        repo_root: repo_root_identity,
+    })
+}
+
 /// Stable identity for coordinating create and remove operations.
 ///
 /// Resolving the deepest existing ancestor keeps a missing checkout beneath a symlink keyed the

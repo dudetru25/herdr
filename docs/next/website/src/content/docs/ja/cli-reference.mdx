@@ -116,6 +116,7 @@ herdr workspace create [--cwd PATH | --machine NAME] [--label TEXT] [--env KEY=V
 herdr workspace get <workspace_id>
 herdr workspace focus <workspace_id>
 herdr workspace rename <workspace_id> <label>
+herdr workspace retarget <workspace_id> <path>
 herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]
 herdr workspace close <workspace_id>
 ```
@@ -127,6 +128,8 @@ herdr workspace create --cwd ~/project --label api --no-focus
 ```
 
 ワークスペースは最上位のプロジェクトまたは作業コンテキストです。作成時に最初のタブとルートペインも作られます。JSON レスポンスの `.result.workspace.workspace_id`、`.result.tab.tab_id`、`.result.root_pane.pane_id` から各 ID を取得できます。
+
+チェックアウトを移動した後は、呼び出し元が指定したパスに `workspace retarget` で変更します。Herdr はチェックアウトを検索しません。リンクされたワークツリーがある場合は、最初にメインチェックアウトを変更し、次に各リンクチェックアウトを変更します。Herdr は両方のワークツリーポインターを修復するか、壊れたポインターを示す型付きエラーを返します。
 
 ## マシン
 

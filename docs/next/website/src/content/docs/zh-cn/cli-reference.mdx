@@ -116,6 +116,7 @@ herdr workspace create [--cwd PATH | --machine NAME] [--label TEXT] [--env KEY=V
 herdr workspace get <workspace_id>
 herdr workspace focus <workspace_id>
 herdr workspace rename <workspace_id> <label>
+herdr workspace retarget <workspace_id> <path>
 herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]
 herdr workspace close <workspace_id>
 ```
@@ -127,6 +128,8 @@ herdr workspace create --cwd ~/project --label api --no-focus
 ```
 
 工作区是顶层项目或工作上下文。创建工作区也会创建第一个标签页和根窗格。JSON 响应中的 `.result.workspace.workspace_id`、`.result.tab.tab_id` 和 `.result.root_pane.pane_id` 是对应 ID。
+
+检出目录移动后，使用 `workspace retarget` 将工作区指向调用方提供的路径。Herdr 不会搜索检出目录。如果仓库有链接工作树，请先重定向主检出目录，再重定向每个链接检出目录。Herdr 会修复两个工作树指针；如果不能修复，则返回指明损坏指针的类型化错误。
 
 ## 机器
 

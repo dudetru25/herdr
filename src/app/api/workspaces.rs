@@ -160,9 +160,20 @@ impl App {
             );
         }
 
-        let path = match resolve_workspace_retarget_path(&params.path) {
-            Ok(path) => path,
-            Err((code, message)) => return encode_error(id, code, message),
+        let worktree_membership = workspace.worktree_space().cloned();
+        let needs_worktree_repair = worktree_membership
+            .as_ref()
+            .is_some_and(|membership| membership.is_linked_worktree);
+        let path = if needs_worktree_repair {
+            match resolve_workspace_retarget_directory(&params.path) {
+                Ok(path) => path,
+                Err((code, message)) => return encode_error(id, code, message),
+            }
+        } else {
+            match resolve_workspace_retarget_path(&params.path) {
+                Ok(path) => path,
+                Err((code, message)) => return encode_error(id, code, message),
+            }
         };
         let pane_ids = self.state.pane_ids_for_workspace(index);
         let mut restarts = Vec::new();
@@ -215,9 +226,75 @@ impl App {
                 ));
             }
         }
+        let worktree_repair = if let Some(membership) = worktree_membership
+            .as_ref()
+            .filter(|membership| membership.is_linked_worktree)
+        {
+            let parents = self
+                .state
+                .workspaces
+                .iter()
+                .enumerate()
+                .filter_map(|(candidate_index, candidate)| {
+                    let candidate_membership = candidate.worktree_space()?;
+                    (candidate_index != index
+                        && candidate_membership.key == membership.key
+                        && !candidate_membership.is_linked_worktree
+                        && crate::worktree::canonical_or_original(&candidate.identity_cwd)
+                            == crate::worktree::canonical_or_original(
+                                &candidate_membership.repo_root,
+                            ))
+                    .then_some(candidate_membership.repo_root.clone())
+                })
+                .collect::<Vec<_>>();
+            if parents.len() != 1 {
+                let code = if parents.is_empty() {
+                    "workspace_retarget_worktree_parent_missing"
+                } else {
+                    "workspace_retarget_worktree_parent_ambiguous"
+                };
+                return encode_error(
+                    id,
+                    code,
+                    format!(
+                        "linked worktree {} requires exactly one retargeted parent checkout; found {}",
+                        membership.checkout_path.display(),
+                        parents.len()
+                    ),
+                );
+            }
+            let repair = match crate::worktree::repair_linked_worktree_after_parent_move(
+                &path,
+                &membership.key,
+                &membership.repo_root,
+                &membership.checkout_path,
+                &parents[0],
+            ) {
+                Ok(repair) => repair,
+                Err(err) => {
+                    let code = match err.kind {
+                        crate::worktree::LinkedWorktreeRepairErrorKind::PointerBroken => {
+                            "workspace_retarget_worktree_pointer_broken"
+                        }
+                        crate::worktree::LinkedWorktreeRepairErrorKind::RepairFailed => {
+                            "workspace_retarget_worktree_repair_failed"
+                        }
+                    };
+                    return encode_error(id, code, err.message);
+                }
+            };
+            if let Err((code, message)) = resolve_workspace_retarget_path(&params.path) {
+                return encode_error(id, code, message);
+            }
+            Some(repair)
+        } else {
+            None
+        };
         if let Err(message) = self.state.retarget_workspace(index, path.clone()) {
             return encode_error(id, "workspace_retarget_state_invalid", message);
         }
+        self.state
+            .apply_retargeted_worktree_membership(index, &path, worktree_repair.as_ref());
         for (pane_id, restart) in restarts {
             let terminal_id = restart.terminal_id.clone();
             self.intentional_pane_restarts.insert(pane_id, restart);
@@ -532,6 +609,22 @@ fn workspace_not_found(id: String, workspace_id: &str) -> String {
 }
 
 fn resolve_workspace_retarget_path(raw_path: &str) -> Result<PathBuf, (&'static str, String)> {
+    let path = resolve_workspace_retarget_directory(raw_path)?;
+    let is_non_bare_checkout =
+        crate::workspace::git_worktree_is_bare(&path).is_some_and(|is_bare| !is_bare);
+    if !is_non_bare_checkout {
+        return Err((
+            "workspace_retarget_path_not_checkout",
+            format!(
+                "workspace retarget path is not a usable Git checkout: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
+fn resolve_workspace_retarget_directory(raw_path: &str) -> Result<PathBuf, (&'static str, String)> {
     let path = PathBuf::from(raw_path);
     if !path.is_absolute() {
         return Err((
@@ -545,13 +638,11 @@ fn resolve_workspace_retarget_path(raw_path: &str) -> Result<PathBuf, (&'static 
             format!("workspace retarget path does not exist: {}", path.display()),
         ));
     }
-    let is_non_bare_checkout = path.is_dir()
-        && crate::workspace::git_worktree_is_bare(&path).is_some_and(|is_bare| !is_bare);
-    if !is_non_bare_checkout {
+    if !path.is_dir() {
         return Err((
             "workspace_retarget_path_not_checkout",
             format!(
-                "workspace retarget path is not a usable Git checkout: {}",
+                "workspace retarget path is not a directory: {}",
                 path.display()
             ),
         ));
@@ -733,13 +824,21 @@ mod tests {
 
     fn test_linked_git_worktree(root: &Path, name: &str) -> PathBuf {
         let source = test_git_checkout(root, &format!("{name}-source"));
+        commit_test_git_checkout(&source);
+
+        let checkout = root.join(name);
+        add_test_linked_git_worktree(&source, &checkout, &format!("{name}-branch"));
+        checkout
+    }
+
+    fn commit_test_git_checkout(source: &Path) {
         for args in [
             ["config", "user.email", "herdr@example.invalid"],
             ["config", "user.name", "Herdr Test"],
         ] {
             let output = std::process::Command::new("git")
                 .arg("-C")
-                .arg(&source)
+                .arg(source)
                 .args(args)
                 .output()
                 .unwrap();
@@ -751,7 +850,7 @@ mod tests {
         }
         let output = std::process::Command::new("git")
             .arg("-C")
-            .arg(&source)
+            .arg(source)
             .args(["commit", "--quiet", "--allow-empty", "-m", "initial"])
             .output()
             .unwrap();
@@ -760,15 +859,15 @@ mod tests {
             "git commit failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
 
-        let checkout = root.join(name);
-        let branch = format!("{name}-branch");
+    fn add_test_linked_git_worktree(source: &Path, checkout: &Path, branch: &str) {
         let output = std::process::Command::new("git")
             .arg("-C")
-            .arg(&source)
+            .arg(source)
             .args(["worktree", "add", "--quiet", "-b"])
             .arg(branch)
-            .arg(&checkout)
+            .arg(checkout)
             .arg("HEAD")
             .output()
             .unwrap();
@@ -778,7 +877,51 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(checkout.join(".git").is_file());
-        checkout
+    }
+
+    fn grouped_worktree_workspace(
+        name: &str,
+        checkout: &Path,
+        key: &str,
+        repo_root: &Path,
+        is_linked_worktree: bool,
+    ) -> Workspace {
+        let mut workspace = Workspace::test_new(name);
+        workspace.identity_cwd = checkout.to_path_buf();
+        workspace.cached_identity_cwd = checkout.to_path_buf();
+        workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: key.to_string(),
+            label: "linked-source".into(),
+            repo_root: repo_root.to_path_buf(),
+            checkout_path: checkout.to_path_buf(),
+            is_linked_worktree,
+        });
+        workspace
+    }
+
+    fn retarget_workspace_response(app: &mut App, workspace_id: &str, path: &Path) -> String {
+        app.handle_api_request(Request {
+            id: format!("retarget-{workspace_id}"),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id: workspace_id.to_string(),
+                path: path.display().to_string(),
+            }),
+        })
+    }
+
+    fn git_worktree_registry(repo_root: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     }
 
     fn retarget_test_app(old_path: &Path) -> (App, EventHub, String) {
@@ -1451,6 +1594,802 @@ mod tests {
             .terminal_ids_for_workspace(0)
             .iter()
             .all(|terminal_id| app.state.terminals[terminal_id].cwd == linked_worktree));
+    }
+
+    #[test]
+    fn workspace_retarget_repairs_linked_worktree_after_parent_move() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_checkout = test_linked_git_worktree(&old_container, "linked");
+        let old_repo_root = old_container.join("linked-source");
+        let old_key = std::fs::canonicalize(old_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = old_repo_root.clone();
+        parent.cached_identity_cwd = old_repo_root.clone();
+        let parent_id = parent.id.clone();
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: old_key.clone(),
+            label: "linked-source".into(),
+            repo_root: old_repo_root.clone(),
+            checkout_path: old_repo_root.clone(),
+            is_linked_worktree: false,
+        });
+
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = old_checkout.clone();
+        child.cached_identity_cwd = old_checkout.clone();
+        let child_id = child.id.clone();
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: old_key.clone(),
+            label: "linked-source".into(),
+            repo_root: old_repo_root.clone(),
+            checkout_path: old_checkout.clone(),
+            is_linked_worktree: true,
+        });
+
+        let stale_sibling_path = old_container.join("sibling");
+        add_test_linked_git_worktree(&old_repo_root, &stale_sibling_path, "sibling-branch");
+        let registry_before_move = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&old_repo_root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(registry_before_move.status.success());
+        let registry_before_move = String::from_utf8(registry_before_move.stdout).unwrap();
+        let sibling_record_before = registry_before_move
+            .split("\n\n")
+            .find(|record| record.contains("branch refs/heads/sibling-branch"))
+            .unwrap();
+        let sibling_registry_path = sibling_record_before
+            .lines()
+            .find(|line| line.starts_with("worktree "))
+            .unwrap()
+            .to_owned();
+        let mut sibling = Workspace::test_new("sibling");
+        sibling.identity_cwd = stale_sibling_path.clone();
+        sibling.cached_identity_cwd = stale_sibling_path.clone();
+        sibling.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: old_key.clone(),
+            label: "linked-source".into(),
+            repo_root: old_repo_root.clone(),
+            checkout_path: stale_sibling_path.clone(),
+            is_linked_worktree: true,
+        });
+
+        let mut app = parent_space_api_app(vec![parent, child, sibling]);
+        app.state.collapsed_space_keys.insert(old_key.clone());
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_repo_root = new_container.join("linked-source");
+        let new_checkout = new_container.join("linked");
+
+        let parent_response = app.handle_api_request(Request {
+            id: "moved-parent".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id: parent_id,
+                path: new_repo_root.display().to_string(),
+            }),
+        });
+        let parent_success: SuccessResponse = serde_json::from_str(&parent_response).unwrap();
+        assert!(matches!(
+            parent_success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        let parent_membership = app.state.workspaces[0].worktree_space().unwrap();
+        assert_eq!(parent_membership.key, old_key);
+        assert_eq!(parent_membership.repo_root, new_repo_root);
+        assert_eq!(parent_membership.checkout_path, new_repo_root);
+
+        let child_response = app.handle_api_request(Request {
+            id: "moved-child".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id: child_id,
+                path: new_checkout.display().to_string(),
+            }),
+        });
+        let child_success: SuccessResponse = serde_json::from_str(&child_response).unwrap();
+        assert!(matches!(
+            child_success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&new_checkout)
+            .args(["status", "--porcelain=v1"])
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "git status failed after repair: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+
+        let child_git_file = new_checkout.join(".git");
+        let child_pointer = std::fs::read_to_string(&child_git_file).unwrap();
+        let child_admin = child_pointer
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .map(PathBuf::from)
+            .unwrap();
+        let child_admin = std::fs::canonicalize(child_admin).unwrap();
+        let expected_admin =
+            std::fs::canonicalize(new_repo_root.join(".git").join("worktrees").join("linked"))
+                .unwrap();
+        assert_eq!(child_admin, expected_admin);
+        let admin_pointer = std::fs::read_to_string(expected_admin.join("gitdir")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(admin_pointer.trim()).unwrap(),
+            std::fs::canonicalize(&child_git_file).unwrap()
+        );
+
+        let registry = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&new_repo_root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(registry.status.success());
+        let registry = String::from_utf8(registry.stdout).unwrap();
+        assert!(registry.contains(&format!(
+            "worktree {}",
+            std::fs::canonicalize(&new_repo_root).unwrap().display()
+        )));
+        assert!(registry.contains(&format!(
+            "worktree {}",
+            std::fs::canonicalize(&new_checkout).unwrap().display()
+        )));
+        let sibling_record_after = registry
+            .split("\n\n")
+            .find(|record| record.contains("branch refs/heads/sibling-branch"))
+            .unwrap_or_else(|| panic!("unrelated sibling missing from registry:\n{registry}"));
+        assert!(sibling_record_after
+            .lines()
+            .any(|line| line == sibling_registry_path));
+        assert_eq!(
+            registry
+                .lines()
+                .filter(|line| line.starts_with("worktree "))
+                .count(),
+            3
+        );
+
+        let new_key = std::fs::canonicalize(new_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let canonical_new_repo_root = std::fs::canonicalize(&new_repo_root).unwrap();
+        for workspace in &app.state.workspaces {
+            let membership = workspace.worktree_space().unwrap();
+            assert_eq!(membership.key, new_key);
+            assert_eq!(membership.repo_root, canonical_new_repo_root);
+        }
+        assert_eq!(
+            app.state.workspaces[1]
+                .worktree_space()
+                .unwrap()
+                .checkout_path,
+            new_checkout
+        );
+        assert_eq!(
+            app.state.workspaces[2]
+                .worktree_space()
+                .unwrap()
+                .checkout_path,
+            stale_sibling_path
+        );
+        assert!(!app.state.collapsed_space_keys.contains(&old_key));
+        assert!(app.state.collapsed_space_keys.contains(&new_key));
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn workspace_retarget_repairs_second_sibling_after_group_rekey() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_first = test_linked_git_worktree(&old_container, "first");
+        let old_repo_root = old_container.join("first-source");
+        let old_second = old_container.join("second");
+        add_test_linked_git_worktree(&old_repo_root, &old_second, "second-branch");
+        let old_key = std::fs::canonicalize(old_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+
+        let parent =
+            grouped_worktree_workspace("parent", &old_repo_root, &old_key, &old_repo_root, false);
+        let parent_id = parent.id.clone();
+        let first = grouped_worktree_workspace("first", &old_first, &old_key, &old_repo_root, true);
+        let first_id = first.id.clone();
+        let second =
+            grouped_worktree_workspace("second", &old_second, &old_key, &old_repo_root, true);
+        let second_id = second.id.clone();
+        let mut app = parent_space_api_app(vec![parent, first, second]);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_repo_root = new_container.join("first-source");
+        let new_first = new_container.join("first");
+        let new_second = new_container.join("second");
+
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app,
+            &parent_id,
+            &new_repo_root,
+        ))
+        .unwrap();
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app, &first_id, &new_first,
+        ))
+        .unwrap();
+
+        let second_before = app.state.workspaces[2].worktree_space().unwrap();
+        assert_eq!(
+            second_before.repo_root,
+            std::fs::canonicalize(&new_repo_root).unwrap()
+        );
+        assert_eq!(second_before.checkout_path, old_second);
+
+        let response = retarget_workspace_response(&mut app, &second_id, &new_second);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        assert_eq!(
+            app.state.workspaces[2]
+                .worktree_space()
+                .unwrap()
+                .checkout_path,
+            new_second
+        );
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&new_second)
+            .args(["status", "--porcelain=v1"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn workspace_retarget_repairs_real_herdr_worktrees_sibling_layout() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_projects = fixture.root.join("old-home").join("GithubProjects");
+        std::fs::create_dir_all(old_projects.join("herdr-worktrees")).unwrap();
+        let old_repo_root = test_git_checkout(&old_projects, "herdr");
+        commit_test_git_checkout(&old_repo_root);
+        let old_checkout = old_projects
+            .join("herdr-worktrees")
+            .join("task-11-4-repair-moved-worktrees");
+        add_test_linked_git_worktree(
+            &old_repo_root,
+            &old_checkout,
+            "w/TASK-11.4-repair-moved-worktrees",
+        );
+        let old_key = std::fs::canonicalize(old_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("herdr", &old_repo_root, &old_key, &old_repo_root, false);
+        let parent_id = parent.id.clone();
+        let child =
+            grouped_worktree_workspace("task-11-4", &old_checkout, &old_key, &old_repo_root, true);
+        let child_id = child.id.clone();
+        let mut app = parent_space_api_app(vec![parent, child]);
+
+        let new_home = fixture.root.join("new-home");
+        std::fs::create_dir_all(&new_home).unwrap();
+        let new_projects = new_home.join("GithubProjects");
+        std::fs::rename(&old_projects, &new_projects).unwrap();
+        let new_repo_root = new_projects.join("herdr");
+        let new_checkout = new_projects
+            .join("herdr-worktrees")
+            .join("task-11-4-repair-moved-worktrees");
+
+        eprintln!("layout=GithubProjects/herdr + GithubProjects/herdr-worktrees/<task>");
+        eprintln!(
+            "before.child_git={}",
+            std::fs::read_to_string(new_checkout.join(".git"))
+                .unwrap()
+                .trim()
+        );
+        eprintln!(
+            "before.registry=\n{}",
+            git_worktree_registry(&new_repo_root)
+        );
+
+        let parent_response = retarget_workspace_response(&mut app, &parent_id, &new_repo_root);
+        let _: SuccessResponse = serde_json::from_str(&parent_response).unwrap();
+        let child_response = retarget_workspace_response(&mut app, &child_id, &new_checkout);
+        let _: SuccessResponse = serde_json::from_str(&child_response).unwrap();
+
+        let child_git = std::fs::read_to_string(new_checkout.join(".git")).unwrap();
+        let registry = git_worktree_registry(&new_repo_root);
+        eprintln!("after.parent_response={parent_response}");
+        eprintln!("after.child_response={child_response}");
+        eprintln!("after.child_git={}", child_git.trim());
+        eprintln!("after.registry=\n{registry}");
+
+        assert!(child_git.contains(&new_repo_root.join(".git").display().to_string()));
+        assert!(registry.contains(&new_checkout.display().to_string()));
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&new_checkout)
+            .args(["status", "--porcelain=v1"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn workspace_retarget_repairs_child_that_did_not_move_with_parent() {
+        let fixture = ParentSpaceApiFixture::new();
+        let checkout = test_linked_git_worktree(&fixture.root, "linked");
+        let old_repo_root = fixture.root.join("linked-source");
+        let old_key = std::fs::canonicalize(old_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("parent", &old_repo_root, &old_key, &old_repo_root, false);
+        let parent_id = parent.id.clone();
+        let child = grouped_worktree_workspace("child", &checkout, &old_key, &old_repo_root, true);
+        let child_id = child.id.clone();
+        let mut app = parent_space_api_app(vec![parent, child]);
+
+        let new_repo_root = fixture.root.join("moved-source");
+        std::fs::rename(&old_repo_root, &new_repo_root).unwrap();
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app,
+            &parent_id,
+            &new_repo_root,
+        ))
+        .unwrap();
+        let response = retarget_workspace_response(&mut app, &child_id, &checkout);
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["status", "--porcelain=v1"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert_eq!(
+            app.state.workspaces[1]
+                .worktree_space()
+                .unwrap()
+                .checkout_path,
+            checkout
+        );
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn workspace_retarget_rejects_missing_or_ambiguous_recovery_parent() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_checkout = test_linked_git_worktree(&old_container, "linked");
+        let old_repo_root = old_container.join("linked-source");
+        let old_key = std::fs::canonicalize(old_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let missing_child =
+            grouped_worktree_workspace("child", &old_checkout, &old_key, &old_repo_root, true);
+        let missing_child_id = missing_child.id.clone();
+        let ambiguous_child =
+            grouped_worktree_workspace("child", &old_checkout, &old_key, &old_repo_root, true);
+        let ambiguous_child_id = ambiguous_child.id.clone();
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_repo_root = new_container.join("linked-source");
+        let new_checkout = new_container.join("linked");
+
+        let mut missing_app = parent_space_api_app(vec![missing_child]);
+        missing_app.state.session_dirty = false;
+        let response =
+            retarget_workspace_response(&mut missing_app, &missing_child_id, &new_checkout);
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code,
+            "workspace_retarget_worktree_parent_missing"
+        );
+        assert!(error.error.message.ends_with("found 0"));
+        assert_eq!(missing_app.state.workspaces[0].identity_cwd, old_checkout);
+        assert!(!missing_app.state.session_dirty);
+        missing_app.state.assert_invariants_for_test();
+
+        let first_parent = grouped_worktree_workspace(
+            "first-parent",
+            &new_repo_root,
+            &old_key,
+            &new_repo_root,
+            false,
+        );
+        let second_parent = grouped_worktree_workspace(
+            "second-parent",
+            &new_repo_root,
+            &old_key,
+            &new_repo_root,
+            false,
+        );
+        let mut ambiguous_app =
+            parent_space_api_app(vec![ambiguous_child, first_parent, second_parent]);
+        ambiguous_app.state.session_dirty = false;
+        let response =
+            retarget_workspace_response(&mut ambiguous_app, &ambiguous_child_id, &new_checkout);
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code,
+            "workspace_retarget_worktree_parent_ambiguous"
+        );
+        assert!(error.error.message.ends_with("found 2"));
+        assert_eq!(ambiguous_app.state.workspaces[0].identity_cwd, old_checkout);
+        assert!(!ambiguous_app.state.session_dirty);
+        ambiguous_app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn workspace_retarget_names_malformed_admin_pointer_and_keeps_state() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_checkout = test_linked_git_worktree(&old_container, "linked");
+        let old_repo_root = old_container.join("linked-source");
+        let old_key = std::fs::canonicalize(old_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("parent", &old_repo_root, &old_key, &old_repo_root, false);
+        let parent_id = parent.id.clone();
+        let child =
+            grouped_worktree_workspace("child", &old_checkout, &old_key, &old_repo_root, true);
+        let child_id = child.id.clone();
+        let mut app = parent_space_api_app(vec![parent, child]);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_repo_root = new_container.join("linked-source");
+        let new_checkout = new_container.join("linked");
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app,
+            &parent_id,
+            &new_repo_root,
+        ))
+        .unwrap();
+        app.state.session_dirty = false;
+
+        let admin_pointer = new_repo_root
+            .join(".git")
+            .join("worktrees")
+            .join("linked")
+            .join("gitdir");
+        std::fs::write(&admin_pointer, "one\ntwo\n").unwrap();
+        let old_identity = app.state.workspaces[1].identity_cwd.clone();
+        let old_membership = app.state.workspaces[1].worktree_space().cloned();
+        let response = retarget_workspace_response(&mut app, &child_id, &new_checkout);
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code,
+            "workspace_retarget_worktree_pointer_broken"
+        );
+        assert!(error
+            .error
+            .message
+            .contains(&admin_pointer.display().to_string()));
+        assert_eq!(app.state.workspaces[1].identity_cwd, old_identity);
+        assert_eq!(
+            app.state.workspaces[1].worktree_space().cloned(),
+            old_membership
+        );
+        assert!(!app.state.session_dirty);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn workspace_retarget_rejects_well_formed_admin_pointer_to_unrelated_checkout() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_checkout = test_linked_git_worktree(&old_container, "linked");
+        let old_repo_root = old_container.join("linked-source");
+        let old_key = std::fs::canonicalize(old_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("parent", &old_repo_root, &old_key, &old_repo_root, false);
+        let parent_id = parent.id.clone();
+        let child =
+            grouped_worktree_workspace("child", &old_checkout, &old_key, &old_repo_root, true);
+        let child_id = child.id.clone();
+        let mut app = parent_space_api_app(vec![parent, child]);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_repo_root = new_container.join("linked-source");
+        let new_checkout = new_container.join("linked");
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app,
+            &parent_id,
+            &new_repo_root,
+        ))
+        .unwrap();
+        app.state.session_dirty = false;
+
+        let unrelated = test_git_checkout(&fixture.root, "unrelated");
+        let admin_pointer = new_repo_root
+            .join(".git")
+            .join("worktrees")
+            .join("linked")
+            .join("gitdir");
+        std::fs::write(
+            &admin_pointer,
+            format!("{}\n", unrelated.join(".git").display()),
+        )
+        .unwrap();
+        let registry_before = git_worktree_registry(&new_repo_root);
+        let old_identity = app.state.workspaces[1].identity_cwd.clone();
+        let old_membership = app.state.workspaces[1].worktree_space().cloned();
+
+        let response = retarget_workspace_response(&mut app, &child_id, &new_checkout);
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code,
+            "workspace_retarget_worktree_pointer_broken"
+        );
+        assert!(error
+            .error
+            .message
+            .contains(&admin_pointer.display().to_string()));
+        assert_eq!(app.state.workspaces[1].identity_cwd, old_identity);
+        assert_eq!(
+            app.state.workspaces[1].worktree_space().cloned(),
+            old_membership
+        );
+        assert_eq!(git_worktree_registry(&new_repo_root), registry_before);
+        assert!(!app.state.session_dirty);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn workspace_retarget_reports_native_repair_failure_without_changing_state_or_registry() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_checkout = test_linked_git_worktree(&old_container, "linked");
+        let old_repo_root = old_container.join("linked-source");
+        let old_key = std::fs::canonicalize(old_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("parent", &old_repo_root, &old_key, &old_repo_root, false);
+        let parent_id = parent.id.clone();
+        let child =
+            grouped_worktree_workspace("child", &old_checkout, &old_key, &old_repo_root, true);
+        let child_id = child.id.clone();
+        let mut app = parent_space_api_app(vec![parent, child]);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_repo_root = new_container.join("linked-source");
+        let new_checkout = new_container.join("linked");
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app,
+            &parent_id,
+            &new_repo_root,
+        ))
+        .unwrap();
+        app.state.session_dirty = false;
+
+        let registry_before = git_worktree_registry(&new_repo_root);
+        let child_pointer = new_checkout.join(".git");
+        let child_pointer_before = std::fs::read_to_string(&child_pointer).unwrap();
+        let admin_pointer = new_repo_root
+            .join(".git")
+            .join("worktrees")
+            .join("linked")
+            .join("gitdir");
+        let admin_pointer_before = std::fs::read_to_string(&admin_pointer).unwrap();
+        let old_identity = app.state.workspaces[1].identity_cwd.clone();
+        let old_membership = app.state.workspaces[1].worktree_space().cloned();
+
+        let response = crate::worktree::with_forced_linked_worktree_repair_failure(|| {
+            retarget_workspace_response(&mut app, &child_id, &new_checkout)
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code,
+            "workspace_retarget_worktree_repair_failed"
+        );
+        assert!(error
+            .error
+            .message
+            .contains(&child_pointer.display().to_string()));
+        assert!(error
+            .error
+            .message
+            .contains("forced native git worktree repair failure"));
+        assert_eq!(app.state.workspaces[1].identity_cwd, old_identity);
+        assert_eq!(
+            app.state.workspaces[1].worktree_space().cloned(),
+            old_membership
+        );
+        assert_eq!(
+            std::fs::read_to_string(child_pointer).unwrap(),
+            child_pointer_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(admin_pointer).unwrap(),
+            admin_pointer_before
+        );
+        assert_eq!(git_worktree_registry(&new_repo_root), registry_before);
+        assert!(!app.state.session_dirty);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_retarget_rejects_symlinked_admin_pointer() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_checkout = test_linked_git_worktree(&old_container, "linked");
+        let old_repo_root = old_container.join("linked-source");
+        let old_key = std::fs::canonicalize(old_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+        let parent =
+            grouped_worktree_workspace("parent", &old_repo_root, &old_key, &old_repo_root, false);
+        let parent_id = parent.id.clone();
+        let child =
+            grouped_worktree_workspace("child", &old_checkout, &old_key, &old_repo_root, true);
+        let child_id = child.id.clone();
+        let mut app = parent_space_api_app(vec![parent, child]);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_repo_root = new_container.join("linked-source");
+        let new_checkout = new_container.join("linked");
+        let _: SuccessResponse = serde_json::from_str(&retarget_workspace_response(
+            &mut app,
+            &parent_id,
+            &new_repo_root,
+        ))
+        .unwrap();
+        app.state.session_dirty = false;
+
+        let admin_pointer = new_repo_root
+            .join(".git")
+            .join("worktrees")
+            .join("linked")
+            .join("gitdir");
+        let saved_pointer = admin_pointer.with_extension("saved");
+        std::fs::rename(&admin_pointer, &saved_pointer).unwrap();
+        symlink(&saved_pointer, &admin_pointer).unwrap();
+
+        let response = retarget_workspace_response(&mut app, &child_id, &new_checkout);
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code,
+            "workspace_retarget_worktree_pointer_broken"
+        );
+        assert!(error
+            .error
+            .message
+            .contains(&admin_pointer.display().to_string()));
+        assert!(!app.state.session_dirty);
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn workspace_retarget_names_broken_linked_worktree_pointer_and_keeps_state() {
+        let fixture = ParentSpaceApiFixture::new();
+        let old_container = fixture.root.join("old-location");
+        std::fs::create_dir_all(&old_container).unwrap();
+        let old_checkout = test_linked_git_worktree(&old_container, "linked");
+        let old_repo_root = old_container.join("linked-source");
+        let old_key = std::fs::canonicalize(old_repo_root.join(".git"))
+            .unwrap()
+            .display()
+            .to_string();
+
+        let mut parent = Workspace::test_new("parent");
+        parent.identity_cwd = old_repo_root.clone();
+        parent.cached_identity_cwd = old_repo_root.clone();
+        let parent_id = parent.id.clone();
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: old_key.clone(),
+            label: "linked-source".into(),
+            repo_root: old_repo_root.clone(),
+            checkout_path: old_repo_root.clone(),
+            is_linked_worktree: false,
+        });
+
+        let mut child = Workspace::test_new("child");
+        child.identity_cwd = old_checkout.clone();
+        child.cached_identity_cwd = old_checkout.clone();
+        let child_id = child.id.clone();
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: old_key,
+            label: "linked-source".into(),
+            repo_root: old_repo_root,
+            checkout_path: old_checkout,
+            is_linked_worktree: true,
+        });
+        let mut app = parent_space_api_app(vec![parent, child]);
+
+        let new_container = fixture.root.join("new-location");
+        std::fs::rename(&old_container, &new_container).unwrap();
+        let new_repo_root = new_container.join("linked-source");
+        let new_checkout = new_container.join("linked");
+
+        let parent_response = app.handle_api_request(Request {
+            id: "moved-parent".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id: parent_id,
+                path: new_repo_root.display().to_string(),
+            }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&parent_response).unwrap();
+        app.state.session_dirty = false;
+
+        let broken_pointer = new_checkout.join(".git");
+        std::fs::write(&broken_pointer, "gitdir: /unrelated/.git/worktrees/wrong\n").unwrap();
+        let old_identity = app.state.workspaces[1].identity_cwd.clone();
+        let old_membership = app.state.workspaces[1].worktree_space().cloned();
+
+        let response = app.handle_api_request(Request {
+            id: "broken-child".into(),
+            method: Method::WorkspaceRetarget(WorkspaceRetargetParams {
+                workspace_id: child_id,
+                path: new_checkout.display().to_string(),
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code,
+            "workspace_retarget_worktree_pointer_broken"
+        );
+        assert!(error
+            .error
+            .message
+            .contains(&broken_pointer.display().to_string()));
+        assert_eq!(app.state.workspaces[1].identity_cwd, old_identity);
+        assert_eq!(
+            app.state.workspaces[1].worktree_space().cloned(),
+            old_membership
+        );
+        assert!(!app.state.session_dirty);
+        app.state.assert_invariants_for_test();
     }
 
     #[test]
