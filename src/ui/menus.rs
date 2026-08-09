@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::widgets::{panel_contrast_fg, render_panel_shell};
-use crate::app::AppState;
+use crate::app::{state::ContextMenuState, AppState};
 
 fn prefix_rhs_label(bindings: &crate::config::ActionKeybinds) -> String {
     bindings
@@ -287,11 +287,24 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
     let Some(menu) = &app.context_menu else {
         return;
     };
-
-    let p = &app.palette;
     let Some(menu_rect) = app.context_menu_rect() else {
         return;
     };
+    render_context_menu_panel(app, menu, frame, menu_rect);
+
+    if let (Some(submenu), Some(submenu_rect)) = (&app.context_submenu, app.context_submenu_rect())
+    {
+        render_context_menu_panel(app, submenu, frame, submenu_rect);
+    }
+}
+
+fn render_context_menu_panel(
+    app: &AppState,
+    menu: &ContextMenuState,
+    frame: &mut Frame,
+    menu_rect: Rect,
+) {
+    let p = &app.palette;
     let Some(inner) = render_panel_shell(frame, menu_rect, p.accent, p.panel_bg) else {
         return;
     };

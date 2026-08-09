@@ -1517,9 +1517,9 @@ pub struct ContextMenuState {
     pub list: MenuListState,
 }
 
-impl ContextMenuState {
+impl ContextMenuKind {
     pub fn items(&self) -> Vec<&str> {
-        let mut items = match &self.kind {
+        let mut items = match self {
             ContextMenuKind::WorkspaceCreateTarget { machines } => std::iter::once("Local")
                 .chain(machines.iter().map(String::as_str))
                 .chain(machines.is_empty().then_some("No machines registered"))
@@ -1612,7 +1612,7 @@ impl ContextMenuState {
                 "Close pane",
             ],
         };
-        let parent_space = match &self.kind {
+        let parent_space = match self {
             ContextMenuKind::Workspace { parent_space, .. }
             | ContextMenuKind::GitWorkspace { parent_space, .. } => *parent_space,
             _ => ParentSpaceMenu::Unavailable,
@@ -1632,6 +1632,12 @@ impl ContextMenuState {
             }
         }
         items
+    }
+}
+
+impl ContextMenuState {
+    pub fn items(&self) -> Vec<&str> {
+        self.kind.items()
     }
 
     pub fn visible_offset(&self, viewport_height: usize) -> usize {
@@ -1801,6 +1807,7 @@ pub struct AppState {
     pub selection: Option<Selection>,
     pub selection_autoscroll: Option<SelectionAutoscroll>,
     pub context_menu: Option<ContextMenuState>,
+    pub context_submenu: Option<ContextMenuState>,
     // Notifications
     pub update_available: Option<String>,
     pub update_install_command: String,
@@ -1929,6 +1936,34 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub(crate) fn replace_context_menu(&mut self, menu: ContextMenuState) {
+        self.context_menu = Some(menu);
+        self.context_submenu = None;
+        self.mode = Mode::ContextMenu;
+    }
+
+    pub(crate) fn tab_create_menu_kind(&self) -> ContextMenuKind {
+        ContextMenuKind::TabCreateTarget {
+            plugin_panes: self.tab_create_plugin_targets(),
+        }
+    }
+
+    pub(crate) fn open_tab_create_submenu(&mut self) {
+        if !matches!(
+            self.context_menu.as_ref().map(|menu| &menu.kind),
+            Some(ContextMenuKind::Tab { .. })
+        ) {
+            return;
+        }
+        self.context_submenu = Some(ContextMenuState {
+            kind: self.tab_create_menu_kind(),
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        });
+        self.mode = Mode::ContextMenu;
+    }
+
     pub(crate) fn tab_create_plugin_targets(&self) -> Vec<TabCreatePluginTarget> {
         let mut targets = self
             .installed_plugins
@@ -2222,6 +2257,7 @@ impl AppState {
             selection: None,
             selection_autoscroll: None,
             context_menu: None,
+            context_submenu: None,
             update_available: None,
             update_install_command: "herdr update".into(),
             latest_release_notes_available: false,
@@ -2649,6 +2685,19 @@ impl AppState {
                     }
                 }
             }
+        }
+        if let Some(submenu) = &self.context_submenu {
+            assert!(
+                matches!(
+                    self.context_menu.as_ref().map(|menu| &menu.kind),
+                    Some(ContextMenuKind::Tab { .. })
+                ),
+                "context submenu requires a tab context menu parent"
+            );
+            assert!(
+                matches!(submenu.kind, ContextMenuKind::TabCreateTarget { .. }),
+                "context submenu must be a tab create target menu"
+            );
         }
     }
 
@@ -3195,6 +3244,37 @@ mod tests {
         assert_eq!(plugin_panes[0].plugin_id, "example.logs");
         assert_eq!(plugin_panes[0].entrypoint, "logs");
         assert_eq!(items, vec!["Terminal", "Logs"]);
+    }
+
+    #[test]
+    fn tab_context_submenu_reuses_picker_items_and_flips_at_right_edge() {
+        let mut state = AppState::test_new();
+        let mut plugin = installed_plugin_with_tab_pane("example.logs", "Logs");
+        plugin.panes[0].id = "logs".into();
+        state
+            .installed_plugins
+            .insert("example.logs".into(), plugin);
+        state.view.sidebar_rect = Rect::new(0, 0, 10, 12);
+        state.view.terminal_area = Rect::new(10, 0, 30, 12);
+        state.context_menu = Some(ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 0,
+            },
+            x: 38,
+            y: 9,
+            list: MenuListState::new(0),
+        });
+
+        state.open_tab_create_submenu();
+
+        let parent = state.context_menu_rect().expect("parent menu rect");
+        let submenu = state.context_submenu.as_ref().expect("tab type submenu");
+        let submenu_rect = state.context_submenu_rect().expect("submenu rect");
+        assert_eq!(submenu.kind, state.tab_create_menu_kind());
+        assert_eq!(submenu.items(), vec!["Terminal", "Logs"]);
+        assert!(submenu_rect.x + submenu_rect.width <= parent.x);
+        assert!(submenu_rect.y + submenu_rect.height <= 12);
     }
 
     #[test]

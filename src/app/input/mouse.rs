@@ -526,7 +526,15 @@ impl AppState {
                         && rect_contains(self.sidebar_new_button_rect(), mouse.column, mouse.row)
                     {
                         self.context_menu = None;
+                        self.context_submenu = None;
                         return Some(MouseAction::NewWorkspace);
+                    }
+                    let submenu_item_idx = self.context_submenu_item_at(mouse.column, mouse.row);
+                    if let Some(idx) = submenu_item_idx {
+                        if let Some(menu) = self.context_submenu.take() {
+                            self.context_menu = None;
+                            return Some(MouseAction::ContextMenu { menu, idx });
+                        }
                     }
                     let item_idx = self.context_menu_item_at(mouse.column, mouse.row);
                     if let Some(menu) = self.context_menu.take() {
@@ -1117,9 +1125,26 @@ impl AppState {
             }
 
             MouseEventKind::Moved if self.mode == Mode::ContextMenu => {
-                let hovered = self.context_menu_item_at(mouse.column, mouse.row);
-                if let Some(menu) = &mut self.context_menu {
-                    menu.list.hover(hovered);
+                let submenu_hovered = self.context_submenu_item_at(mouse.column, mouse.row);
+                if submenu_hovered.is_some() {
+                    if let Some(menu) = &mut self.context_submenu {
+                        menu.list.hover(submenu_hovered);
+                    }
+                } else {
+                    let hovered = self.context_menu_item_at(mouse.column, mouse.row);
+                    let opens_tab_submenu = hovered == Some(0)
+                        && self
+                            .context_menu
+                            .as_ref()
+                            .is_some_and(|menu| matches!(menu.kind, ContextMenuKind::Tab { .. }));
+                    if let Some(menu) = &mut self.context_menu {
+                        menu.list.hover(hovered);
+                    }
+                    if opens_tab_submenu {
+                        self.open_tab_create_submenu();
+                    } else if hovered.is_some() {
+                        self.context_submenu = None;
+                    }
                 }
             }
 
@@ -1202,13 +1227,12 @@ impl AppState {
                             }
                         },
                     );
-                    self.context_menu = Some(ContextMenuState {
+                    self.replace_context_menu(ContextMenuState {
                         kind,
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
                     });
-                    self.mode = Mode::ContextMenu;
                 }
             }
 
@@ -1216,15 +1240,12 @@ impl AppState {
                 if !self.mode_bar_covers_tab_row(mouse.column, mouse.row)
                     && self.on_new_tab_button(mouse.column, mouse.row) =>
             {
-                self.context_menu = Some(ContextMenuState {
-                    kind: ContextMenuKind::TabCreateTarget {
-                        plugin_panes: self.tab_create_plugin_targets(),
-                    },
+                self.replace_context_menu(ContextMenuState {
+                    kind: self.tab_create_menu_kind(),
                     x: mouse.column,
                     y: mouse.row,
                     list: MenuListState::new(0),
                 });
-                self.mode = Mode::ContextMenu;
             }
 
             MouseEventKind::Down(MouseButton::Right)
@@ -1234,13 +1255,12 @@ impl AppState {
                 if let (Some(ws_idx), Some(tab_idx)) =
                     (self.active, self.tab_at(mouse.column, mouse.row))
                 {
-                    self.context_menu = Some(ContextMenuState {
+                    self.replace_context_menu(ContextMenuState {
                         kind: ContextMenuKind::Tab { ws_idx, tab_idx },
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
                     });
-                    self.mode = Mode::ContextMenu;
                 }
             }
 
@@ -1264,7 +1284,7 @@ impl AppState {
                         .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
                         .and_then(|terminal| terminal.manual_label.as_ref())
                         .is_some();
-                    self.context_menu = Some(ContextMenuState {
+                    self.replace_context_menu(ContextMenuState {
                         kind: ContextMenuKind::Pane {
                             ws_idx,
                             tab_idx,
@@ -1276,7 +1296,6 @@ impl AppState {
                         y: mouse.row,
                         list: MenuListState::new(0),
                     });
-                    self.mode = Mode::ContextMenu;
                 }
             }
 
@@ -1380,6 +1399,30 @@ impl AppState {
     pub(crate) fn context_menu_rect(&self) -> Option<Rect> {
         let menu = self.context_menu.as_ref()?;
         let screen = self.screen_rect();
+        let (menu_w, menu_h) = Self::context_menu_size(menu, screen);
+        let x = menu.x.min(screen.x + screen.width.saturating_sub(menu_w));
+        let y = menu.y.min(screen.y + screen.height.saturating_sub(menu_h));
+        Some(Rect::new(x, y, menu_w, menu_h))
+    }
+
+    pub(crate) fn context_submenu_rect(&self) -> Option<Rect> {
+        let submenu = self.context_submenu.as_ref()?;
+        let parent = self.context_menu_rect()?;
+        let screen = self.screen_rect();
+        let (menu_w, menu_h) = Self::context_menu_size(submenu, screen);
+        let screen_right = screen.x.saturating_add(screen.width);
+        let right_x = parent.x.saturating_add(parent.width);
+        let x = if right_x.saturating_add(menu_w) <= screen_right {
+            right_x
+        } else {
+            parent.x.saturating_sub(menu_w).max(screen.x)
+        };
+        let desired_y = parent.y.saturating_add(1);
+        let y = desired_y.min(screen.y + screen.height.saturating_sub(menu_h));
+        Some(Rect::new(x, y, menu_w, menu_h))
+    }
+
+    fn context_menu_size(menu: &ContextMenuState, screen: Rect) -> (u16, u16) {
         let max_item_w = menu
             .items()
             .iter()
@@ -1388,9 +1431,7 @@ impl AppState {
             .unwrap_or(0);
         let menu_w = (max_item_w + 4).max(14).min(screen.width.max(1));
         let menu_h = (menu.items().len() as u16 + 2).min(screen.height.max(1));
-        let x = menu.x.min(screen.x + screen.width.saturating_sub(menu_w));
-        let y = menu.y.min(screen.y + screen.height.saturating_sub(menu_h));
-        Some(Rect::new(x, y, menu_w, menu_h))
+        (menu_w, menu_h)
     }
 
     pub(crate) fn confirm_close_rect(&self) -> Rect {
@@ -1399,20 +1440,28 @@ impl AppState {
 
     fn context_menu_item_at(&self, col: u16, row: u16) -> Option<usize> {
         let menu_rect = self.context_menu_rect()?;
+        let menu = self.context_menu.as_ref()?;
+        Self::context_menu_item_at_rect(menu, menu_rect, col, row)
+    }
+
+    fn context_submenu_item_at(&self, col: u16, row: u16) -> Option<usize> {
+        let menu_rect = self.context_submenu_rect()?;
+        let menu = self.context_submenu.as_ref()?;
+        Self::context_menu_item_at_rect(menu, menu_rect, col, row)
+    }
+
+    fn context_menu_item_at_rect(
+        menu: &ContextMenuState,
+        menu_rect: Rect,
+        col: u16,
+        row: u16,
+    ) -> Option<usize> {
         let inner_x = menu_rect.x + 1;
         let inner_y = menu_rect.y + 1;
         let inner_w = menu_rect.width.saturating_sub(2);
         let inner_h = menu_rect.height.saturating_sub(2);
-        let item_count = self
-            .context_menu
-            .as_ref()
-            .map(|menu| menu.items().len() as u16)
-            .unwrap_or(0);
-        let visible_offset = self
-            .context_menu
-            .as_ref()
-            .map(|menu| menu.visible_offset(inner_h as usize))
-            .unwrap_or(0);
+        let item_count = menu.items().len() as u16;
+        let visible_offset = menu.visible_offset(inner_h as usize);
         if col >= inner_x
             && col < inner_x + inner_w
             && row >= inner_y
@@ -1755,6 +1804,7 @@ impl AppState {
         self.tab_press = None;
         self.drag = None;
         self.context_menu = None;
+        self.context_submenu = None;
         self.right_click_passthrough = Some(RightClickPassthroughGesture {
             pane_info: info,
             modifiers,
@@ -2071,6 +2121,25 @@ mod tests {
             checkout_path: format!("/repo/worktree-{ws_idx}").into(),
             is_linked_worktree: ws_idx != 0,
         });
+    }
+
+    fn open_tab_context_submenu(app: &mut crate::app::App) {
+        let tab = app.state.view.tab_hit_areas[0];
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            tab.x + 1,
+            tab.y,
+        ));
+        let parent = app
+            .state
+            .context_menu_rect()
+            .expect("tab context menu rect");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            parent.x + 2,
+            parent.y + 1,
+        ));
+        assert!(app.state.context_submenu.is_some());
     }
 
     #[tokio::test]
@@ -4215,6 +4284,78 @@ mod tests {
         assert_eq!(app.state.mode, Mode::ContextMenu);
     }
 
+    #[tokio::test]
+    async fn clicking_tab_context_new_tab_opens_submenu_and_creates_terminal() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        open_tab_context_submenu(&mut app);
+
+        assert!(app.state.context_menu.is_some());
+        assert_eq!(
+            app.state
+                .context_submenu
+                .as_ref()
+                .expect("tab type submenu")
+                .items(),
+            vec!["Terminal"]
+        );
+        let submenu = app
+            .state
+            .context_submenu_rect()
+            .expect("tab type submenu rect");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            submenu.x + 2,
+            submenu.y + 1,
+        ));
+
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.context_menu.is_none());
+        assert!(app.state.context_submenu.is_none());
+    }
+
+    #[test]
+    fn replacing_tab_submenu_with_workspace_and_pane_menus_clears_child() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        open_tab_context_submenu(&mut app);
+        let card = app.state.view.workspace_card_areas[0].rect;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            card.x + 2,
+            card.y + 1,
+        ));
+        assert!(matches!(
+            app.state.context_menu.as_ref().map(|menu| &menu.kind),
+            Some(ContextMenuKind::Workspace { .. } | ContextMenuKind::GitWorkspace { .. })
+        ));
+        assert!(app.state.context_submenu.is_none());
+
+        open_tab_context_submenu(&mut app);
+        let pane = app.state.view.pane_infos[0].inner_rect;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            pane.x + 2,
+            pane.y + 2,
+        ));
+        assert!(matches!(
+            app.state.context_menu.as_ref().map(|menu| &menu.kind),
+            Some(ContextMenuKind::Pane { .. })
+        ));
+        assert!(app.state.context_submenu.is_none());
+    }
+
     #[test]
     fn clicking_tab_context_menu_close_leaves_context_menu_mode() {
         let mut app = app_for_mouse_test();
@@ -4256,7 +4397,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_tab_context_menu_rename_opens_dialog() {
+    fn clicking_tab_context_menu_rename_with_submenu_clears_child() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.active = Some(0);
@@ -4264,12 +4405,7 @@ mod tests {
         app.state.mode = Mode::Terminal;
 
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
-        let first_tab = app.state.view.tab_hit_areas[0];
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Right),
-            first_tab.x + 1,
-            first_tab.y,
-        ));
+        open_tab_context_submenu(&mut app);
 
         let menu = app
             .state
@@ -4284,6 +4420,7 @@ mod tests {
         assert_eq!(app.state.mode, Mode::RenameTab);
         assert_eq!(app.state.name_input, "1");
         assert!(app.state.context_menu.is_none());
+        assert!(app.state.context_submenu.is_none());
     }
 
     #[test]

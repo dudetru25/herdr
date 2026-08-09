@@ -187,13 +187,13 @@ impl App {
             .iter()
             .map(|machine| machine.name.clone())
             .collect();
-        self.state.context_menu = Some(super::state::ContextMenuState {
-            kind: super::state::ContextMenuKind::WorkspaceCreateTarget { machines },
-            x,
-            y,
-            list: super::state::MenuListState::new(0),
-        });
-        self.state.mode = Mode::ContextMenu;
+        self.state
+            .replace_context_menu(super::state::ContextMenuState {
+                kind: super::state::ContextMenuKind::WorkspaceCreateTarget { machines },
+                x,
+                y,
+                list: super::state::MenuListState::new(0),
+            });
     }
 
     pub(super) fn begin_tui_local_workspace_create(&mut self, request_id: &'static str) {

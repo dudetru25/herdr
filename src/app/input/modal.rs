@@ -426,6 +426,8 @@ fn workspace_create_label(input: &str, suggested_name: &str) -> Option<String> {
 }
 
 pub(super) fn leave_modal(state: &mut AppState) {
+    state.context_menu = None;
+    state.context_submenu = None;
     if state.active.is_some() {
         state.mode = Mode::Terminal;
     } else {
@@ -805,6 +807,17 @@ pub(super) fn apply_context_menu_action(
     menu: ContextMenuState,
     idx: usize,
 ) {
+    state.context_submenu = None;
+    if idx == 0 {
+        if let ContextMenuKind::Tab { ws_idx, tab_idx } = &menu.kind {
+            state.selected = *ws_idx;
+            state.active = Some(*ws_idx);
+            state.switch_tab(*tab_idx);
+            state.replace_context_menu(menu);
+            state.open_tab_create_submenu();
+            return;
+        }
+    }
     if let ContextMenuKind::TabCreateTarget { .. } = &menu.kind {
         if idx == 0 {
             state.request_new_tab = true;
@@ -1059,21 +1072,45 @@ pub(crate) fn handle_context_menu_key(
 ) {
     match key.code {
         KeyCode::Esc => {
-            state.context_menu = None;
-            leave_modal(state);
+            if state.context_submenu.take().is_none() {
+                leave_modal(state);
+            }
         }
         KeyCode::Up => {
-            if let Some(menu) = &mut state.context_menu {
+            if let Some(menu) = &mut state.context_submenu {
+                menu.list.move_prev();
+            } else if let Some(menu) = &mut state.context_menu {
                 menu.list.move_prev();
             }
         }
         KeyCode::Down => {
-            if let Some(menu) = &mut state.context_menu {
+            if let Some(menu) = &mut state.context_submenu {
+                menu.list.move_next(menu.items().len());
+            } else if let Some(menu) = &mut state.context_menu {
                 menu.list.move_next(menu.items().len());
             }
         }
+        KeyCode::Left => {
+            state.context_submenu = None;
+        }
+        KeyCode::Right => {
+            let opens_submenu = state.context_submenu.is_none()
+                && state.context_menu.as_ref().is_some_and(|menu| {
+                    menu.list.highlighted == 0 && matches!(menu.kind, ContextMenuKind::Tab { .. })
+                });
+            if opens_submenu {
+                if let Some(menu) = state.context_menu.take() {
+                    let idx = menu.list.highlighted;
+                    apply_context_menu_action(state, terminal_runtimes, menu, idx);
+                }
+            }
+        }
         KeyCode::Enter => {
-            if let Some(menu) = state.context_menu.take() {
+            if let Some(menu) = state.context_submenu.take() {
+                state.context_menu = None;
+                let idx = menu.list.highlighted;
+                apply_context_menu_action(state, terminal_runtimes, menu, idx);
+            } else if let Some(menu) = state.context_menu.take() {
                 let idx = menu.list.highlighted;
                 apply_context_menu_action(state, terminal_runtimes, menu, idx);
             }
@@ -1446,21 +1483,46 @@ impl App {
     pub(crate) fn handle_context_menu_key_via_api(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.state.context_menu = None;
-                leave_modal(&mut self.state);
+                if self.state.context_submenu.take().is_none() {
+                    leave_modal(&mut self.state);
+                }
             }
             KeyCode::Up => {
-                if let Some(menu) = &mut self.state.context_menu {
+                if let Some(menu) = &mut self.state.context_submenu {
+                    menu.list.move_prev();
+                } else if let Some(menu) = &mut self.state.context_menu {
                     menu.list.move_prev();
                 }
             }
             KeyCode::Down => {
-                if let Some(menu) = &mut self.state.context_menu {
+                if let Some(menu) = &mut self.state.context_submenu {
+                    menu.list.move_next(menu.items().len());
+                } else if let Some(menu) = &mut self.state.context_menu {
                     menu.list.move_next(menu.items().len());
                 }
             }
+            KeyCode::Left => {
+                self.state.context_submenu = None;
+            }
+            KeyCode::Right => {
+                let opens_submenu = self.state.context_submenu.is_none()
+                    && self.state.context_menu.as_ref().is_some_and(|menu| {
+                        menu.list.highlighted == 0
+                            && matches!(menu.kind, ContextMenuKind::Tab { .. })
+                    });
+                if opens_submenu {
+                    if let Some(menu) = self.state.context_menu.take() {
+                        let idx = menu.list.highlighted;
+                        self.apply_context_menu_action_via_api(menu, idx);
+                    }
+                }
+            }
             KeyCode::Enter => {
-                if let Some(menu) = self.state.context_menu.take() {
+                if let Some(menu) = self.state.context_submenu.take() {
+                    self.state.context_menu = None;
+                    let idx = menu.list.highlighted;
+                    self.apply_context_menu_action_via_api(menu, idx);
+                } else if let Some(menu) = self.state.context_menu.take() {
                     let idx = menu.list.highlighted;
                     self.apply_context_menu_action_via_api(menu, idx);
                 }
@@ -1470,6 +1532,16 @@ impl App {
     }
 
     pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
+        self.state.context_submenu = None;
+        if idx == 0 {
+            if let ContextMenuKind::Tab { ws_idx, tab_idx } = &menu.kind {
+                self.focus_workspace_idx_via_api(*ws_idx);
+                self.focus_tab_idx_via_api(*tab_idx);
+                self.state.replace_context_menu(menu);
+                self.state.open_tab_create_submenu();
+                return;
+            }
+        }
         if let ContextMenuKind::TabCreateTarget { plugin_panes } = &menu.kind {
             self.apply_tab_create_target_via_api(plugin_panes, idx);
             return;
@@ -2670,26 +2742,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_tab_type_terminal_selection_creates_terminal_tab() {
+    async fn api_tab_context_submenu_terminal_selection_creates_terminal_tab() {
         let mut app = app_with_test_workspaces(&["test"]);
         app.state.mode = Mode::ContextMenu;
-        let menu = ContextMenuState {
-            kind: ContextMenuKind::TabCreateTarget {
-                plugin_panes: Vec::new(),
+        app.state.context_menu = Some(ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 0,
             },
             x: 0,
             y: 0,
             list: MenuListState::new(0),
-        };
+        });
 
-        app.apply_context_menu_action_via_api(menu, 0);
+        app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(
+            app.state
+                .context_submenu
+                .as_ref()
+                .expect("tab type submenu")
+                .items(),
+            vec!["Terminal"]
+        );
+        app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
         assert_eq!(app.state.workspaces[0].tabs.len(), 2);
         assert_eq!(app.state.mode, Mode::Terminal);
     }
 
     #[tokio::test]
-    async fn api_tab_type_plugin_selection_creates_plugin_tab_in_active_checkout() {
+    async fn api_tab_context_submenu_plugin_selection_creates_plugin_tab_in_active_checkout() {
         let mut app = app_with_test_workspaces(&["other", "test"]);
         app.state.mode = Mode::ContextMenu;
         app.state.active = Some(1);
@@ -2742,16 +2824,29 @@ mod tests {
                 warnings: Vec::new(),
             },
         );
-        let menu = ContextMenuState {
-            kind: ContextMenuKind::TabCreateTarget {
-                plugin_panes: vec![target],
+        app.state.context_menu = Some(ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 1,
+                tab_idx: 0,
             },
             x: 0,
             y: 0,
-            list: MenuListState::new(1),
-        };
+            list: MenuListState::new(0),
+        });
 
-        app.apply_context_menu_action_via_api(menu, 1);
+        app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        let submenu = app
+            .state
+            .context_submenu
+            .as_mut()
+            .expect("tab type submenu");
+        assert!(matches!(
+            &submenu.kind,
+            ContextMenuKind::TabCreateTarget { plugin_panes }
+                if plugin_panes == &vec![target]
+        ));
+        submenu.list.highlighted = 1;
+        app.handle_context_menu_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
         assert_eq!(app.state.workspaces[0].tabs.len(), 1);
         let workspace = &app.state.workspaces[1];
@@ -2948,14 +3043,14 @@ mod tests {
     }
 
     #[test]
-    fn api_context_menu_close_tab_last_parent_group_workspace_keeps_confirmation_mode() {
+    fn api_context_menu_close_tab_with_submenu_clears_child_before_confirmation() {
         let mut app = app_with_test_workspaces(&["main", "issue"]);
         mark_worktree_space_member(&mut app.state, 0, "repo-key");
         mark_worktree_space_member(&mut app.state, 1, "repo-key");
         app.state.active = Some(0);
         app.state.selected = 1;
         app.state.mode = Mode::ContextMenu;
-        let menu = ContextMenuState {
+        app.state.context_menu = Some(ContextMenuState {
             kind: ContextMenuKind::Tab {
                 ws_idx: 0,
                 tab_idx: 0,
@@ -2963,7 +3058,9 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
-        };
+        });
+        app.state.open_tab_create_submenu();
+        let menu = app.state.context_menu.take().expect("tab context menu");
         let idx = menu
             .items()
             .iter()
@@ -2975,6 +3072,7 @@ mod tests {
         assert_eq!(app.state.selected, 0);
         assert_eq!(app.state.mode, Mode::ConfirmClose);
         assert_eq!(app.state.workspaces.len(), 2);
+        assert!(app.state.context_submenu.is_none());
     }
 
     #[test]
